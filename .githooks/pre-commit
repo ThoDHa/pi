@@ -1,0 +1,21 @@
+#!/bin/sh
+# Second layer of the secrets guard (the whitelist .gitignore is the first):
+# fails when any staged path is auth.json or under sessions/. Deletions stay
+# exempt so an accidentally tracked secrets file can still be removed.
+
+fail=0
+while IFS= read -r path; do
+	case "$path" in
+	auth.json | */auth.json | sessions/* | */sessions/*)
+		printf 'pre-commit: refusing "%s": auth.json and sessions/ must not be committed\n' "$path" >&2
+		fail=1
+		;;
+	esac
+done <<EOF
+$(git diff --cached --name-only --diff-filter=d)
+EOF
+
+if [ "$fail" -ne 0 ]; then
+	printf 'pre-commit: unstage the listed files with: git restore --staged <path>\n' >&2
+fi
+exit $fail
