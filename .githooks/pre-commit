@@ -1,21 +1,28 @@
 #!/bin/sh
-# Second layer of the secrets guard (the whitelist .gitignore is the first):
-# fails when any staged path is auth.json or under sessions/. Deletions stay
-# exempt so an accidentally tracked secrets file can still be removed.
+# Second layer of the secrets guard (the whitelist .gitignore default-deny is
+# the first): fails when any staged path is a credential file (auth.json,
+# models.json, mcp.json) or under sessions/. Deletions stay exempt so an
+# accidentally tracked secrets file can still be removed.
+
+paths=$(git diff --cached --name-only --diff-filter=d) || {
+	printf 'pre-commit: git diff failed; refusing to skip the guard\n' >&2
+	exit 1
+}
 
 fail=0
 while IFS= read -r path; do
 	case "$path" in
-	auth.json | */auth.json | sessions/* | */sessions/*)
-		printf 'pre-commit: refusing "%s": auth.json and sessions/ must not be committed\n' "$path" >&2
+	auth.json | */auth.json | models.json | */models.json | mcp.json | */mcp.json | sessions/* | */sessions/*)
+		printf 'pre-commit: refusing "%s"\n' "$path" >&2
 		fail=1
 		;;
 	esac
 done <<EOF
-$(git diff --cached --name-only --diff-filter=d)
+$paths
 EOF
 
 if [ "$fail" -ne 0 ]; then
+	printf 'pre-commit: credentials (auth.json, models.json, mcp.json) and transcripts (sessions/) must not be committed; the whitelist default-deny is the first layer\n' >&2
 	printf 'pre-commit: unstage the listed files with: git restore --staged <path>\n' >&2
 fi
 exit $fail
