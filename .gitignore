@@ -2,4 +2,5 @@
 !/.gitignore
 !/README.md
 !/settings.json
+!/themes/
 !/.githooks/
