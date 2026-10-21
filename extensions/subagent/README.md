@@ -7,6 +7,9 @@ Delegate tasks to specialized subagents with isolated context windows.
 - **Isolated context**: Each subagent runs in a separate `pi` process
 - **Streaming output**: See tool calls and progress as they happen
 - **Parallel streaming**: All parallel tasks stream updates simultaneously
+- **Detached dispatch**: Optional `detach: true` runs any mode in the background and returns job IDs immediately
+- **Jobs tool**: `jobs status` polls detached jobs without blocking; `jobs wait` blocks for final outputs and collects them
+- **Settle-time wakeup**: Finished detached results are delivered automatically between turns, with no continuation once everything is collected
 - **Markdown rendering**: Final output rendered with proper formatting (expanded view)
 - **Usage tracking**: Shows turns, tokens, cost, and context usage per agent
 - **Abort support**: Ctrl+C propagates to kill subagent processes
@@ -81,6 +84,11 @@ Run 2 scouts in parallel: one to find models, one to find providers
 Use a chain: first have scout find the read tool, then have planner suggest improvements
 ```
 
+### Detached execution
+```
+Run scout in the background to map the auth module (detach: true), then ask jobs status for job-1
+```
+
 ### Workflow prompts
 ```
 /implement add Redis caching to the session store
@@ -95,6 +103,27 @@ Use a chain: first have scout find the read tool, then have planner suggest impr
 | Single | `{ agent, task }` | One agent, one task |
 | Parallel | `{ tasks: [...] }` | Multiple agents run concurrently (max 8, 4 concurrent) |
 | Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder |
+
+All three modes accept an optional `detach: true` flag; see [Detached Dispatch](#detached-dispatch-and-the-jobs-tool). Blocking dispatch is the default and is unchanged.
+
+## Detached Dispatch and the Jobs Tool
+
+Adding `detach: true` to any subagent call spawns the same child `pi` processes as blocking dispatch (identical tools, models, gates, and confirmations) but returns immediately with job IDs such as `job-1`. Each job registers in a session-scoped registry, and its results persist there until they are collected or the session ends. Blocking dispatch without `detach` remains the default and behaves exactly as before.
+
+The `jobs` tool inspects and collects detached jobs:
+
+| Action | Behavior |
+|--------|----------|
+| `jobs { action: "status" }` | Non-blocking per-job state: running/done/failed, elapsed time, task preview, and whether results are already collected |
+| `jobs { action: "wait", id?, timeout? }` | Blocks until the selected jobs finish or the timeout elapses (default 120s, max 900s), then returns final outputs once and marks them collected |
+
+Omitting `id` selects every job in the session. A second `wait` for an already-collected job reports `collected earlier; output not repeated` instead of re-printing the results, and the settle-time wakeup never re-delivers them. A job whose child process is killed mid-run (including jobs still running when the session shuts down) is marked `failed` with the abort reason.
+
+**Settle-time wakeup**: when the session settles with finished-but-uncollected detached jobs, the extension injects their final outputs as a custom message and requests exactly one continuation so the agent can use them. Each job's results are injected at most once. While jobs are still running, settlement injects a hidden reminder (with a bounded number of idle continuations, reset whenever a job finishes) suggesting `jobs wait`; an empty or fully collected registry never continues.
+
+**Timeouts**: every child process has a 15 minute hard timeout in the spawn path, after which it is killed (SIGTERM, then SIGKILL) and the job is marked failed. This applies to blocking dispatch too, where a hung subagent previously waited forever.
+
+**Per-agent policy**: an agent whose frontmatter sets `detach: false` rejects detached dispatch with a clear error and can only be dispatched in blocking mode; blocking dispatch of that agent is unaffected. There are no hardcoded agent names in the extension; the flag is discovered from frontmatter like `tools` and `model`.
 
 ## Output Display
 
@@ -132,12 +161,13 @@ name: my-agent
 description: What this agent does
 tools: read, grep, find, ls
 model: claude-haiku-4-5
+detach: false
 ---
 
 System prompt for the agent goes here.
 ```
 
-When `model` is omitted, the subagent inherits the dispatching session's active model and thinking level.
+When `model` is omitted, the subagent inherits the dispatching session's active model and thinking level. The optional `detach: false` key bars the agent from detached (background) dispatch; see [Detached Dispatch](#detached-dispatch-and-the-jobs-tool).
 
 **Locations:**
 - `~/.pi/agent/agents/*.md` - User-level (always loaded)
@@ -149,7 +179,7 @@ Project agents override user agents with the same name when `agentScope: "both"`
 
 | Agent | Purpose | Model | Tools |
 |-------|---------|-------|-------|
-| `scout` | Fast codebase recon | Haiku | read, grep, find, ls, bash |
+| `scout` | Fast codebase recon (blocking only, `detach: false`) | Haiku | read, grep, find, ls, bash |
 | `planner` | Implementation plans | Sonnet | read, grep, find, ls |
 | `reviewer` | Code review | Sonnet | read, grep, find, ls, bash |
 | `worker` | General-purpose | Sonnet | (all default) |
@@ -167,11 +197,14 @@ Project agents override user agents with the same name when `agentScope: "both"`
 - **Exit code != 0**: Tool returns error with stderr/output
 - **stopReason "error"**: LLM error propagated with error message
 - **stopReason "aborted"**: User abort (Ctrl+C) kills subprocess, throws error
+- **stopReason "timeout"**: Child exceeded the 15 minute hard timeout and was killed
 - **Chain mode**: Stops at first failing step, reports which step failed
+- **Detached jobs**: Failures mark the job `failed` in the registry; the outputs of failed jobs are delivered like any other result
 
 ## Limitations
 
 - Output truncated to last 10 items in collapsed view (expand to see all)
-- Parallel model-visible output is capped at 50 KB per task; full results remain in tool details
+- Parallel model-visible output is capped at 50 KB per task; full results remain in tool details (for detached jobs, in the delivered message's entry details)
 - Agents discovered fresh on each invocation (allows editing mid-session)
 - Parallel mode limited to 8 tasks, 4 concurrent
+- Detached jobs and their results live in memory for the current session only; a new session starts with an empty registry and kills any still-running children

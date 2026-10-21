@@ -13,6 +13,8 @@ export interface AgentConfig {
 	description: string;
 	tools?: string[];
 	model?: string;
+	/** Frontmatter `detach: false` bars this agent from detached (background) dispatch. */
+	detach?: boolean;
 	systemPrompt: string;
 	source: "user" | "project";
 	filePath: string;
@@ -36,6 +38,7 @@ type AgentFrontmatter = {
 	description?: unknown;
 	tools?: unknown;
 	model?: unknown;
+	detach?: unknown;
 };
 
 /**
@@ -96,6 +99,7 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			description: frontmatter.description,
 			tools: parseToolList(frontmatter.tools),
 			model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
+			detach: typeof frontmatter.detach === "boolean" ? frontmatter.detach : undefined,
 			systemPrompt: body,
 			source,
 			filePath,

@@ -9,6 +9,10 @@
  *   - Parallel: { tasks: [{ agent: "name", task: "..." }, ...] }
  *   - Chain: { chain: [{ agent: "name", task: "... {previous} ..." }, ...] }
  *
+ * Every mode also supports detach: true, which registers the dispatch in a
+ * session-scoped job registry, returns job IDs immediately, and delivers
+ * results later via the jobs tool or a settle-time wakeup.
+ *
  * Uses JSON mode to capture structured output from subagents.
  */
 
@@ -21,6 +25,7 @@ import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	CONFIG_DIR_NAME,
+	type CustomMessageEntryDraft,
 	type ExtensionAPI,
 	formatReadLineRange,
 	getAgentDir,
@@ -35,6 +40,23 @@ const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
+const SUBAGENT_HARD_TIMEOUT_MS = 15 * 60 * 1000;
+const JOBS_WAIT_DEFAULT_TIMEOUT_S = 120;
+const JOBS_WAIT_MAX_TIMEOUT_S = 900;
+const MAX_IDLE_WAKEUPS = 10;
+const JOB_ERROR_PREVIEW_CHARS = 200;
+const JOB_RESULT_CUSTOM_TYPE = "subagent-job-result";
+const JOBS_PENDING_CUSTOM_TYPE = "subagent-jobs-pending";
+const FAILED_TASK_STOP_REASON = "timeout";
+
+function formatDuration(ms: number): string {
+	const totalSeconds = Math.max(0, Math.round(ms / 1000));
+	if (totalSeconds < 60) return `${totalSeconds}s`;
+	const minutes = Math.floor(totalSeconds / 60);
+	const seconds = totalSeconds % 60;
+	if (minutes < 60) return seconds > 0 ? `${minutes}m${seconds}s` : `${minutes}m`;
+	return `${Math.floor(minutes / 60)}h${minutes % 60}m`;
+}
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -165,6 +187,19 @@ interface SubagentDetails {
 	results: SingleResult[];
 }
 
+interface JobStatusSnapshot {
+	id: string;
+	mode: DetachedJob["mode"];
+	agents: string[];
+	status: JobStatus;
+	collected: boolean;
+	elapsedMs: number;
+}
+
+interface JobWaitSnapshot extends JobStatusSnapshot {
+	results: SingleResult[];
+}
+
 function getFinalOutput(messages: Message[]): string {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];
@@ -178,7 +213,9 @@ function getFinalOutput(messages: Message[]): string {
 }
 
 function isFailedResult(result: SingleResult): boolean {
-	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+	return (
+		result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted" || result.stopReason === FAILED_TASK_STOP_REASON
+	);
 }
 
 function getResultOutput(result: SingleResult): string {
@@ -276,8 +313,8 @@ async function runSingleAgent(
 	cwd: string | undefined,
 	step: number | undefined,
 	signal: AbortSignal | undefined,
-	onUpdate: OnUpdateCallback | undefined,
-	makeDetails: (results: SingleResult[]) => SubagentDetails,
+	onUpdate?: OnUpdateCallback,
+	makeDetails?: (results: SingleResult[]) => SubagentDetails,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -320,7 +357,7 @@ async function runSingleAgent(
 	};
 
 	const emitUpdate = () => {
-		if (onUpdate) {
+		if (onUpdate && makeDetails) {
 			onUpdate({
 				content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(running...)" }],
 				details: makeDetails([currentResult]),
@@ -347,6 +384,13 @@ async function runSingleAgent(
 				stdio: ["ignore", "pipe", "pipe"],
 			});
 			let buffer = "";
+
+			const killProc = () => {
+				proc.kill("SIGTERM");
+				setTimeout(() => {
+					if (!proc.killed) proc.kill("SIGKILL");
+				}, 5000);
+			};
 
 			const processLine = (line: string) => {
 				if (!line.trim()) return;
@@ -396,25 +440,30 @@ async function runSingleAgent(
 				currentResult.stderr += data.toString();
 			});
 
+			const hardTimeout = setTimeout(() => {
+				currentResult.stopReason = FAILED_TASK_STOP_REASON;
+				currentResult.errorMessage = `Subagent run exceeded the ${formatDuration(SUBAGENT_HARD_TIMEOUT_MS)} hard timeout and was killed`;
+				killProc();
+			}, SUBAGENT_HARD_TIMEOUT_MS);
+
 			proc.on("close", (code) => {
 				if (buffer.trim()) processLine(buffer);
+				clearTimeout(hardTimeout);
 				resolve(code ?? 0);
 			});
 
 			proc.on("error", () => {
+				clearTimeout(hardTimeout);
 				resolve(1);
 			});
 
 			if (signal) {
-				const killProc = () => {
+				const killOnAbort = () => {
 					wasAborted = true;
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
+					killProc();
 				};
-				if (signal.aborted) killProc();
-				else signal.addEventListener("abort", killProc, { once: true });
+				if (signal.aborted) killOnAbort();
+				else signal.addEventListener("abort", killOnAbort, { once: true });
 			}
 		});
 
@@ -436,6 +485,160 @@ async function runSingleAgent(
 			}
 	}
 }
+
+interface DispatchStep {
+	agent: string;
+	task: string;
+	cwd?: string;
+}
+
+type JobStatus = "running" | "done" | "failed";
+
+interface DetachedJob {
+	id: string;
+	mode: "single" | "parallel" | "chain";
+	agentNames: string[];
+	taskPreview: string;
+	status: JobStatus;
+	results: SingleResult[];
+	/** Final outputs stay in the registry until collected via jobs wait or a settle-time wakeup. */
+	collected: boolean;
+	error?: string;
+	startedAt: number;
+	finishedAt?: number;
+	readonly done: Promise<void>;
+	readonly abort: AbortController;
+	readonly resolveDone: () => void;
+}
+
+function createDetachedJob(id: string, mode: DetachedJob["mode"], steps: DispatchStep[]): DetachedJob {
+	let resolveDone!: () => void;
+	const done = new Promise<void>((resolve) => {
+		resolveDone = resolve;
+	});
+	const taskPreview = steps[0]?.task.replace(/\s+/g, " ").slice(0, 80) ?? "";
+	return {
+		id,
+		mode,
+		agentNames: [...new Set(steps.map((step) => step.agent))],
+		taskPreview,
+		status: "running",
+		results: [],
+		collected: false,
+		startedAt: Date.now(),
+		done,
+		abort: new AbortController(),
+		resolveDone,
+	};
+}
+
+async function runDetachedJob(
+	job: DetachedJob,
+	steps: DispatchStep[],
+	agents: AgentConfig[],
+	dispatchDefaults: DispatchDefaults,
+	defaultCwd: string,
+): Promise<void> {
+	try {
+		let results: SingleResult[];
+		if (job.mode === "parallel") {
+			results = await mapWithConcurrencyLimit(steps, MAX_CONCURRENCY, (step) =>
+				runSingleAgent(defaultCwd, dispatchDefaults, agents, step.agent, step.task, step.cwd, undefined, job.abort.signal),
+			);
+		} else if (job.mode === "chain") {
+			results = [];
+			let previousOutput = "";
+			for (let i = 0; i < steps.length; i++) {
+				const step = steps[i];
+				const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+				const result = await runSingleAgent(
+					defaultCwd,
+					dispatchDefaults,
+					agents,
+					step.agent,
+					taskWithContext,
+					step.cwd,
+					i + 1,
+					job.abort.signal,
+				);
+				results.push(result);
+				if (isFailedResult(result)) break;
+				previousOutput = getFinalOutput(result.messages);
+			}
+		} else {
+			const step = steps[0];
+			results = [
+				await runSingleAgent(defaultCwd, dispatchDefaults, agents, step.agent, step.task, step.cwd, undefined, job.abort.signal),
+			];
+		}
+		job.results = results;
+		job.status = results.some(isFailedResult) ? "failed" : "done";
+	} catch (error) {
+		job.status = "failed";
+		job.error = error instanceof Error ? error.message : String(error);
+	} finally {
+		job.finishedAt = Date.now();
+		job.resolveDone();
+	}
+}
+
+function jobElapsed(job: DetachedJob, now: number = Date.now()): string {
+	return formatDuration((job.finishedAt ?? now) - job.startedAt);
+}
+
+function jobSnapshot(job: DetachedJob): JobStatusSnapshot {
+	return {
+		id: job.id,
+		mode: job.mode,
+		agents: job.agentNames,
+		status: job.status,
+		collected: job.collected,
+		elapsedMs: (job.finishedAt ?? Date.now()) - job.startedAt,
+	};
+}
+
+function jobResultSummary(job: DetachedJob): string {
+	if (job.results.length === 0) return job.error || "(no output)";
+	return job.results
+		.map((r) => {
+			const status = isFailedResult(r)
+				? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
+				: "completed";
+			return `### [${r.agent}] ${status}\n\n${truncateParallelOutput(getResultOutput(r))}`;
+		})
+		.join("\n\n---\n\n");
+}
+
+function jobResultMessage(job: DetachedJob): string {
+	const status = job.status === "failed" ? "failed" : "completed";
+	return `Detached subagent job ${job.id} (${job.agentNames.join(", ")}, ${job.mode}) ${status}:\n\n${jobResultSummary(job)}`;
+}
+
+function jobsPendingMessage(running: DetachedJob[]): string {
+	const list = running.map((job) => `${job.id} (${job.agentNames.join(", ")})`).join(", ");
+	return `Detached subagent jobs still running: ${list}. Call the jobs tool with action "wait" to block until they finish and collect their outputs, or continue with other work.`;
+}
+
+function formatJobStatusLine(job: DetachedJob): string {
+	const state = job.status === "running" ? `running ${jobElapsed(job)}` : `ran ${jobElapsed(job)}`;
+	let line = `${job.id} [${job.status}] ${job.agentNames.join(", ")} (${job.mode}): ${state}; task: ${job.taskPreview || "..."}`;
+	if (job.status === "running") return line;
+	line += job.collected ? "; collected" : "; output ready, collect with jobs wait";
+	if (job.status === "failed" && job.error) line += `; error: ${job.error.slice(0, JOB_ERROR_PREVIEW_CHARS)}`;
+	return line;
+}
+
+const activeJobRegistries = new Set<Map<string, DetachedJob>>();
+
+// Best-effort orphan prevention: "exit" handlers run synchronously, so the
+// SIGTERM is still delivered at shutdown (the SIGKILL fallback is not).
+process.on("exit", () => {
+	for (const registry of activeJobRegistries) {
+		for (const job of registry.values()) {
+			if (job.status === "running") job.abort.abort();
+		}
+	}
+});
 
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
@@ -463,16 +666,216 @@ const SubagentParams = Type.Object({
 	confirmProjectAgents: Type.Optional(
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
 	),
+	detach: Type.Optional(
+		Type.Boolean({
+			description:
+				'Run in the background: returns job IDs immediately instead of waiting. Collect results later with the jobs tool (status/wait); finished results are also delivered automatically when the session settles. Agents whose frontmatter sets "detach: false" reject detached dispatch. Default: false.',
+			default: false,
+		}),
+	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
 });
 
+const JobsParams = Type.Object({
+	action: StringEnum(["status", "wait"] as const, {
+		description:
+			'Status returns per-job state without blocking. Wait blocks until the jobs finish (or the timeout elapses), then returns final outputs and marks them collected.',
+	}),
+	id: Type.Optional(Type.String({ description: 'Job ID such as "job-1". Omit to cover all detached jobs in this session.' })),
+	timeout: Type.Optional(
+		Type.Number({
+			description: `Seconds to wait before returning (action "wait"). Default ${JOBS_WAIT_DEFAULT_TIMEOUT_S}, max ${JOBS_WAIT_MAX_TIMEOUT_S}.`,
+		}),
+	),
+});
+
 export default function (pi: ExtensionAPI) {
+	const jobs = new Map<string, DetachedJob>();
+	let nextJobId = 1;
+	let idleWakeups = 0;
+	let lastKnownFinishedCount = 0;
+
+	activeJobRegistries.add(jobs);
+
+	const killRunningJobs = () => {
+		for (const job of jobs.values()) {
+			if (job.status === "running") job.abort.abort();
+		}
+	};
+
+	pi.on("session_start", async () => {
+		killRunningJobs();
+		jobs.clear();
+		nextJobId = 1;
+		idleWakeups = 0;
+		lastKnownFinishedCount = 0;
+	});
+
+	pi.on("session_shutdown", async () => {
+		killRunningJobs();
+	});
+
+	// Settle-time wakeup: deliver finished detached results with one continuation.
+	// Continuations are bounded: nothing pending (empty registry or everything
+	// collected) never continues, results inject at most once per job, idle
+	// nudges for still-running jobs stop after MAX_IDLE_WAKEUPS without
+	// progress, and the per-job hard timeout guarantees running jobs resolve.
+	pi.on("agent_before_settle", async (event) => {
+		const all = Array.from(jobs.values());
+		if (all.length === 0) return {};
+
+		const finished = all.filter((job) => job.status !== "running");
+		if (finished.length > lastKnownFinishedCount) {
+			lastKnownFinishedCount = finished.length;
+			idleWakeups = 0;
+		}
+
+		const undelivered = finished.filter((job) => !job.collected);
+		if (undelivered.length > 0) {
+			for (const job of undelivered) job.collected = true;
+			return {
+				entries: [
+					...event.entries,
+					...undelivered.map(
+						(job): CustomMessageEntryDraft => ({
+							type: "custom_message",
+							customType: JOB_RESULT_CUSTOM_TYPE,
+							content: jobResultMessage(job),
+							display: true,
+							details: job.results,
+						}),
+					),
+				],
+				continue: event.outcome === "completed" ? true : undefined,
+			};
+		}
+
+		const running = all.filter((job) => job.status === "running");
+		if (running.length === 0) return {};
+		if (event.outcome !== "completed") return {};
+		if (idleWakeups >= MAX_IDLE_WAKEUPS) return {};
+		idleWakeups += 1;
+		return {
+			entries: [
+				...event.entries,
+				{
+					type: "custom_message",
+					customType: JOBS_PENDING_CUSTOM_TYPE,
+					content: jobsPendingMessage(running),
+					display: false,
+				},
+			],
+			continue: true,
+		};
+	});
+
+	pi.registerTool({
+		name: "jobs",
+		label: "Jobs",
+		description: [
+			"Inspect and collect detached subagent jobs started via the subagent tool's detach option.",
+			'action "status" returns per-job state without blocking.',
+			'action "wait" blocks until the jobs finish or the timeout elapses, then returns final outputs and marks them collected.',
+			"Results persist in the session's job registry until collected or the session ends.",
+		].join(" "),
+		parameters: JobsParams,
+
+		async execute(_toolCallId, params, signal) {
+			if (jobs.size === 0) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: 'No detached subagent jobs in this session. Start one with the subagent tool and detach: true.',
+						},
+					],
+					details: [] as JobStatusSnapshot[],
+				};
+			}
+
+			let selected: DetachedJob[];
+			if (params.id) {
+				const job = jobs.get(params.id);
+				if (!job) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Unknown job id: ${params.id}. Known jobs: ${Array.from(jobs.keys()).join(", ")}.`,
+							},
+						],
+						details: Array.from(jobs.values()).map(jobSnapshot),
+						isError: true,
+					};
+				}
+				selected = [job];
+			} else {
+				selected = Array.from(jobs.values());
+			}
+
+			if (params.action === "status") {
+				return {
+					content: [{ type: "text", text: `Detached subagent jobs:\n${selected.map(formatJobStatusLine).join("\n")}` }],
+					details: selected.map(jobSnapshot),
+				};
+			}
+
+			const timeoutSeconds = Math.min(
+				Math.max(params.timeout ?? JOBS_WAIT_DEFAULT_TIMEOUT_S, 0),
+				JOBS_WAIT_MAX_TIMEOUT_S,
+			);
+			const timeoutMs = timeoutSeconds * 1000;
+			const unfinished = selected.filter((job) => job.status === "running");
+			let timedOut = false;
+			if (unfinished.length > 0) {
+				let waitTimer: ReturnType<typeof setTimeout> | undefined;
+				const outcome = await Promise.race([
+					Promise.all(unfinished.map((job) => job.done)).then(() => "done" as const),
+					new Promise<"timeout">((resolve) => {
+						waitTimer = setTimeout(() => resolve("timeout"), timeoutMs);
+					}),
+					new Promise<"aborted">((resolve) => {
+						if (signal) {
+							if (signal.aborted) resolve("aborted");
+							else signal.addEventListener("abort", () => resolve("aborted"), { once: true });
+						}
+					}),
+				]);
+				if (waitTimer) clearTimeout(waitTimer);
+				timedOut = outcome === "timeout";
+			}
+
+			const parts: string[] = [];
+			const collectible = selected.filter((job) => job.status !== "running" && !job.collected);
+			for (const job of collectible) job.collected = true;
+			for (const job of collectible) {
+				const status = job.status === "failed" ? "failed" : "completed";
+				parts.push(`job ${job.id} (${job.agentNames.join(", ")}) ${status}:\n\n${jobResultSummary(job)}`);
+			}
+			for (const job of selected.filter((candidate) => candidate.status !== "running" && !collectible.includes(candidate))) {
+				const status = job.status === "failed" ? "failed" : "completed";
+				parts.push(`job ${job.id} (${job.agentNames.join(", ")}) ${status} (collected earlier; output not repeated)`);
+			}
+			const stillRunning = selected.filter((job) => job.status === "running");
+			if (stillRunning.length > 0) {
+				const list = stillRunning.map((job) => `${job.id} (${job.agentNames.join(", ")}, ${jobElapsed(job)})`).join(", ");
+				parts.push(
+					timedOut
+						? `Timed out after ${formatDuration(timeoutMs)} waiting for: ${list}. Call jobs wait again to keep waiting.`
+						: `Still running: ${list}. Call jobs wait again to collect outputs when they finish.`,
+				);
+			}
+			return { content: [{ type: "text", text: parts.join("\n\n---\n\n") }], details: selected.map((job): JobWaitSnapshot => ({ ...jobSnapshot(job), results: job.results })) };
+		},
+	});
+
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			'Set detach: true to run in the background: returns job IDs immediately; collect results with the jobs tool (status/wait). Agents whose frontmatter sets "detach: false" reject detached dispatch.',
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
 		].join(" "),
@@ -543,6 +946,77 @@ export default function (pi: ExtensionAPI) {
 							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
 						};
 				}
+			}
+
+			const steps: DispatchStep[] = hasChain
+				? params.chain!.map((step) => ({ agent: step.agent, task: step.task, cwd: step.cwd }))
+				: hasTasks
+					? params.tasks!.map((task) => ({ agent: task.agent, task: task.task, cwd: task.cwd }))
+					: [{ agent: params.agent!, task: params.task!, cwd: params.cwd }];
+			const mode: "single" | "parallel" | "chain" = hasChain ? "chain" : hasTasks ? "parallel" : "single";
+
+			if (params.detach) {
+				if (mode === "parallel" && steps.length > MAX_PARALLEL_TASKS) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Too many parallel tasks (${steps.length}). Max is ${MAX_PARALLEL_TASKS}.`,
+							},
+						],
+						details: makeDetails("parallel")([]),
+					};
+				}
+
+				const unknownNames = [
+					...new Set(steps.filter((step) => !agents.some((agent) => agent.name === step.agent)).map((step) => step.agent)),
+				];
+				if (unknownNames.length > 0) {
+					const available = agents.map((agent) => `${agent.name} (${agent.source})`).join(", ") || "none";
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Unknown agent(s): ${unknownNames.join(", ")}. Available agents: ${available}.`,
+							},
+						],
+						details: makeDetails(mode)([]),
+						isError: true,
+					};
+				}
+
+				const blockedNames = [
+					...new Set(
+						steps
+							.filter((step) => agents.find((agent) => agent.name === step.agent)?.detach === false)
+							.map((step) => step.agent),
+					),
+				];
+				if (blockedNames.length > 0) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Detached dispatch rejected: agent ${blockedNames.join(", ")} sets "detach: false" in its frontmatter. Dispatch ${blockedNames.length > 1 ? "them" : "it"} in blocking mode (omit detach) instead.`,
+							},
+						],
+						details: makeDetails(mode)([]),
+						isError: true,
+					};
+				}
+
+				const job = createDetachedJob(`job-${nextJobId++}`, mode, steps);
+				jobs.set(job.id, job);
+				void runDetachedJob(job, steps, agents, dispatchDefaults, ctx.cwd);
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Detached subagent job ${job.id} started (${mode}: ${job.agentNames.join(", ")}). Collect results with the jobs tool (action "status" or "wait"); finished results are also delivered automatically when this session settles.`,
+						},
+					],
+					details: makeDetails(mode)([]),
+				};
 			}
 
 			if (params.chain && params.chain.length > 0) {
@@ -720,11 +1194,13 @@ export default function (pi: ExtensionAPI) {
 
 		renderCall(args, theme, _context) {
 			const scope: AgentScope = args.agentScope ?? "user";
+			const detachLabel = args.detach ? theme.fg("warning", " detached") : "";
 			if (args.chain && args.chain.length > 0) {
 				let text =
 					theme.fg("toolTitle", theme.bold("subagent ")) +
 					theme.fg("accent", `chain (${args.chain.length} steps)`) +
-					theme.fg("muted", ` [${scope}]`);
+					theme.fg("muted", ` [${scope}]`) +
+					detachLabel;
 				for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
 					const step = args.chain[i];
 					// Clean up {previous} placeholder for display
@@ -744,7 +1220,8 @@ export default function (pi: ExtensionAPI) {
 				let text =
 					theme.fg("toolTitle", theme.bold("subagent ")) +
 					theme.fg("accent", `parallel (${args.tasks.length} tasks)`) +
-					theme.fg("muted", ` [${scope}]`);
+					theme.fg("muted", ` [${scope}]`) +
+					detachLabel;
 				for (const t of args.tasks.slice(0, 3)) {
 					const preview = t.task.length > 40 ? `${t.task.slice(0, 40)}...` : t.task;
 					text += `\n  ${theme.fg("accent", t.agent)}${theme.fg("dim", ` ${preview}`)}`;
@@ -757,7 +1234,8 @@ export default function (pi: ExtensionAPI) {
 			let text =
 				theme.fg("toolTitle", theme.bold("subagent ")) +
 				theme.fg("accent", agentName) +
-				theme.fg("muted", ` [${scope}]`);
+				theme.fg("muted", ` [${scope}]`) +
+				detachLabel;
 			text += `\n  ${theme.fg("dim", preview)}`;
 			return new Text(text, 0, 0);
 		},
