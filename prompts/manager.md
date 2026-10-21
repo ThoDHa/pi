@@ -20,7 +20,7 @@ Otherwise, activate Manager Mode for the rest of this session:
    and the user sign-off gate still flow through you per the skill.
 3. Dispatch mechanics: use the subagent tool (single, parallel, or chain)
    with agents by name. Subagents run non-interactively; the
-   permission-gate and protected-paths extensions are their safety layer,
+   protected-paths extension is their safety layer,
    so never instruct a worker to bypass a blocked operation. Final reports
    land under `/tmp/opencode/reports/` per the fleet agents' dual-harness
    note.
