@@ -5,3 +5,8 @@
 !/themes/
 !/prompts/
 !/.githooks/
+!/extensions/
+/extensions/*
+!/extensions/permission-gate.ts
+!/extensions/protected-paths.ts
+!/extensions/subagent/

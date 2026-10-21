@@ -1,1 +1,0 @@
-/home/khave/.nvm/versions/node/v24.18.0/lib/node_modules/@earendil-works/pi-coding-agent/examples/extensions/subagent/prompts/implement-and-review.md
