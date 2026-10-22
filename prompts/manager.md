@@ -22,7 +22,7 @@ Otherwise, activate Manager Mode for the rest of this session:
    with agents by name. Subagents run non-interactively; the
    protected-paths extension is their safety layer,
    so never instruct a worker to bypass a blocked operation. Final reports
-   land under `/tmp/opencode/reports/` per the fleet agents' dual-harness
+   land under `/tmp/llm/reports/` per the fleet agents' dual-harness
    note.
 4. Announce activation in one line, including the current mode (Delegating
    with the fixed fleet), then wait for the task.
