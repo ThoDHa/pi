@@ -6,5 +6,12 @@
   "modelThinkingLevels": {
     "zai/glm-5.3": "high",
     "zai/glm-5.3-flash": "max"
-  }
+  },
+  "hideThinkingBlock": false,
+  "enabledModels": [
+    "zai/glm-5.3",
+    "zai/glm-5.3-flash"
+  ],
+  "tuiMode": "fullscreen",
+  "enableInstallTelemetry": false
 }
