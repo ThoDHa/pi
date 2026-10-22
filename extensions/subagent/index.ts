@@ -53,11 +53,13 @@ const FAILED_TASK_STOP_REASON = "timeout";
 
 // SUBAGENT_TIMEOUT_MS raises the per-child hard timeout for legitimately
 // long single-child work; it is floored at the default so the env var
-// stays raise-only and the no-infinite-hang guarantee keeps holding.
+// stays raise-only and the no-infinite-hang guarantee keeps holding, and
+// capped at 2^31-1 ms because Node collapses a larger setTimeout delay
+// to 1 ms, which would kill every child as an instant bogus timeout.
 function resolveHardTimeoutMs(): number {
 	const raw = Number(process.env.SUBAGENT_TIMEOUT_MS);
 	if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_HARD_TIMEOUT_MS;
-	return Math.max(raw, DEFAULT_HARD_TIMEOUT_MS);
+	return Math.min(Math.max(raw, DEFAULT_HARD_TIMEOUT_MS), 2_147_483_647);
 }
 
 function formatDuration(ms: number): string {
