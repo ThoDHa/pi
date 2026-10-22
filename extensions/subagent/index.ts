@@ -899,7 +899,7 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text", text: parts.join("\n\n---\n\n") }],
 				details: selected.map((job): JobWaitSnapshot => ({
 					...jobSnapshot(job),
-					results: collectible.includes(job) ? job.results : [],
+					results: job.results,
 				})),
 			};
 		},
