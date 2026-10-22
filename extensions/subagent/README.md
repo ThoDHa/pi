@@ -9,7 +9,7 @@ Delegate tasks to specialized subagents with isolated context windows.
 - **Parallel streaming**: All parallel tasks stream updates simultaneously
 - **Detached dispatch**: Optional `detach: true` runs any mode in the background and returns job IDs immediately
 - **Jobs tool**: `jobs status` polls detached jobs without blocking; `jobs wait` blocks for final outputs and collects them
-- **Settle-time wakeup**: Finished detached results are delivered automatically between turns, with no continuation once everything is collected
+- **Wake on completion**: Finished detached results are delivered the moment a job finishes; an idle session wakes with exactly one turn, and nothing runs while jobs are still in flight
 - **Markdown rendering**: Final output rendered with proper formatting (expanded view)
 - **Usage tracking**: Shows turns, tokens, cost, and context usage per agent
 - **Abort support**: Ctrl+C propagates to kill subagent processes
@@ -117,9 +117,9 @@ The `jobs` tool inspects and collects detached jobs:
 | `jobs { action: "status" }` | Non-blocking per-job state: running/done/failed, elapsed time, task preview, and whether results are already collected |
 | `jobs { action: "wait", id?, timeout? }` | Blocks until the selected jobs finish or the timeout elapses (default 120s, max 900s), then returns final outputs once and marks them collected |
 
-Omitting `id` selects every job in the session. A second `wait` for an already-collected job reports `collected earlier; output not repeated` instead of re-printing the results, and the settle-time wakeup never re-delivers them. A job whose child process is killed mid-run (including jobs still running when the session shuts down) is marked `failed` with the abort reason. At most 4 detached jobs run at once; a detach call that would exceed the cap is rejected until earlier jobs finish.
+Omitting `id` selects every job in the session. A second `wait` for an already-collected job reports `collected earlier; output not repeated` instead of re-printing the results, and the completion wake never re-delivers them. A job whose child process is killed mid-run (including jobs still running when the session shuts down) is marked `failed` with the abort reason. At most 4 detached jobs run at once; a detach call that would exceed the cap is rejected until earlier jobs finish.
 
-**Settle-time wakeup**: when the session settles with finished-but-uncollected detached jobs, the extension injects their final outputs as a custom message and requests exactly one continuation so the agent can use them. Each job's results are injected at most once. While jobs are still running, settlement injects a hidden reminder (with a bounded number of idle continuations, reset whenever a job finishes) suggesting `jobs wait`; an empty or fully collected registry never continues.
+**Wake on completion**: when a detached job finishes (done, failed, or hard timeout), the extension sends its final outputs as a custom message with a turn trigger. An idle session wakes immediately with exactly one turn; while a run is active, the message is queued into it. Each job's results are delivered at most once. A `jobs wait` already blocked on the job when it finishes collects the outputs itself and suppresses the wake, and settlement keeps a fallback that delivers finished-but-uncollected results with one continuation if completion races settlement, so no result can fall through.
 
 **Timeouts**: every child process has a 60 minute hard timeout in the spawn path, after which it is killed (SIGTERM, then SIGKILL) and the job is marked failed. This applies to blocking dispatch too, where a hung subagent previously waited forever. The `SUBAGENT_TIMEOUT_MS` environment variable raises the timeout for legitimately long single-child work; values below or at the 60 minute default are clamped up to the default and values above 2147483647 ms (Node.js's largest timer delay, about 24.8 days) are clamped down to it, so the env var is raise-only and a run can never hang forever.
 

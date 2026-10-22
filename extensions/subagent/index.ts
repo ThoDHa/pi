@@ -11,7 +11,7 @@
  *
  * Every mode also supports detach: true, which registers the dispatch in a
  * session-scoped job registry, returns job IDs immediately, and delivers
- * results later via the jobs tool or a settle-time wakeup.
+ * results later via the jobs tool or a wake on completion.
  *
  * Uses JSON mode to capture structured output from subagents.
  */
@@ -45,10 +45,8 @@ const SUBAGENT_HARD_TIMEOUT_MS = resolveHardTimeoutMs();
 const MAX_RUNNING_DETACHED_JOBS = 4;
 const JOBS_WAIT_DEFAULT_TIMEOUT_S = 120;
 const JOBS_WAIT_MAX_TIMEOUT_S = 900;
-const MAX_IDLE_WAKEUPS = 10;
 const JOB_ERROR_PREVIEW_CHARS = 200;
 const JOB_RESULT_CUSTOM_TYPE = "subagent-job-result";
-const JOBS_PENDING_CUSTOM_TYPE = "subagent-jobs-pending";
 const FAILED_TASK_STOP_REASON = "timeout";
 
 // SUBAGENT_TIMEOUT_MS raises the per-child hard timeout for legitimately
@@ -541,7 +539,7 @@ interface DetachedJob {
 	taskPreview: string;
 	status: JobStatus;
 	results: SingleResult[];
-	/** Final outputs stay in the registry until collected via jobs wait or a settle-time wakeup. */
+	/** Final outputs stay in the registry until collected via jobs wait or the completion wake. */
 	collected: boolean;
 	error?: string;
 	startedAt: number;
@@ -578,6 +576,7 @@ async function runDetachedJob(
 	agents: AgentConfig[],
 	dispatchDefaults: DispatchDefaults,
 	defaultCwd: string,
+	onJobFinished: (job: DetachedJob) => void,
 ): Promise<void> {
 	try {
 		let results: SingleResult[];
@@ -619,6 +618,7 @@ async function runDetachedJob(
 	} finally {
 		job.finishedAt = Date.now();
 		job.resolveDone();
+		onJobFinished(job);
 	}
 }
 
@@ -652,11 +652,6 @@ function jobResultSummary(job: DetachedJob): string {
 function jobResultMessage(job: DetachedJob): string {
 	const status = job.status === "failed" ? "failed" : "completed";
 	return `Detached subagent job ${job.id} (${job.agentNames.join(", ")}, ${job.mode}) ${status}:\n\n${jobResultSummary(job)}`;
-}
-
-function jobsPendingMessage(running: DetachedJob[]): string {
-	const list = running.map((job) => `${job.id} (${job.agentNames.join(", ")})`).join(", ");
-	return `Detached subagent jobs still running: ${list}. Call the jobs tool with action "wait" to block until they finish and collect their outputs, or continue with other work.`;
 }
 
 function formatJobStatusLine(job: DetachedJob): string {
@@ -709,7 +704,7 @@ const SubagentParams = Type.Object({
 	detach: Type.Optional(
 		Type.Boolean({
 			description:
-				'Run in the background: returns job IDs immediately instead of waiting. Collect results later with the jobs tool (status/wait); finished results are also delivered automatically when the session settles. Agents whose frontmatter sets "detach: false" reject detached dispatch. Default: false.',
+				'Run in the background: returns job IDs immediately instead of waiting. Collect results later with the jobs tool (status/wait); finished results are also delivered automatically as soon as the job finishes. Agents whose frontmatter sets "detach: false" reject detached dispatch. Default: false.',
 			default: false,
 		}),
 	),
@@ -732,8 +727,7 @@ const JobsParams = Type.Object({
 export default function (pi: ExtensionAPI) {
 	const jobs = new Map<string, DetachedJob>();
 	let nextJobId = 1;
-	let idleWakeups = 0;
-	let lastKnownFinishedCount = 0;
+	let shuttingDown = false;
 
 	activeJobRegistries.add(jobs);
 
@@ -743,70 +737,65 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
+	// Completion wake: when a detached job finishes, deliver its result with one
+	// triggered turn. The check defers to a macrotask so an in-flight jobs wait,
+	// which collects in microtasks after resolveDone, keeps owning delivery for
+	// the jobs it covers; the shared collected flag keeps delivery exactly once.
+	// The registry-membership check drops jobs aborted for a cleared or replaced
+	// session, and shuttingDown drops jobs aborted at shutdown, whose sendMessage
+	// would otherwise start a ghost run on the dead session.
+	const wakeOnCompletion = (job: DetachedJob) => {
+		setTimeout(() => {
+			if (shuttingDown || job.collected || jobs.get(job.id) !== job) return;
+			job.collected = true;
+			pi.sendMessage(
+				{
+					customType: JOB_RESULT_CUSTOM_TYPE,
+					content: jobResultMessage(job),
+					display: true,
+					details: job.results,
+				},
+				{ triggerTurn: true },
+			);
+		}, 0);
+	};
+
 	pi.on("session_start", async () => {
 		killRunningJobs();
 		jobs.clear();
 		nextJobId = 1;
-		idleWakeups = 0;
-		lastKnownFinishedCount = 0;
+		shuttingDown = false;
 	});
 
 	pi.on("session_shutdown", async () => {
+		shuttingDown = true;
 		killRunningJobs();
 		activeJobRegistries.delete(jobs);
 	});
 
-	// Settle-time wakeup: deliver finished detached results with one continuation.
-	// Continuations are bounded: nothing pending (empty registry or everything
-	// collected) never continues, results inject at most once per job, idle
-	// nudges for still-running jobs stop after MAX_IDLE_WAKEUPS without
-	// progress, and the per-job hard timeout guarantees running jobs resolve.
+	// Settle-time fallback: completion normally delivers results via the wake,
+	// but a job can land finished and uncollected here when completion races
+	// settlement processing. The shared collected flag keeps delivery exactly
+	// once; an empty or fully collected registry never continues.
 	pi.on("agent_before_settle", async (event) => {
-		const all = Array.from(jobs.values());
-		if (all.length === 0) return {};
+		const undelivered = Array.from(jobs.values()).filter((job) => job.status !== "running" && !job.collected);
+		if (undelivered.length === 0) return {};
 
-		const finished = all.filter((job) => job.status !== "running");
-		if (finished.length > lastKnownFinishedCount) {
-			lastKnownFinishedCount = finished.length;
-			idleWakeups = 0;
-		}
-
-		const undelivered = finished.filter((job) => !job.collected);
-		if (undelivered.length > 0) {
-			for (const job of undelivered) job.collected = true;
-			return {
-				entries: [
-					...event.entries,
-					...undelivered.map(
-						(job): CustomMessageEntryDraft => ({
-							type: "custom_message",
-							customType: JOB_RESULT_CUSTOM_TYPE,
-							content: jobResultMessage(job),
-							display: true,
-							details: job.results,
-						}),
-					),
-				],
-				continue: event.outcome === "completed" ? true : undefined,
-			};
-		}
-
-		const running = all.filter((job) => job.status === "running");
-		if (running.length === 0) return {};
-		if (event.outcome !== "completed") return {};
-		if (idleWakeups >= MAX_IDLE_WAKEUPS) return {};
-		idleWakeups += 1;
+		for (const job of undelivered) job.collected = true;
 		return {
 			entries: [
 				...event.entries,
-				{
-					type: "custom_message",
-					customType: JOBS_PENDING_CUSTOM_TYPE,
-					content: jobsPendingMessage(running),
-					display: false,
-				},
+				...undelivered.map(
+					(job): CustomMessageEntryDraft => ({
+						type: "custom_message",
+						customType: JOB_RESULT_CUSTOM_TYPE,
+						content: jobResultMessage(job),
+						display: true,
+						details: job.results,
+					}),
+				),
 			],
-			continue: true,
+			continue: event.outcome === "completed" ? true : undefined,
 		};
 	});
 
@@ -1048,12 +1037,12 @@ export default function (pi: ExtensionAPI) {
 
 				const job = createDetachedJob(`job-${nextJobId++}`, mode, steps);
 				jobs.set(job.id, job);
-				void runDetachedJob(job, steps, agents, dispatchDefaults, ctx.cwd);
+				void runDetachedJob(job, steps, agents, dispatchDefaults, ctx.cwd, wakeOnCompletion);
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Detached subagent job ${job.id} started (${mode}: ${job.agentNames.join(", ")}). Collect results with the jobs tool (action "status" or "wait"); finished results are also delivered automatically when this session settles.`,
+							text: `Detached subagent job ${job.id} started (${mode}: ${job.agentNames.join(", ")}). Collect results with the jobs tool (action "status" or "wait"); finished results are also delivered automatically as soon as the job finishes.`,
 						},
 					],
 					details: makeDetails(mode)([]),
