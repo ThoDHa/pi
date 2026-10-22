@@ -117,11 +117,11 @@ The `jobs` tool inspects and collects detached jobs:
 | `jobs { action: "status" }` | Non-blocking per-job state: running/done/failed, elapsed time, task preview, and whether results are already collected |
 | `jobs { action: "wait", id?, timeout? }` | Blocks until the selected jobs finish or the timeout elapses (default 120s, max 900s), then returns final outputs once and marks them collected |
 
-Omitting `id` selects every job in the session. A second `wait` for an already-collected job reports `collected earlier; output not repeated` instead of re-printing the results, and the settle-time wakeup never re-delivers them. A job whose child process is killed mid-run (including jobs still running when the session shuts down) is marked `failed` with the abort reason.
+Omitting `id` selects every job in the session. A second `wait` for an already-collected job reports `collected earlier; output not repeated` instead of re-printing the results, and the settle-time wakeup never re-delivers them. A job whose child process is killed mid-run (including jobs still running when the session shuts down) is marked `failed` with the abort reason. At most 4 detached jobs run at once; a detach call that would exceed the cap is rejected until earlier jobs finish.
 
 **Settle-time wakeup**: when the session settles with finished-but-uncollected detached jobs, the extension injects their final outputs as a custom message and requests exactly one continuation so the agent can use them. Each job's results are injected at most once. While jobs are still running, settlement injects a hidden reminder (with a bounded number of idle continuations, reset whenever a job finishes) suggesting `jobs wait`; an empty or fully collected registry never continues.
 
-**Timeouts**: every child process has a 15 minute hard timeout in the spawn path, after which it is killed (SIGTERM, then SIGKILL) and the job is marked failed. This applies to blocking dispatch too, where a hung subagent previously waited forever.
+**Timeouts**: every child process has a 15 minute hard timeout in the spawn path, after which it is killed (SIGTERM, then SIGKILL) and the job is marked failed. This applies to blocking dispatch too, where a hung subagent previously waited forever. The `SUBAGENT_TIMEOUT_MS` environment variable raises the timeout for legitimately long single-child work; values below or at the 15 minute default are clamped up to the default, so the env var is raise-only and a run can never hang forever.
 
 **Per-agent policy**: an agent whose frontmatter sets `detach: false` rejects detached dispatch with a clear error and can only be dispatched in blocking mode; blocking dispatch of that agent is unaffected. There are no hardcoded agent names in the extension; the flag is discovered from frontmatter like `tools` and `model`.
 
@@ -179,7 +179,7 @@ Project agents override user agents with the same name when `agentScope: "both"`
 
 | Agent | Purpose | Model | Tools |
 |-------|---------|-------|-------|
-| `scout` | Fast codebase recon (blocking only, `detach: false`) | Haiku | read, grep, find, ls, bash |
+| `scout` | Fast codebase recon (blocking only, `detach: false`) | glm-5.3-flash | read, bash |
 | `planner` | Implementation plans | Sonnet | read, grep, find, ls |
 | `reviewer` | Code review | Sonnet | read, grep, find, ls, bash |
 | `worker` | General-purpose | Sonnet | (all default) |
@@ -197,7 +197,7 @@ Project agents override user agents with the same name when `agentScope: "both"`
 - **Exit code != 0**: Tool returns error with stderr/output
 - **stopReason "error"**: LLM error propagated with error message
 - **stopReason "aborted"**: User abort (Ctrl+C) kills subprocess, throws error
-- **stopReason "timeout"**: Child exceeded the 15 minute hard timeout and was killed
+- **stopReason "timeout"**: Child exceeded the hard timeout (default 15 minutes, raisable via `SUBAGENT_TIMEOUT_MS`) and was killed
 - **Chain mode**: Stops at first failing step, reports which step failed
 - **Detached jobs**: Failures mark the job `failed` in the registry; the outputs of failed jobs are delivered like any other result
 
@@ -208,3 +208,4 @@ Project agents override user agents with the same name when `agentScope: "both"`
 - Agents discovered fresh on each invocation (allows editing mid-session)
 - Parallel mode limited to 8 tasks, 4 concurrent
 - Detached jobs and their results live in memory for the current session only; a new session starts with an empty registry and kills any still-running children
+- At most 4 detached jobs run at a time per session; further detach calls are rejected until running jobs finish

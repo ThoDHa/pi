@@ -40,7 +40,9 @@ const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
-const SUBAGENT_HARD_TIMEOUT_MS = 15 * 60 * 1000;
+const DEFAULT_HARD_TIMEOUT_MS = 15 * 60 * 1000;
+const SUBAGENT_HARD_TIMEOUT_MS = resolveHardTimeoutMs();
+const MAX_RUNNING_DETACHED_JOBS = 4;
 const JOBS_WAIT_DEFAULT_TIMEOUT_S = 120;
 const JOBS_WAIT_MAX_TIMEOUT_S = 900;
 const MAX_IDLE_WAKEUPS = 10;
@@ -48,6 +50,15 @@ const JOB_ERROR_PREVIEW_CHARS = 200;
 const JOB_RESULT_CUSTOM_TYPE = "subagent-job-result";
 const JOBS_PENDING_CUSTOM_TYPE = "subagent-jobs-pending";
 const FAILED_TASK_STOP_REASON = "timeout";
+
+// SUBAGENT_TIMEOUT_MS raises the per-child hard timeout for legitimately
+// long single-child work; it is floored at the default so the env var
+// stays raise-only and the no-infinite-hang guarantee keeps holding.
+function resolveHardTimeoutMs(): number {
+	const raw = Number(process.env.SUBAGENT_TIMEOUT_MS);
+	if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_HARD_TIMEOUT_MS;
+	return Math.max(raw, DEFAULT_HARD_TIMEOUT_MS);
+}
 
 function formatDuration(ms: number): string {
 	const totalSeconds = Math.max(0, Math.round(ms / 1000));
@@ -417,8 +428,13 @@ async function runSingleAgent(
 							currentResult.usage.contextTokens = usage.totalTokens || 0;
 						}
 						if (!currentResult.model && msg.model) currentResult.model = msg.model;
-						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
+						// After the hard timeout fired, residual buffered lines from the
+						// dying child must not overwrite the timeout classification, or
+						// a killed run presents a mid-run stopReason and classifies done.
+						if (currentResult.stopReason !== FAILED_TASK_STOP_REASON) {
+							if (msg.stopReason) currentResult.stopReason = msg.stopReason;
+							if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
+						}
 					}
 					emitUpdate();
 				}
@@ -490,6 +506,28 @@ interface DispatchStep {
 	agent: string;
 	task: string;
 	cwd?: string;
+}
+
+// Pre-flight validation shared by the detach and blocking-parallel paths:
+// rejects an oversized parallel fan-out and, aggregating across all steps
+// before anything spawns, unknown agent names. Returns null when the steps
+// are dispatchable.
+function validateDispatchSteps(
+	mode: "single" | "parallel" | "chain",
+	steps: DispatchStep[],
+	agents: AgentConfig[],
+): { message: string; isError: boolean } | null {
+	if (mode === "parallel" && steps.length > MAX_PARALLEL_TASKS) {
+		return { message: `Too many parallel tasks (${steps.length}). Max is ${MAX_PARALLEL_TASKS}.`, isError: false };
+	}
+	const unknownNames = [
+		...new Set(steps.filter((step) => !agents.some((agent) => agent.name === step.agent)).map((step) => step.agent)),
+	];
+	if (unknownNames.length > 0) {
+		const available = agents.map((agent) => `${agent.name} (${agent.source})`).join(", ") || "none";
+		return { message: `Unknown agent(s): ${unknownNames.join(", ")}. Available agents: ${available}.`, isError: true };
+	}
+	return null;
 }
 
 type JobStatus = "running" | "done" | "failed";
@@ -713,6 +751,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		killRunningJobs();
+		activeJobRegistries.delete(jobs);
 	});
 
 	// Settle-time wakeup: deliver finished detached results with one continuation.
@@ -865,7 +904,13 @@ export default function (pi: ExtensionAPI) {
 						: `Still running: ${list}. Call jobs wait again to collect outputs when they finish.`,
 				);
 			}
-			return { content: [{ type: "text", text: parts.join("\n\n---\n\n") }], details: selected.map((job): JobWaitSnapshot => ({ ...jobSnapshot(job), results: job.results })) };
+			return {
+				content: [{ type: "text", text: parts.join("\n\n---\n\n") }],
+				details: selected.map((job): JobWaitSnapshot => ({
+					...jobSnapshot(job),
+					results: collectible.includes(job) ? job.results : [],
+				})),
+			};
 		},
 	});
 
@@ -956,28 +1001,22 @@ export default function (pi: ExtensionAPI) {
 			const mode: "single" | "parallel" | "chain" = hasChain ? "chain" : hasTasks ? "parallel" : "single";
 
 			if (params.detach) {
-				if (mode === "parallel" && steps.length > MAX_PARALLEL_TASKS) {
+				const rejection = validateDispatchSteps(mode, steps, agents);
+				if (rejection) {
 					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many parallel tasks (${steps.length}). Max is ${MAX_PARALLEL_TASKS}.`,
-							},
-						],
-						details: makeDetails("parallel")([]),
+						content: [{ type: "text", text: rejection.message }],
+						details: makeDetails(mode)([]),
+						isError: rejection.isError,
 					};
 				}
 
-				const unknownNames = [
-					...new Set(steps.filter((step) => !agents.some((agent) => agent.name === step.agent)).map((step) => step.agent)),
-				];
-				if (unknownNames.length > 0) {
-					const available = agents.map((agent) => `${agent.name} (${agent.source})`).join(", ") || "none";
+				const runningJobs = Array.from(jobs.values()).filter((job) => job.status === "running");
+				if (runningJobs.length >= MAX_RUNNING_DETACHED_JOBS) {
 					return {
 						content: [
 							{
 								type: "text",
-								text: `Unknown agent(s): ${unknownNames.join(", ")}. Available agents: ${available}.`,
+								text: `Too many running detached jobs (${runningJobs.length}). Max is ${MAX_RUNNING_DETACHED_JOBS}. Collect finished results with the jobs tool and wait for running jobs to finish before starting more.`,
 							},
 						],
 						details: makeDetails(mode)([]),
@@ -1074,16 +1113,14 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.tasks && params.tasks.length > 0) {
-				if (params.tasks.length > MAX_PARALLEL_TASKS)
+				const rejection = validateDispatchSteps("parallel", steps, agents);
+				if (rejection) {
 					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
-							},
-						],
+						content: [{ type: "text", text: rejection.message }],
 						details: makeDetails("parallel")([]),
+						isError: rejection.isError,
 					};
+				}
 
 				// Track all results for streaming updates
 				const allResults: SingleResult[] = new Array(params.tasks.length);
