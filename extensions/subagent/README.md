@@ -121,7 +121,7 @@ Omitting `id` selects every job in the session. A second `wait` for an already-c
 
 **Settle-time wakeup**: when the session settles with finished-but-uncollected detached jobs, the extension injects their final outputs as a custom message and requests exactly one continuation so the agent can use them. Each job's results are injected at most once. While jobs are still running, settlement injects a hidden reminder (with a bounded number of idle continuations, reset whenever a job finishes) suggesting `jobs wait`; an empty or fully collected registry never continues.
 
-**Timeouts**: every child process has a 15 minute hard timeout in the spawn path, after which it is killed (SIGTERM, then SIGKILL) and the job is marked failed. This applies to blocking dispatch too, where a hung subagent previously waited forever. The `SUBAGENT_TIMEOUT_MS` environment variable raises the timeout for legitimately long single-child work; values below or at the 15 minute default are clamped up to the default and values above 2147483647 ms (Node.js's largest timer delay, about 24.8 days) are clamped down to it, so the env var is raise-only and a run can never hang forever.
+**Timeouts**: every child process has a 60 minute hard timeout in the spawn path, after which it is killed (SIGTERM, then SIGKILL) and the job is marked failed. This applies to blocking dispatch too, where a hung subagent previously waited forever. The `SUBAGENT_TIMEOUT_MS` environment variable raises the timeout for legitimately long single-child work; values below or at the 60 minute default are clamped up to the default and values above 2147483647 ms (Node.js's largest timer delay, about 24.8 days) are clamped down to it, so the env var is raise-only and a run can never hang forever.
 
 **Per-agent policy**: an agent whose frontmatter sets `detach: false` rejects detached dispatch with a clear error and can only be dispatched in blocking mode; blocking dispatch of that agent is unaffected. There are no hardcoded agent names in the extension; the flag is discovered from frontmatter like `tools` and `model`.
 
@@ -197,7 +197,7 @@ Project agents override user agents with the same name when `agentScope: "both"`
 - **Exit code != 0**: Tool returns error with stderr/output
 - **stopReason "error"**: LLM error propagated with error message
 - **stopReason "aborted"**: User abort (Ctrl+C) kills subprocess, throws error
-- **stopReason "timeout"**: Child exceeded the hard timeout (default 15 minutes, raisable via `SUBAGENT_TIMEOUT_MS`) and was killed
+- **stopReason "timeout"**: Child exceeded the hard timeout (default 60 minutes, raisable via `SUBAGENT_TIMEOUT_MS`) and was killed
 - **Chain mode**: Stops at first failing step, reports which step failed
 - **Detached jobs**: Failures mark the job `failed` in the registry; the outputs of failed jobs are delivered like any other result
 
