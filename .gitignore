@@ -2,6 +2,7 @@
 !/.gitignore
 !/README.md
 !/settings.json
+!/AGENTS.md
 !/themes/
 !/prompts/
 !/.githooks/
