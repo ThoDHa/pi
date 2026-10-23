@@ -420,18 +420,24 @@ export function extractLastActivity(messages: ActivityMessage[]): string | undef
  * raw name and arguments beside the shared one-line description.
  * Thinking-only messages contribute nothing. Capped at the most
  * recent ACTIVITY_LOG_MAX entries so a long run cannot grow the
- * shared state without bound.
+ * shared state without bound: the cap is collected by walking the
+ * stream in reverse and stopping once the cap is full, so the scan
+ * cost tracks the cap rather than the run length; the output is
+ * byte-identical to the full forward walk it replaced (pinned by the
+ * identity suite).
  */
 export function extractActivityLog(messages: ActivityMessage[]): DispatchActivityEntry[] {
-	const entries: DispatchActivityEntry[] = [];
-	for (const message of messages) {
+	const collected: DispatchActivityEntry[] = [];
+	for (let i = messages.length - 1; i >= 0 && collected.length < ACTIVITY_LOG_MAX; i--) {
+		const message = messages[i];
 		if (message.role !== "assistant") continue;
 		const at = message.timestamp ?? 0;
-		for (const part of message.content) {
+		for (let j = message.content.length - 1; j >= 0 && collected.length < ACTIVITY_LOG_MAX; j--) {
+			const part = message.content[j];
 			if (part.type === "text" && part.text?.trim()) {
-				entries.push({ at, kind: "text", text: truncateActivity(part.text) });
+				collected.push({ at, kind: "text", text: truncateActivity(part.text) });
 			} else if (part.type === "toolCall" && part.name) {
-				entries.push({
+				collected.push({
 					at,
 					kind: "toolCall",
 					text: describeToolCall(part.name, part.arguments ?? {}),
@@ -441,5 +447,5 @@ export function extractActivityLog(messages: ActivityMessage[]): DispatchActivit
 			}
 		}
 	}
-	return entries.length > ACTIVITY_LOG_MAX ? entries.slice(entries.length - ACTIVITY_LOG_MAX) : entries;
+	return collected.reverse();
 }

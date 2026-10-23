@@ -205,6 +205,78 @@ assert.equal(capped.length, ACTIVITY_LOG_MAX, "the activity log is capped");
 assert.equal(capped[0].text, `line ${flooded.length - ACTIVITY_LOG_MAX}`, "the cap keeps the most recent entries");
 assert.equal(capped[capped.length - 1].text, `line ${flooded.length - 1}`);
 
+// --- extractActivityLog: tail-scan output identity with the forward-walk reference ---
+
+// The pre-tail-scan algorithm, verbatim in semantics: full forward
+// walk building every entry, then a tail slice. The module's
+// extractActivityLog must reproduce its output byte-for-byte on every
+// fixture, including where the cap splits a message's parts.
+function forwardActivityLog(messages) {
+	const truncate = (text) => {
+		const collapsed = text.replace(/\s+/g, " ").trim();
+		return collapsed.length > 60 ? `${collapsed.slice(0, 60)}…` : collapsed;
+	};
+	const describe = (name, args) => {
+		const firstString = (value) => (typeof value === "string" ? value : undefined);
+		switch (name) {
+			case "bash": return `$ ${truncate(firstString(args.command) ?? "...")}`;
+			case "read": return `read ${truncate(firstString(args.file_path ?? args.path) ?? "...")}`;
+			case "write": return `write ${truncate(firstString(args.file_path ?? args.path) ?? "...")}`;
+			case "edit": return `edit ${truncate(firstString(args.file_path ?? args.path) ?? "...")}`;
+			case "grep": return `grep ${truncate(firstString(args.pattern) ?? "")}`;
+			case "find": return `find ${truncate(firstString(args.pattern) ?? "")}`;
+			default: return name;
+		}
+	};
+	const entries = [];
+	for (const message of messages) {
+		if (message.role !== "assistant") continue;
+		const at = message.timestamp ?? 0;
+		for (const part of message.content) {
+			if (part.type === "text" && part.text?.trim()) {
+				entries.push({ at, kind: "text", text: truncate(part.text) });
+			} else if (part.type === "toolCall" && part.name) {
+				entries.push({ at, kind: "toolCall", text: describe(part.name, part.arguments ?? {}), name: part.name, args: part.arguments });
+			}
+		}
+	}
+	return entries.length > ACTIVITY_LOG_MAX ? entries.slice(entries.length - ACTIVITY_LOG_MAX) : entries;
+}
+
+const dense = Array.from({ length: 40 }, (_, i) => ({
+	role: "assistant",
+	timestamp: i,
+	content: [
+		{ type: "thinking", text: `skip ${i}` },
+		{ type: "text", text: `alpha step ${i}` },
+		{ type: "text", text: `beta step ${i}` },
+		{ type: "text", text: `gamma step ${i}` },
+	],
+}));
+assert.deepEqual(extractActivityLog(dense), forwardActivityLog(dense), "identity on an over-cap run whose cap splits a message's parts");
+
+const toolStream = Array.from({ length: 30 }, (_, i) => ({
+	role: "assistant",
+	timestamp: 1_000 + i,
+	content: [
+		{ type: "text", text: `probe ${i}` },
+		{ type: "toolCall", name: i % 2 ? "bash" : "grep", arguments: i % 2 ? { command: `rg case ${i}` } : { pattern: `pat-${i}` } },
+	],
+}));
+assert.deepEqual(extractActivityLog(toolStream), forwardActivityLog(toolStream), "identity with tool-call entries across the cap");
+
+const exactCap = Array.from({ length: ACTIVITY_LOG_MAX }, (_, i) => ({ role: "assistant", timestamp: i, content: [{ type: "text", text: `exact ${i}` }] }));
+assert.deepEqual(extractActivityLog(exactCap), forwardActivityLog(exactCap), "identity at exactly the cap");
+
+const sparseMixed = [
+	{ role: "user", content: [{ type: "text", text: "prompt" }] },
+	{ role: "assistant", content: [{ type: "thinking", text: "hmm" }] },
+	{ role: "assistant", timestamp: 5, content: [{ type: "text", text: "a  spaced\nout" }] },
+	{ role: "assistant", content: [{ type: "text", text: "b" }, { type: "toolCall", name: "edit", arguments: { file_path: "/tmp/x.ts" } }] },
+	{ role: "assistant", timestamp: 6, content: [{ type: "text", text: "tail" }] },
+];
+assert.deepEqual(extractActivityLog(sparseMixed), forwardActivityLog(sparseMixed), "identity under the cap with untimed and thinking-only messages");
+
 // --- mergeAgentUpdate: the defined-field merge both publishers share ---
 
 const mergedNode = { agent: "worker", status: "running", startedAt: NOW };
