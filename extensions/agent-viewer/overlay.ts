@@ -35,7 +35,6 @@ export const NAVIGATOR_POLL_INTERVAL_MS = 300;
 export interface NavigatorSources {
 	registry: DispatchRegistry;
 	detachedJobs: DetachedJobSnapshot[];
-	navigatorKey: string;
 }
 
 const TREE_PANE_MIN_WIDTH = 26;

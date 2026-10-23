@@ -166,7 +166,6 @@ export default function (pi: ExtensionAPI) {
 							new NavigatorOverlay(tui, theme, {
 								registry: shared.registry,
 								detachedJobs: shared.detachedJobs,
-								navigatorKey: viewerKeys.navigatorKey,
 							}, done),
 						{ overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "85%" } },
 					);
