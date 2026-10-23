@@ -30,11 +30,21 @@ import {
 	formatReadLineRange,
 	getAgentDir,
 	getMarkdownTheme,
+	type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import { Container, Markdown, Spacer, Text, truncateToWidth, type Component, type KeyId, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { resolveTaskLabel } from "./labels.ts";
 import { releasePromptDir, writePromptToTempFile } from "./prompt-temp.ts";
+import { createDispatchRegistry, extractLastActivity, type DispatchRegistry } from "./registry.ts";
+import {
+	buildStripTasks,
+	formatDuration,
+	renderStripLines,
+	statusGlyph,
+	STRIP_MAX_LINES,
+} from "./strip.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -48,6 +58,13 @@ const JOBS_WAIT_MAX_TIMEOUT_S = 900;
 const JOB_ERROR_PREVIEW_CHARS = 200;
 const JOB_RESULT_CUSTOM_TYPE = "subagent-job-result";
 const FAILED_TASK_STOP_REASON = "timeout";
+const STRIP_WIDGET_KEY = "subagent-dispatch-strip";
+const STRIP_POLL_INTERVAL_MS = 500;
+// Hardcoded defaults so both hotkeys work with no `subagentViewer`
+// settings block present; both are unused in pi's built-in keybindings
+// (checked against docs/keybindings.md at pi 1.4.0).
+const DEFAULT_STRIP_KEY = "alt+s";
+const DEFAULT_NAVIGATOR_KEY = "alt+n";
 
 // SUBAGENT_TIMEOUT_MS raises the per-child hard timeout for legitimately
 // long single-child work; it is floored at the default so the env var
@@ -58,15 +75,6 @@ function resolveHardTimeoutMs(): number {
 	const raw = Number(process.env.SUBAGENT_TIMEOUT_MS);
 	if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_HARD_TIMEOUT_MS;
 	return Math.min(Math.max(raw, DEFAULT_HARD_TIMEOUT_MS), 2_147_483_647);
-}
-
-function formatDuration(ms: number): string {
-	const totalSeconds = Math.max(0, Math.round(ms / 1000));
-	if (totalSeconds < 60) return `${totalSeconds}s`;
-	const minutes = Math.floor(totalSeconds / 60);
-	const seconds = totalSeconds % 60;
-	if (minutes < 60) return seconds > 0 ? `${minutes}m${seconds}s` : `${minutes}m`;
-	return `${Math.floor(minutes / 60)}h${minutes % 60}m`;
 }
 
 function formatTokens(count: number): string {
@@ -227,6 +235,30 @@ function isFailedResult(result: SingleResult): boolean {
 	return (
 		result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted" || result.stopReason === FAILED_TASK_STOP_REASON
 	);
+}
+
+/**
+ * Publish one streaming or final result snapshot into the dispatch
+ * registry (exitCode -1 = still running). The blocking single,
+ * parallel, and chain paths call this from their update callbacks and
+ * after each agent completes, keeping the ambient strip live.
+ */
+function syncRegistryAgent(
+	registry: DispatchRegistry,
+	taskId: string,
+	roundIndex: number,
+	slot: number,
+	result: SingleResult | undefined,
+): void {
+	if (!result) return;
+	const finished = result.exitCode !== -1;
+	registry.updateAgent(taskId, roundIndex, slot, {
+		status: !finished ? "running" : isFailedResult(result) ? "failed" : "done",
+		lastActivity: extractLastActivity(result.messages),
+		usage: { ...result.usage },
+		result: { exitCode: result.exitCode, stopReason: result.stopReason, errorMessage: result.errorMessage },
+		finishedAt: finished ? Date.now() : undefined,
+	});
 }
 
 function getResultOutput(result: SingleResult): string {
@@ -631,12 +663,12 @@ function jobResultSummary(job: DetachedJob): string {
 
 function jobResultMessage(job: DetachedJob): string {
 	const status = job.status === "failed" ? "failed" : "completed";
-	return `Detached subagent job ${job.id} (${job.agentNames.join(", ")}, ${job.mode}) ${status}:\n\n${jobResultSummary(job)}`;
+	return `${statusGlyph(job.status)} Detached subagent job ${job.id} (${job.agentNames.join(", ")}, ${job.mode}) ${status}:\n\n${jobResultSummary(job)}`;
 }
 
 function formatJobStatusLine(job: DetachedJob): string {
 	const state = job.status === "running" ? `running ${jobElapsed(job)}` : `ran ${jobElapsed(job)}`;
-	let line = `${job.id} [${job.status}] ${job.agentNames.join(", ")} (${job.mode}): ${state}; task: ${job.taskPreview || "..."}`;
+	let line = `${statusGlyph(job.status)} ${job.id} [${job.status}] ${job.agentNames.join(", ")} (${job.mode}): ${state}; task: ${job.taskPreview || "..."}`;
 	if (job.status === "running") return line;
 	line += job.collected ? "; collected" : "; output ready, collect with jobs wait";
 	if (job.status === "failed" && job.error) line += `; error: ${job.error.slice(0, JOB_ERROR_PREVIEW_CHARS)}`;
@@ -704,8 +736,93 @@ const JobsParams = Type.Object({
 	),
 });
 
+interface StripWidgetSources {
+	registry: DispatchRegistry;
+	jobs: Map<string, DetachedJob>;
+	stripKey: string;
+	navigatorKey: string;
+}
+
+/**
+ * Build the ambient strip widget component: a poll-and-render loop
+ * (doom-overlay pattern) that re-renders from the dispatch registry
+ * and the detached jobs registry on an interval, plus a dispose that
+ * clears the interval (setWidget also calls dispose when the widget
+ * is hidden or cleared). Lines render through the theme with the
+ * blocking path's glyph conventions and are truncated to the
+ * viewport width; the strip owns its line budget via
+ * renderStripLines, so pi's string-array widget cap never applies.
+ */
+function createStripWidget(tui: TUI, theme: Theme, sources: StripWidgetSources): Component & { dispose(): void } {
+	let interval: ReturnType<typeof setInterval> | null = null;
+	const renderLines = (width: number): string[] => {
+		const views = buildStripTasks(sources.registry, sources.jobs.values(), Date.now());
+		const stripLines = renderStripLines(views, {
+			hint: `${sources.navigatorKey} navigator · ${sources.stripKey} hide`,
+			maxLines: STRIP_MAX_LINES,
+		});
+		return stripLines.map((line) =>
+			truncateToWidth(
+				line.segments
+					.map((segment) => {
+						const text = segment.bold ? theme.bold(segment.text) : segment.text;
+						return segment.color ? theme.fg(segment.color, text) : text;
+					})
+					.join(""),
+				width,
+			),
+		);
+	};
+	interval = setInterval(() => tui.requestRender(), STRIP_POLL_INTERVAL_MS);
+	return {
+		render(width: number) {
+			return renderLines(width);
+		},
+		invalidate() {},
+		dispose() {
+			if (interval) {
+				clearInterval(interval);
+				interval = null;
+			}
+		},
+	};
+}
+
+/**
+ * A settings value is accepted as a shortcut key only when it is a
+ * non-blank string; anything else falls back to the hardcoded default
+ * so a malformed block can never leave the surfaces unbound.
+ */
+function resolveShortcutKey(value: unknown, fallback: KeyId): KeyId {
+	if (typeof value !== "string") return fallback;
+	const trimmed = value.trim().toLowerCase();
+	return trimmed.length > 0 ? (trimmed as KeyId) : fallback;
+}
+
+interface ViewerKeys {
+	stripKey: KeyId;
+	navigatorKey: KeyId;
+}
+
+/**
+ * Resolve the two hotkeys from the extension-owned `subagentViewer`
+ * settings block. The namespace is not part of pi's Settings type
+ * (unknown top-level settings keys survive end-to-end), so the block
+ * is read through a validated structural cast. registerShortcut is
+ * load-time with no settings-change event, so a changed key binds
+ * after /reload.
+ */
+function readViewerKeys(settings: ReturnType<ExtensionAPI["getSettings"]>): ViewerKeys {
+	const block = (settings as { subagentViewer?: { stripKey?: unknown; navigatorKey?: unknown } }).subagentViewer;
+	return {
+		stripKey: resolveShortcutKey(block?.stripKey, DEFAULT_STRIP_KEY),
+		navigatorKey: resolveShortcutKey(block?.navigatorKey, DEFAULT_NAVIGATOR_KEY),
+	};
+}
+
 export default function (pi: ExtensionAPI) {
 	const jobs = new Map<string, DetachedJob>();
+	const dispatchRegistry = createDispatchRegistry();
 	let nextJobId = 1;
 	let shuttingDown = false;
 
@@ -743,8 +860,14 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async () => {
 		killRunningJobs();
 		jobs.clear();
+		dispatchRegistry.reset();
 		nextJobId = 1;
 		shuttingDown = false;
+		// Session invalidation cleared the widget (disposing the poll
+		// interval), so visibility resets with the rest of the state and
+		// the next toggle shows the strip against the new session.
+		stripVisible = false;
+		registerViewerShortcuts();
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -778,6 +901,38 @@ export default function (pi: ExtensionAPI) {
 			continue: event.outcome === "completed" ? true : undefined,
 		};
 	});
+
+	// Ambient strip: hidden until the first toggle; the next toggle
+	// hides it again. getSettings and registerShortcut are action
+	// methods that throw during extension loading, so the hotkeys are
+	// resolved and registered on session_start, which pi emits before
+	// the editor's shortcut setup on both startup and /reload. A
+	// changed subagentViewer key therefore binds after /reload.
+	let stripVisible = false;
+	const registerViewerShortcuts = () => {
+		const viewerKeys = readViewerKeys(pi.getSettings());
+		pi.registerShortcut(viewerKeys.stripKey, {
+			description: "Toggle the subagent dispatch strip",
+			handler: (ctx) => {
+				stripVisible = !stripVisible;
+				if (!stripVisible) {
+					ctx.ui.setWidget(STRIP_WIDGET_KEY, undefined);
+					return;
+				}
+				ctx.ui.setWidget(
+					STRIP_WIDGET_KEY,
+					(tui, theme) =>
+						createStripWidget(tui, theme, {
+							registry: dispatchRegistry,
+							jobs,
+							stripKey: viewerKeys.stripKey,
+							navigatorKey: viewerKeys.navigatorKey,
+						}),
+					{ placement: "aboveEditor" },
+				);
+			},
+		});
+	};
 
 	pi.registerTool({
 		name: "jobs",
@@ -860,19 +1015,19 @@ export default function (pi: ExtensionAPI) {
 			for (const job of collectible) job.collected = true;
 			for (const job of collectible) {
 				const status = job.status === "failed" ? "failed" : "completed";
-				parts.push(`job ${job.id} (${job.agentNames.join(", ")}) ${status}:\n\n${jobResultSummary(job)}`);
+				parts.push(`${statusGlyph(job.status)} job ${job.id} (${job.agentNames.join(", ")}) ${status}:\n\n${jobResultSummary(job)}`);
 			}
 			for (const job of selected.filter((candidate) => candidate.status !== "running" && !collectible.includes(candidate))) {
 				const status = job.status === "failed" ? "failed" : "completed";
-				parts.push(`job ${job.id} (${job.agentNames.join(", ")}) ${status} (collected earlier; output not repeated)`);
+				parts.push(`${statusGlyph(job.status)} job ${job.id} (${job.agentNames.join(", ")}) ${status} (collected earlier; output not repeated)`);
 			}
 			const stillRunning = selected.filter((job) => job.status === "running");
 			if (stillRunning.length > 0) {
 				const list = stillRunning.map((job) => `${job.id} (${job.agentNames.join(", ")}, ${jobElapsed(job)})`).join(", ");
 				parts.push(
 					timedOut
-						? `Timed out after ${formatDuration(timeoutMs)} waiting for: ${list}. Call jobs wait again to keep waiting.`
-						: `Still running: ${list}. Call jobs wait again to collect outputs when they finish.`,
+						? `${statusGlyph("running")} Timed out after ${formatDuration(timeoutMs)} waiting for: ${list}. Call jobs wait again to keep waiting.`
+						: `${statusGlyph("running")} Still running: ${list}. Call jobs wait again to collect outputs when they finish.`,
 				);
 			}
 			return {
@@ -1030,57 +1185,70 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.chain && params.chain.length > 0) {
-				const results: SingleResult[] = [];
-				let previousOutput = "";
+				const taskNode = dispatchRegistry.startTask({
+					mode: "chain",
+					prompt: params.chain[0].task,
+					label: resolveTaskLabel(params.chain[0].task),
+				});
+				try {
+					const results: SingleResult[] = [];
+					let previousOutput = "";
 
-				for (let i = 0; i < params.chain.length; i++) {
-					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+					for (let i = 0; i < params.chain.length; i++) {
+						const step = params.chain[i];
+						const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+						const round = dispatchRegistry.startRound(taskNode.id, [{ agent: step.agent, step: i + 1 }]);
 
-					// Create update callback that includes all previous results
-					const chainUpdate: OnUpdateCallback | undefined = onUpdate
-						? (partial) => {
-								// Combine completed results with current streaming result
-								const currentResult = partial.details?.results[0];
-								if (currentResult) {
-									const allResults = [...results, currentResult];
-									onUpdate({
-										content: partial.content,
-										details: makeDetails("chain")(allResults),
-									});
-								}
+						// Create update callback that includes all previous results
+						const chainUpdate: OnUpdateCallback = (partial) => {
+							// Combine completed results with current streaming result
+							const currentResult = partial.details?.results[0];
+							syncRegistryAgent(dispatchRegistry, taskNode.id, round.index, 0, currentResult);
+							if (currentResult && onUpdate) {
+								const allResults = [...results, currentResult];
+								onUpdate({
+									content: partial.content,
+									details: makeDetails("chain")(allResults),
+								});
 							}
-						: undefined;
-
-					const result = await runSingleAgent(
-						ctx.cwd,
-						dispatchDefaults,
-						agents,
-						step.agent,
-						taskWithContext,
-						step.cwd,
-						i + 1,
-						signal,
-						chainUpdate,
-						makeDetails("chain"),
-					);
-					results.push(result);
-
-					const isError = isFailedResult(result);
-					if (isError) {
-						const errorMsg = getResultOutput(result);
-						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
-							details: makeDetails("chain")(results),
-							isError: true,
 						};
+
+						const result = await runSingleAgent(
+							ctx.cwd,
+							dispatchDefaults,
+							agents,
+							step.agent,
+							taskWithContext,
+							step.cwd,
+							i + 1,
+							signal,
+							chainUpdate,
+							makeDetails("chain"),
+						);
+						syncRegistryAgent(dispatchRegistry, taskNode.id, round.index, 0, result);
+						results.push(result);
+
+						const isError = isFailedResult(result);
+						if (isError) {
+							const errorMsg = getResultOutput(result);
+							return {
+								content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
+								details: makeDetails("chain")(results),
+								isError: true,
+							};
+						}
+						previousOutput = getFinalOutput(result.messages);
 					}
-					previousOutput = getFinalOutput(result.messages);
+					return {
+						content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
+						details: makeDetails("chain")(results),
+					};
+				} finally {
+					// Aborts and dispatch errors throw past the final sync; mark
+					// any still-running agent failed so the strip never shows a
+					// ghost hourglass. No-op when every agent already settled.
+					dispatchRegistry.failRunningAgents(taskNode.id);
 				}
-				return {
-					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
-					details: makeDetails("chain")(results),
-				};
 			}
 
 			if (params.tasks && params.tasks.length > 0) {
@@ -1093,104 +1261,140 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
-				// Track all results for streaming updates
-				const allResults: SingleResult[] = new Array(params.tasks.length);
+				const taskNode = dispatchRegistry.startTask({
+					mode: "parallel",
+					prompt: params.tasks[0].task,
+					label: resolveTaskLabel(params.tasks[0].task),
+				});
+				const dispatchRound = dispatchRegistry.startRound(
+					taskNode.id,
+					params.tasks.map((task) => ({ agent: task.agent })),
+				);
+				try {
+					// Track all results for streaming updates
+					const allResults: SingleResult[] = new Array(params.tasks.length);
 
-				// Initialize placeholder results
-				for (let i = 0; i < params.tasks.length; i++) {
-					allResults[i] = {
-						agent: params.tasks[i].agent,
-						agentSource: "unknown",
-						task: params.tasks[i].task,
-						exitCode: -1, // -1 = still running
-						messages: [],
-						stderr: "",
-						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-					};
-				}
-
-				const emitParallelUpdate = () => {
-					if (onUpdate) {
-						const running = allResults.filter((r) => r.exitCode === -1).length;
-						const done = allResults.filter((r) => r.exitCode !== -1).length;
-						onUpdate({
-							content: [
-								{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running...` },
-							],
-							details: makeDetails("parallel")([...allResults]),
-						});
+					// Initialize placeholder results
+					for (let i = 0; i < params.tasks.length; i++) {
+						allResults[i] = {
+							agent: params.tasks[i].agent,
+							agentSource: "unknown",
+							task: params.tasks[i].task,
+							exitCode: -1, // -1 = still running
+							messages: [],
+							stderr: "",
+							usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+						};
 					}
-				};
 
-				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
+					const emitParallelUpdate = () => {
+						if (onUpdate) {
+							const running = allResults.filter((r) => r.exitCode === -1).length;
+							const done = allResults.filter((r) => r.exitCode !== -1).length;
+							onUpdate({
+								content: [
+									{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running...` },
+								],
+								details: makeDetails("parallel")([...allResults]),
+							});
+						}
+					};
+
+					const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
+						const result = await runSingleAgent(
+							ctx.cwd,
+							dispatchDefaults,
+							agents,
+							t.agent,
+							t.task,
+							t.cwd,
+							undefined,
+							signal,
+							// Per-task update callback
+							(partial) => {
+								if (partial.details?.results[0]) {
+									allResults[index] = partial.details.results[0];
+									syncRegistryAgent(dispatchRegistry, taskNode.id, dispatchRound.index, index, partial.details.results[0]);
+									emitParallelUpdate();
+								}
+							},
+							makeDetails("parallel"),
+						);
+						allResults[index] = result;
+						syncRegistryAgent(dispatchRegistry, taskNode.id, dispatchRound.index, index, result);
+						emitParallelUpdate();
+						return result;
+					});
+
+					const successCount = results.filter((r) => !isFailedResult(r)).length;
+					const summaries = results.map((r) => {
+						const output = truncateParallelOutput(getResultOutput(r));
+						const status = isFailedResult(r)
+							? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
+							: "completed";
+						return `### [${r.agent}] ${status}\n\n${output}`;
+					});
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
+							},
+						],
+						details: makeDetails("parallel")(results),
+					};
+				} finally {
+					// Aborts and dispatch errors throw past the final sync; mark
+					// any still-running agent failed so the strip never shows a
+					// ghost hourglass. No-op when every agent already settled.
+					dispatchRegistry.failRunningAgents(taskNode.id);
+				}
+			}
+
+			if (params.agent && params.task) {
+				const taskNode = dispatchRegistry.startTask({
+					mode: "single",
+					prompt: params.task,
+					label: resolveTaskLabel(params.task),
+				});
+				const dispatchRound = dispatchRegistry.startRound(taskNode.id, [{ agent: params.agent }]);
+				try {
+					const streamingUpdate: OnUpdateCallback = (partial) => {
+						syncRegistryAgent(dispatchRegistry, taskNode.id, dispatchRound.index, 0, partial.details?.results[0]);
+						onUpdate?.(partial);
+					};
 					const result = await runSingleAgent(
 						ctx.cwd,
 						dispatchDefaults,
 						agents,
-						t.agent,
-						t.task,
-						t.cwd,
+						params.agent,
+						params.task,
+						params.cwd,
 						undefined,
 						signal,
-						// Per-task update callback
-						(partial) => {
-							if (partial.details?.results[0]) {
-								allResults[index] = partial.details.results[0];
-								emitParallelUpdate();
-							}
-						},
-						makeDetails("parallel"),
+						streamingUpdate,
+						makeDetails("single"),
 					);
-					allResults[index] = result;
-					emitParallelUpdate();
-					return result;
-				});
-
-				const successCount = results.filter((r) => !isFailedResult(r)).length;
-				const summaries = results.map((r) => {
-					const output = truncateParallelOutput(getResultOutput(r));
-					const status = isFailedResult(r)
-						? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
-						: "completed";
-					return `### [${r.agent}] ${status}\n\n${output}`;
-				});
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
-						},
-					],
-					details: makeDetails("parallel")(results),
-				};
-			}
-
-			if (params.agent && params.task) {
-				const result = await runSingleAgent(
-					ctx.cwd,
-					dispatchDefaults,
-					agents,
-					params.agent,
-					params.task,
-					params.cwd,
-					undefined,
-					signal,
-					onUpdate,
-					makeDetails("single"),
-				);
-				const isError = isFailedResult(result);
-				if (isError) {
-					const errorMsg = getResultOutput(result);
+					syncRegistryAgent(dispatchRegistry, taskNode.id, dispatchRound.index, 0, result);
+					const isError = isFailedResult(result);
+					if (isError) {
+						const errorMsg = getResultOutput(result);
+						return {
+							content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
+							details: makeDetails("single")([result]),
+							isError: true,
+						};
+					}
 					return {
-						content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
+						content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
 						details: makeDetails("single")([result]),
-						isError: true,
 					};
+				} finally {
+					// Aborts and dispatch errors throw past the final sync; mark
+					// any still-running agent failed so the strip never shows a
+					// ghost hourglass. No-op when every agent already settled.
+					dispatchRegistry.failRunningAgents(taskNode.id);
 				}
-				return {
-					content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
-					details: makeDetails("single")([result]),
-				};
 			}
 
 			const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";

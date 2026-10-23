@@ -13,6 +13,7 @@ Delegate tasks to specialized subagents with isolated context windows.
 - **Markdown rendering**: Final output rendered with proper formatting (expanded view)
 - **Usage tracking**: Shows turns, tokens, cost, and context usage per agent
 - **Abort support**: Ctrl+C propagates to kill subagent processes
+- **Dispatch strip**: a toggleable ambient widget above the editor summarizing every live dispatch as task → round → agent lines with status glyphs, current activity, and duration
 
 ## Structure
 
@@ -21,6 +22,9 @@ subagent/
 ├── README.md            # This file
 ├── index.ts             # The extension (entry point)
 ├── agents.ts            # Agent discovery logic
+├── labels.ts            # Task-label heuristic (fleet EXT-N[-M] parse, first-words fallback)
+├── registry.ts          # Active-dispatch registry (task → round → agent live state)
+├── strip.ts             # Ambient strip rendering (line budget, glyphs, view assembly)
 ├── agents/              # Sample agent definitions
 │   ├── scout.md         # Fast recon, returns compressed context
 │   ├── planner.md       # Creates implementation plans
@@ -119,11 +123,46 @@ The `jobs` tool inspects and collects detached jobs:
 
 Omitting `id` selects every job in the session. A second `wait` for an already-collected job reports `collected earlier; output not repeated` in its text instead of re-printing the results, and the completion wake never re-delivers them; the wait's result details still carry the job's outputs, so a result lost to a failed delivery stays recoverable with one wait. A job whose child process is killed mid-run (including jobs still running when the session shuts down) is marked `failed` with the abort reason. At most 4 detached jobs run at once; a detach call that would exceed the cap is rejected until earlier jobs finish.
 
+Detached jobs carry the fleet status glyphs across their surfaces: ⏳ while running, ✓ when done, ✗ when failed, in `jobs status` lines, `jobs wait` output, and the completion wake message, keyed off the live `job.status`.
+
 **Wake on completion**: when a detached job finishes (done, failed, or hard timeout), the extension sends its final outputs as a custom message with a turn trigger. An idle session wakes immediately with exactly one turn; while a run is active, the message is queued into it. Each job's results are delivered at most once. A `jobs wait` already blocked on the job when it finishes collects the outputs itself and suppresses the wake, and settlement keeps a fallback that delivers finished-but-uncollected results with one continuation if completion races settlement, so no result can fall through.
 
 **Timeouts**: every child process has a 60 minute hard timeout in the spawn path, after which it is killed (SIGTERM, then SIGKILL) and the job is marked failed. This applies to blocking dispatch too, where a hung subagent previously waited forever. The `SUBAGENT_TIMEOUT_MS` environment variable raises the timeout for legitimately long single-child work; values below or at the 60 minute default are clamped up to the default and values above 2147483647 ms (Node.js's largest timer delay, about 24.8 days) are clamped down to it, so the env var is raise-only and a run can never hang forever.
 
 **Per-agent policy**: an agent whose frontmatter sets `detach: false` rejects detached dispatch with a clear error and can only be dispatched in blocking mode; blocking dispatch of that agent is unaffected. There are no hardcoded agent names in the extension; the flag is discovered from frontmatter like `tools` and `model`.
+
+## Dispatch Strip
+
+The extension registers a global hotkey (default `alt+s`) that toggles an ambient strip widget above the editor. The strip is hidden until the first toggle and hidden again on the next one. While visible it renders, refreshed twice a second:
+
+- One header line per dispatch, labeled with the dispatch's task label and mode
+- One line per live agent: status glyph (⏳ running, ✓ done, ✗ failed), agent name, most recent streamed activity (tool call or text snippet), and elapsed duration
+- Finished rounds collapsed to a single summary line per round (`✓ round 1 · 3/3 done · 2m`)
+- Detached jobs appear alongside blocking dispatches, one agent line per agent name, glyphs keyed off the live `job.status`
+- A hint line naming the navigator key, always last
+
+The strip owns its own line budget (12 lines): live tasks render before finished ones, and content that does not fit is summarized as a `+N more` line above the hint, so the terminal never truncates the widget.
+
+### Task labels
+
+Dispatch payloads carry no task-ID field, so the label is parsed from the prompt text: the first `EXT-N` or `EXT-N-M` fleet task reference when the prompt names one (first match wins on multi-reference prompts), otherwise the prompt's first words truncated to 60 characters. Detached jobs reuse their existing task preview as the label.
+
+### Hotkey configuration
+
+Both extension hotkeys are configurable through the `subagentViewer` settings block in `settings.json`:
+
+```json
+{
+  "subagentViewer": {
+    "stripKey": "alt+s",
+    "navigatorKey": "alt+n"
+  }
+}
+```
+
+When the block or a key is absent, the hardcoded defaults apply (`alt+s` strip, `alt+n` navigator; both unused by pi's built-in keybindings). pi's native `keybindings.json` cannot rebind extension shortcuts, and extension settings are read when the shortcuts register, so a changed key takes effect after `/reload` (or a new session).
+
+The navigator itself (opened by the navigator key) is a separate checkpoint; the strip's hint line already shows the key that will open it.
 
 ## Output Display
 
