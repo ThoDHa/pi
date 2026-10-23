@@ -294,6 +294,23 @@ export function flattenNavigatorTree(tasks: NavigatorTaskView[], state: Navigato
 	return rows;
 }
 
+/**
+ * Apply the left/right key semantics for a row: collapsing a task
+ * adds its raw id to collapsedTasks and expanding deletes it (the
+ * flatten contract keys that set on raw task ids); a round toggle
+ * stores the override under the row's namespaced id, overriding the
+ * live-expanded/completed-collapsed default; agent rows are leaves
+ * and a no-op.
+ */
+export function toggleNavigatorRow(state: NavigatorExpansionState, row: NavigatorRow, expand: boolean): void {
+	if (row.kind === "task") {
+		if (expand) state.collapsedTasks.delete(row.taskId);
+		else state.collapsedTasks.add(row.taskId);
+	} else if (row.kind === "round") {
+		state.roundOverrides.set(row.id, expand);
+	}
+}
+
 /** Move the cursor over visible rows, clamped to the first and last row. */
 export function moveCursor(rows: NavigatorRow[], currentIndex: number, delta: number): number {
 	if (rows.length === 0) return 0;

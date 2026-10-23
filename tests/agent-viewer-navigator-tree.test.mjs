@@ -26,6 +26,7 @@ import {
 	flattenNavigatorTree,
 	moveCursor,
 	nextTaskRow,
+	toggleNavigatorRow,
 } from "../extensions/agent-viewer/navigator.ts";
 
 // --- buildNavigatorTasks: registry task -> rounds -> agents ---
@@ -269,5 +270,40 @@ assert.equal(nextTaskRow(rows, 2, 1), 4, "Tab from a nested row skips to the nex
 assert.equal(nextTaskRow(rows, 4, 1), 0, "Tab past the last task wraps to the first");
 assert.equal(nextTaskRow(rows, 0, -1), 4, "Shift+Tab wraps backwards to the last task row");
 assert.equal(nextTaskRow(rows, 5, -1), 4, "Shift+Tab from a nested row finds its own task row");
+
+// --- toggleNavigatorRow: the collapse/expand semantics the overlay's left/right keys drive ---
+
+const toggleState = createExpansionState();
+const toggleRows = flattenNavigatorTree(tasks, toggleState);
+const toggleTaskRow = toggleRows.find((row) => row.kind === "task" && row.taskId === chainTask.id);
+const toggleRoundRow = toggleRows.find((row) => row.kind === "round" && row.roundIndex === 1);
+const toggleAgentRow = toggleRows.find((row) => row.kind === "agent");
+assert.ok(toggleTaskRow && toggleRoundRow && toggleAgentRow, "the fixture exposes one row of each kind");
+
+toggleNavigatorRow(toggleState, toggleTaskRow, false);
+assert.ok(toggleState.collapsedTasks.has(chainTask.id), "collapsing a task adds the raw task id (flatten contract)");
+assert.equal(
+	flattenNavigatorTree(tasks, toggleState).filter((row) => row.taskId === chainTask.id).length,
+	1,
+	"a collapsed task's subtree disappears",
+);
+
+toggleNavigatorRow(toggleState, toggleTaskRow, true);
+assert.ok(!toggleState.collapsedTasks.has(chainTask.id), "expanding a task deletes the raw task id");
+assert.ok(flattenNavigatorTree(tasks, toggleState).some((row) => row.kind === "round"), "the expanded task's rounds are visible again");
+
+toggleNavigatorRow(toggleState, toggleRoundRow, true);
+assert.equal(toggleState.roundOverrides.get(toggleRoundRow.id), true, "expanding a round stores the override under the namespaced row id");
+toggleNavigatorRow(toggleState, toggleRoundRow, false);
+assert.equal(toggleState.roundOverrides.get(toggleRoundRow.id), false, "collapsing a round overrides its auto state under the namespaced row id");
+
+toggleNavigatorRow(toggleState, toggleAgentRow, false);
+toggleNavigatorRow(toggleState, toggleAgentRow, true);
+assert.ok(!toggleState.collapsedTasks.has(toggleAgentRow.id), "agent rows never touch the task set");
+assert.equal(toggleState.roundOverrides.size, 1, "agent rows are a no-op on expansion state");
+
+// --- moveCursor: the empty-tree clamp branch ---
+
+assert.equal(moveCursor([], 0, 1), 0, "moving on an empty tree stays at index 0");
 
 console.log("agent-viewer-navigator-tree: all assertions passed");
