@@ -34,7 +34,7 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
-import { writePromptToTempFile } from "./prompt-temp.ts";
+import { releasePromptDir, writePromptToTempFile } from "./prompt-temp.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -478,12 +478,7 @@ async function runSingleAgent(
 		if (wasAborted) throw new Error("Subagent was aborted");
 		return currentResult;
 	} finally {
-		if (tmpPromptDir)
-			try {
-				fs.rmSync(tmpPromptDir, { recursive: true, force: true });
-			} catch {
-				/* ignore */
-			}
+		if (tmpPromptDir) releasePromptDir(tmpPromptDir);
 	}
 }
 
