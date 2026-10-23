@@ -177,7 +177,9 @@ function agentEntry(agent: DispatchAgentNode, now: number): StripAgentEntry {
 /**
  * Assemble the strip's task views from the blocking-path dispatch
  * registry plus the detached jobs registry. Task labels resolve from
- * the prompt at render time; a finished round of a
+ * the prompt at render time, falling back to the detached jobs'
+ * "(detached)" wording when the resolution comes up empty so a task
+ * header never renders bare; a finished round of a
  * live task collapses to one round entry; within a task, live rounds'
  * agent entries lead so the budget's tail cut spares live content. A
  * detached job becomes one task view labeled with its taskPreview,
@@ -198,7 +200,7 @@ export function buildStripTasks(
 			for (const agent of round.agents) entries.push(agentEntry(agent, now));
 		}
 		for (const round of finishedRounds) entries.push(collapsedRoundEntry(round, now));
-		views.push({ label: resolveTaskLabel(task.prompt), mode: task.mode, live, entries });
+		views.push({ label: resolveTaskLabel(task.prompt) || "(detached)", mode: task.mode, live, entries });
 	}
 
 	for (const job of jobs) {

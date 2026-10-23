@@ -232,9 +232,11 @@ assert.equal(detachedFailedView.entries[0].durationText, "30s", "finished detach
 const labeled = createDispatchRegistry();
 labeled.startTask({ mode: "single", prompt: "Task: EXT-9-2 parser fixes", now: 1_000 });
 labeled.startTask({ mode: "single", prompt: "Reply ready for the fleet", now: 1_000 });
+labeled.startTask({ mode: "single", prompt: "", now: 1_000 });
 const labeledViews = buildStripTasks(labeled, [], 2_000);
 assert.equal(labeledViews[0].label, "EXT-9-2", "fleet-reference prompts label by the reference");
 assert.equal(labeledViews[1].label, "Reply ready for the fleet", "plain prompts label by first words");
+assert.equal(labeledViews[2].label, "(detached)", "an empty prompt falls back like detached jobs instead of a bare header");
 
 // --- buildStripTasks: mixed failed round collapses with the mixed glyph ---
 
