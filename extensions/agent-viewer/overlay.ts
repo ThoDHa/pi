@@ -85,6 +85,9 @@ export class NavigatorOverlay implements Focusable {
 		}
 	}
 
+	/** TUI invalidation hook: no cached render state, every render rebuilds rows from the shared state. */
+	invalidate(): void {}
+
 	/** Re-read the shared dispatch state, keeping the cursor on its row (or clamped) across rebuilds. */
 	private refresh(): void {
 		this.tasks = buildNavigatorTasks(this.sources.registry, this.sources.detachedJobs, Date.now());
@@ -167,7 +170,7 @@ export class NavigatorOverlay implements Focusable {
 		const detail = row.detail ? theme.fg("muted", ` · ${row.detail}`) : "";
 		const activity = row.activity ? theme.fg("dim", ` · ${row.activity}`) : "";
 		const line = `${indent}${cursor}${glyph} ${label}${detail}${activity}`;
-		return selected ? line + CURSOR_MARKER : line;
+		return selected && this.focused ? line + CURSOR_MARKER : line;
 	}
 
 	private renderDetailLines(): string[] {
