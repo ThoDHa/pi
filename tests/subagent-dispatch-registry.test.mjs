@@ -178,7 +178,6 @@ assert.equal(getSharedDispatchState().detachedJobs, shared.detachedJobs, "clear 
 const upsertJobs = [
 	{ id: "job-1", mode: "single", status: "running", agentNames: ["scout"], taskPreview: "map the auth module", startedAt: NOW },
 ];
-const upsertJobsRef = upsertJobs;
 upsertDetachedJobSnapshot(upsertJobs, {
 	id: "job-2",
 	mode: "parallel",
@@ -203,7 +202,22 @@ assert.equal(upsertJobs.length, 2, "replace-by-id does not grow the array");
 assert.equal(upsertJobs[0].status, "done", "the existing snapshot is replaced by id");
 assert.equal(upsertJobs[0].id, "job-1", "replacement keeps the snapshot's position");
 assert.equal(upsertJobs[1].id, "job-2", "later snapshots are untouched by the replace");
-assert.equal(upsertJobs, upsertJobsRef, "the array identity is preserved (in-place mutation)");
+// An alias comparison of one local binding cannot fail, so the identity
+// property is pinned on the real contract surface instead: an upsert into
+// the array obtained via getSharedDispatchState() must mutate that array
+// in place, keeping the accessor's reference valid.
+const sharedJobs = getSharedDispatchState().detachedJobs;
+upsertDetachedJobSnapshot(sharedJobs, {
+	id: "job-3",
+	mode: "single",
+	status: "running",
+	agentNames: ["scout"],
+	taskPreview: "map the auth module",
+	startedAt: NOW,
+});
+assert.equal(getSharedDispatchState().detachedJobs.length, 1, "an upsert into the shared array publishes through the accessor");
+assert.equal(getSharedDispatchState().detachedJobs, sharedJobs, "an upsert into the shared array keeps its identity (in-place mutation)");
+shared.detachedJobs.length = 0;
 
 // pi evaluates the contract module once per extension entrypoint, so
 // convergence must hold across module instances, not just calls: a
