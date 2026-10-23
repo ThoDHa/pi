@@ -157,6 +157,7 @@ export function buildNavigatorTasks(registry: DispatchRegistry, jobs: Iterable<N
 			};
 		});
 		const allAgents = rounds.flatMap((round) => round.agents);
+		const finishTimes = allAgents.map((agent) => agent.finishedAt ?? now);
 		views.push({
 			id: task.id,
 			source: "registry",
@@ -164,7 +165,7 @@ export function buildNavigatorTasks(registry: DispatchRegistry, jobs: Iterable<N
 			mode: task.mode,
 			live: allAgents.some((agent) => agent.status === "running"),
 			glyph: taskGlyph(allAgents),
-			durationText: formatDuration((allAgents.at(-1)?.finishedAt ?? now) - task.startedAt),
+			durationText: formatDuration((finishTimes.length > 0 ? Math.max(...finishTimes) : now) - task.startedAt),
 			rounds,
 			agents: [],
 		});

@@ -179,6 +179,16 @@ settled.updateAgent(mixedTask.id, 1, 0, { status: "failed", finishedAt: 2_000 })
 const allFailedView = buildNavigatorTasks(settled, [], 10_000)[0];
 assert.equal(allFailedView.glyph, "failed", "all-failed settles on the failed glyph");
 
+// --- buildNavigatorTasks: task duration ends at the latest slot finish ---
+
+const ordered = createDispatchRegistry();
+const lateFirst = ordered.startTask({ mode: "parallel", prompt: "fan", now: 1_000 });
+ordered.startRound(lateFirst.id, [{ agent: "slow" }, { agent: "quick" }], 1_000);
+ordered.updateAgent(lateFirst.id, 1, 0, { status: "done", finishedAt: 9_000 });
+ordered.updateAgent(lateFirst.id, 1, 1, { status: "done", finishedAt: 3_000 });
+const lateFirstView = buildNavigatorTasks(ordered, [], 10_000)[0];
+assert.equal(lateFirstView.durationText, "8s", "task duration ends at the latest slot finish, not the last slot's");
+
 // --- flattenNavigatorTree: rows, depths, completed collapsed, live expanded ---
 
 const state = createExpansionState();
