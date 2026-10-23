@@ -36,11 +36,16 @@ import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { releasePromptDir, writePromptToTempFile } from "./prompt-temp.ts";
 import {
+	extractActivityLog,
 	extractLastActivity,
 	formatDuration,
+	formatUsageSummary,
 	getSharedDispatchState,
+	mergeAgentUpdate,
 	statusGlyph,
 	upsertDetachedJobSnapshot,
+	type DispatchAgentNode,
+	type DispatchAgentUpdate,
 	type DispatchRegistry,
 } from "./registry.ts";
 
@@ -68,13 +73,6 @@ function resolveHardTimeoutMs(): number {
 	return Math.min(Math.max(raw, DEFAULT_HARD_TIMEOUT_MS), 2_147_483_647);
 }
 
-function formatTokens(count: number): string {
-	if (count < 1000) return count.toString();
-	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-	if (count < 1000000) return `${Math.round(count / 1000)}k`;
-	return `${(count / 1000000).toFixed(1)}M`;
-}
-
 function formatUsageStats(
 	usage: {
 		input: number;
@@ -87,18 +85,9 @@ function formatUsageStats(
 	},
 	model?: string,
 ): string {
-	const parts: string[] = [];
-	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
-	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
-	if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
-	if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
-	if (usage.cacheWrite) parts.push(`W${formatTokens(usage.cacheWrite)}`);
-	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
-	if (usage.contextTokens && usage.contextTokens > 0) {
-		parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
-	}
-	if (model) parts.push(model);
-	return parts.join(" ");
+	const summary = formatUsageSummary(usage);
+	if (!model) return summary;
+	return summary ? `${summary} ${model}` : model;
 }
 
 function formatToolCall(
@@ -229,10 +218,34 @@ function isFailedResult(result: SingleResult): boolean {
 }
 
 /**
+ * Streaming-or-final result snapshot converted into the shared
+ * state's agent-node update (exitCode -1 = still running): status,
+ * last-activity one-liner for the strip, the recent-activity log for
+ * the navigator's detail pane, model and effective cwd for the
+ * detail header, usage, and the result snapshot. Both publishers
+ * share this conversion: the blocking paths via syncRegistryAgent,
+ * the detached wiring via its slot nodes.
+ */
+function agentUpdateFromResult(result: SingleResult, cwd: string | undefined, now: number): DispatchAgentUpdate {
+	const finished = result.exitCode !== -1;
+	return {
+		status: !finished ? "running" : isFailedResult(result) ? "failed" : "done",
+		lastActivity: extractLastActivity(result.messages),
+		activity: extractActivityLog(result.messages),
+		model: result.model,
+		cwd,
+		usage: { ...result.usage },
+		result: { exitCode: result.exitCode, stopReason: result.stopReason, errorMessage: result.errorMessage },
+		finishedAt: finished ? now : undefined,
+	};
+}
+
+/**
  * Publish one streaming or final result snapshot into the dispatch
  * registry (exitCode -1 = still running). The blocking single,
  * parallel, and chain paths call this from their update callbacks and
- * after each agent completes, keeping the ambient strip live.
+ * after each agent completes, keeping the ambient strip live. `cwd`
+ * is the agent's effective working directory for the detail header.
  */
 function syncRegistryAgent(
 	registry: DispatchRegistry,
@@ -240,16 +253,10 @@ function syncRegistryAgent(
 	roundIndex: number,
 	slot: number,
 	result: SingleResult | undefined,
+	cwd: string | undefined,
 ): void {
 	if (!result) return;
-	const finished = result.exitCode !== -1;
-	registry.updateAgent(taskId, roundIndex, slot, {
-		status: !finished ? "running" : isFailedResult(result) ? "failed" : "done",
-		lastActivity: extractLastActivity(result.messages),
-		usage: { ...result.usage },
-		result: { exitCode: result.exitCode, stopReason: result.stopReason, errorMessage: result.errorMessage },
-		finishedAt: finished ? Date.now() : undefined,
-	});
+	registry.updateAgent(taskId, roundIndex, slot, agentUpdateFromResult(result, cwd, Date.now()));
 }
 
 function getResultOutput(result: SingleResult): string {
@@ -585,7 +592,40 @@ function createDetachedJob(id: string, mode: DetachedJob["mode"], steps: Dispatc
  * then would re-add a ghost of the dead session, the same race the
  * completion wake's registry-membership check guards.
  */
-function publishDetachedJobSnapshot(job: DetachedJob): void {
+/**
+ * Per-slot live nodes of a detached job at settle: slots still marked
+ * running when the job finished never produced a result (the
+ * dispatch-error path), so they settle to the job's outcome like the
+ * blocking paths' failRunningAgents cleanup — the tree must never
+ * show a ghost hourglass.
+ */
+function detachedAgentNodes(job: DetachedJob, slotNodes: DispatchAgentNode[]): DispatchAgentNode[] {
+	if (job.finishedAt === undefined) return slotNodes.map((node) => ({ ...node }));
+	return slotNodes.map((node) => {
+		if (node.status !== "running") return { ...node };
+		return {
+			...node,
+			status: job.status === "failed" ? "failed" : "done",
+			finishedAt: node.finishedAt ?? job.finishedAt,
+		};
+	});
+}
+
+/**
+ * Publish the job's current state into the shared detached-job
+ * snapshots (replace-by-id via upsertDetachedJobSnapshot), so the
+ * viewer extension renders detached jobs off live status without the
+ * jobs Map (whose collection and wake semantics stay private to this
+ * extension) crossing the extension boundary. Called at job creation,
+ * on every per-agent streaming update (with the slot nodes the
+ * onUpdate wiring merges into), and again at settle. Aborted jobs are
+ * skipped: abortion only happens in session teardown, whose
+ * session_start clears the shared array, and the killed child settles
+ * seconds later — republishing then would re-add a ghost of the dead
+ * session, the same race the completion wake's registry-membership
+ * check guards.
+ */
+function publishDetachedJobSnapshot(job: DetachedJob, slotNodes?: DispatchAgentNode[]): void {
 	if (job.abort.signal.aborted) return;
 	const { detachedJobs } = getSharedDispatchState();
 	upsertDetachedJobSnapshot(detachedJobs, {
@@ -596,6 +636,14 @@ function publishDetachedJobSnapshot(job: DetachedJob): void {
 		taskPreview: job.taskPreview,
 		startedAt: job.startedAt,
 		finishedAt: job.finishedAt,
+		agents: slotNodes
+			? detachedAgentNodes(job, slotNodes)
+			: job.agentNames.map((name) => ({
+					agent: name,
+					status: job.status,
+					startedAt: job.startedAt,
+					...(job.finishedAt !== undefined ? { finishedAt: job.finishedAt } : {}),
+				})),
 	});
 }
 
@@ -605,14 +653,51 @@ async function runDetachedJob(
 	agents: AgentConfig[],
 	dispatchDefaults: DispatchDefaults,
 	defaultCwd: string,
+	makeDetails: (results: SingleResult[]) => SubagentDetails,
 	onJobFinished: (job: DetachedJob) => void,
 ): Promise<void> {
+	// Per-slot live nodes the update callbacks merge into and every
+	// publication carries: the detached counterpart of the blocking
+	// paths' syncRegistryAgent, keeping detached detail streaming into
+	// the strip and the navigator while the tool call has already
+	// returned.
+	const slotNodes: DispatchAgentNode[] = steps.map((step, index) => ({
+		agent: step.agent,
+		step: job.mode === "chain" ? index + 1 : undefined,
+		status: "running",
+		startedAt: job.startedAt,
+		cwd: step.cwd ?? defaultCwd,
+	}));
+	const publishSlotUpdate = (slot: number, result: SingleResult) => {
+		mergeAgentUpdate(slotNodes[slot], agentUpdateFromResult(result, steps[slot].cwd ?? defaultCwd, Date.now()));
+		publishDetachedJobSnapshot(job, slotNodes);
+	};
+	// The per-slot streaming callback handed to runSingleAgent: it only
+	// fires when makeDetails is passed alongside, so the wiring passes
+	// the execute-scope factory even though no transcript renders the
+	// detached details.
+	const slotUpdate = (slot: number) => (partial: AgentToolResult<SubagentDetails>) => {
+		const result = partial.details?.results[0];
+		if (result) publishSlotUpdate(slot, result);
+	};
 	try {
 		let results: SingleResult[];
 		if (job.mode === "parallel") {
-			results = await mapWithConcurrencyLimit(steps, MAX_CONCURRENCY, (step) =>
-				runSingleAgent(defaultCwd, dispatchDefaults, agents, step.agent, step.task, step.cwd, undefined, job.abort.signal),
+			results = await mapWithConcurrencyLimit(steps, MAX_CONCURRENCY, (step, slot) =>
+				runSingleAgent(
+					defaultCwd,
+					dispatchDefaults,
+					agents,
+					step.agent,
+					step.task,
+					step.cwd,
+					undefined,
+					job.abort.signal,
+					slotUpdate(slot),
+					makeDetails,
+				),
 			);
+			results.forEach((result, slot) => publishSlotUpdate(slot, result));
 		} else if (job.mode === "chain") {
 			results = [];
 			let previousOutput = "";
@@ -628,16 +713,30 @@ async function runDetachedJob(
 					step.cwd,
 					i + 1,
 					job.abort.signal,
+					slotUpdate(i),
+					makeDetails,
 				);
 				results.push(result);
+				publishSlotUpdate(i, result);
 				if (isFailedResult(result)) break;
 				previousOutput = getFinalOutput(result.messages);
 			}
 		} else {
 			const step = steps[0];
-			results = [
-				await runSingleAgent(defaultCwd, dispatchDefaults, agents, step.agent, step.task, step.cwd, undefined, job.abort.signal),
-			];
+			const result = await runSingleAgent(
+				defaultCwd,
+				dispatchDefaults,
+				agents,
+				step.agent,
+				step.task,
+				step.cwd,
+				undefined,
+				job.abort.signal,
+				slotUpdate(0),
+				makeDetails,
+			);
+			results = [result];
+			publishSlotUpdate(0, result);
 		}
 		job.results = results;
 		job.status = results.some(isFailedResult) ? "failed" : "done";
@@ -646,7 +745,7 @@ async function runDetachedJob(
 		job.error = error instanceof Error ? error.message : String(error);
 	} finally {
 		job.finishedAt = Date.now();
-		publishDetachedJobSnapshot(job);
+		publishDetachedJobSnapshot(job, slotNodes);
 		job.resolveDone();
 		onJobFinished(job);
 	}
@@ -1074,7 +1173,7 @@ export default function (pi: ExtensionAPI) {
 				const job = createDetachedJob(`job-${nextJobId++}`, mode, steps);
 				jobs.set(job.id, job);
 				publishDetachedJobSnapshot(job);
-				void runDetachedJob(job, steps, agents, dispatchDefaults, ctx.cwd, wakeOnCompletion);
+				void runDetachedJob(job, steps, agents, dispatchDefaults, ctx.cwd, makeDetails(mode), wakeOnCompletion);
 				return {
 					content: [
 						{
@@ -1104,7 +1203,7 @@ export default function (pi: ExtensionAPI) {
 						const chainUpdate: OnUpdateCallback = (partial) => {
 							// Combine completed results with current streaming result
 							const currentResult = partial.details?.results[0];
-							syncRegistryAgent(dispatchRegistry, taskNode.id, round.index, 0, currentResult);
+							syncRegistryAgent(dispatchRegistry, taskNode.id, round.index, 0, currentResult, step.cwd ?? ctx.cwd);
 							if (currentResult && onUpdate) {
 								const allResults = [...results, currentResult];
 								onUpdate({
@@ -1126,7 +1225,7 @@ export default function (pi: ExtensionAPI) {
 							chainUpdate,
 							makeDetails("chain"),
 						);
-						syncRegistryAgent(dispatchRegistry, taskNode.id, round.index, 0, result);
+						syncRegistryAgent(dispatchRegistry, taskNode.id, round.index, 0, result, step.cwd ?? ctx.cwd);
 						results.push(result);
 
 						const isError = isFailedResult(result);
@@ -1214,14 +1313,14 @@ export default function (pi: ExtensionAPI) {
 							(partial) => {
 								if (partial.details?.results[0]) {
 									allResults[index] = partial.details.results[0];
-									syncRegistryAgent(dispatchRegistry, taskNode.id, dispatchRound.index, index, partial.details.results[0]);
+									syncRegistryAgent(dispatchRegistry, taskNode.id, dispatchRound.index, index, partial.details.results[0], t.cwd ?? ctx.cwd);
 									emitParallelUpdate();
 								}
 							},
 							makeDetails("parallel"),
 						);
 						allResults[index] = result;
-						syncRegistryAgent(dispatchRegistry, taskNode.id, dispatchRound.index, index, result);
+						syncRegistryAgent(dispatchRegistry, taskNode.id, dispatchRound.index, index, result, t.cwd ?? ctx.cwd);
 						emitParallelUpdate();
 						return result;
 					});
@@ -1259,7 +1358,7 @@ export default function (pi: ExtensionAPI) {
 				const dispatchRound = dispatchRegistry.startRound(taskNode.id, [{ agent: params.agent }]);
 				try {
 					const streamingUpdate: OnUpdateCallback = (partial) => {
-						syncRegistryAgent(dispatchRegistry, taskNode.id, dispatchRound.index, 0, partial.details?.results[0]);
+						syncRegistryAgent(dispatchRegistry, taskNode.id, dispatchRound.index, 0, partial.details?.results[0], params.cwd ?? ctx.cwd);
 						onUpdate?.(partial);
 					};
 					const result = await runSingleAgent(
@@ -1274,7 +1373,7 @@ export default function (pi: ExtensionAPI) {
 						streamingUpdate,
 						makeDetails("single"),
 					);
-					syncRegistryAgent(dispatchRegistry, taskNode.id, dispatchRound.index, 0, result);
+					syncRegistryAgent(dispatchRegistry, taskNode.id, dispatchRound.index, 0, result, params.cwd ?? ctx.cwd);
 					const isError = isFailedResult(result);
 					if (isError) {
 						const errorMsg = getResultOutput(result);
