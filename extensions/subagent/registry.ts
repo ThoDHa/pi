@@ -229,7 +229,9 @@ export function mergeAgentUpdate(node: DispatchAgentNode, update: DispatchAgentU
  * per-slot `agents` nodes join additively for EXT-1-3, so snapshots
  * published before that wiring (still alive on globalThis across a
  * /reload) may omit them and render surfaces fall back to
- * agentNames.
+ * agentNames. Nodes are created lazily at step start, so an empty
+ * `agents` array means nothing has started yet rather than a legacy
+ * snapshot.
  */
 export interface DetachedJobSnapshot {
 	id: string;

@@ -122,6 +122,49 @@ assert.equal(legacyView.agents[0].status, "failed", "fallback children key off j
 assert.equal(legacyView.agents[0].finishedAt, 31_000);
 assert.equal(legacyView.glyph, "failed");
 
+// --- buildNavigatorTasks: empty and partial agents arrays (lazy detached node creation) ---
+
+const notStartedJob = {
+	id: "job-4",
+	mode: "chain",
+	status: "running",
+	agentNames: ["first", "second", "third"],
+	taskPreview: "chain not started",
+	startedAt: 1_000,
+	agents: [],
+};
+const notStartedTasks = buildNavigatorTasks(registry, [notStartedJob], 2_000);
+const notStartedView = notStartedTasks[notStartedTasks.length - 1];
+assert.equal(notStartedView.agents.length, 0, "an empty agents array renders no agent children (nothing started yet)");
+const notStartedRows = flattenNavigatorTree(notStartedTasks, createExpansionState());
+assert.deepEqual(
+	notStartedRows.filter((row) => row.taskId === "job-4").map((row) => row.id),
+	["t:job-4"],
+	"a job whose steps have not started shows only its task row",
+);
+
+const brokenChainJob = {
+	id: "job-5",
+	mode: "chain",
+	status: "failed",
+	agentNames: ["planner", "worker", "reviewer"],
+	taskPreview: "broken chain",
+	startedAt: 1_000,
+	finishedAt: 9_000,
+	agents: [{ agent: "planner", status: "failed", step: 1, startedAt: 1_000, finishedAt: 4_000 }],
+};
+const brokenTasks = buildNavigatorTasks(registry, [brokenChainJob], 10_000);
+const brokenView = brokenTasks[brokenTasks.length - 1];
+assert.equal(brokenView.agents.length, 1, "a chain broken at step 1 publishes only the started step");
+assert.equal(brokenView.agents[0].status, "failed");
+assert.equal(brokenView.agents[0].finishedAt, 4_000, "the started step keeps its own finish, not the job's");
+const brokenRows = flattenNavigatorTree(brokenTasks, createExpansionState());
+assert.deepEqual(
+	brokenRows.filter((row) => row.taskId === "job-5").map((row) => row.kind),
+	["task", "agent"],
+	"never-started chain steps render no rows instead of ghost failures",
+);
+
 // --- buildNavigatorTasks: aggregate task glyph over settled agents ---
 
 const settled = createDispatchRegistry();

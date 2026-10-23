@@ -253,6 +253,33 @@ assert.equal(legacyView.entries[0].glyph, "failed", "the job-status glyph covers
 assert.equal(legacyView.entries[0].activity, undefined);
 assert.equal(legacyView.entries[0].durationText, "30s");
 
+// --- buildStripTasks: empty and partial agents arrays (lazy detached node creation) ---
+
+const notStartedJob = {
+	mode: "chain",
+	status: "running",
+	agentNames: ["first", "second", "third"],
+	taskPreview: "chain not started",
+	startedAt: 1_000,
+	agents: [],
+};
+const notStartedStrip = buildStripTasks(createDispatchRegistry(), [notStartedJob], 2_000)[0];
+assert.equal(notStartedStrip.entries.length, 0, "a job whose steps have not started shows only its header");
+
+const brokenChainJob = {
+	mode: "chain",
+	status: "failed",
+	agentNames: ["planner", "worker", "reviewer"],
+	taskPreview: "broken chain",
+	startedAt: 1_000,
+	finishedAt: 9_000,
+	agents: [{ agent: "planner", status: "failed", step: 1, startedAt: 1_000, finishedAt: 4_000 }],
+};
+const brokenStrip = buildStripTasks(createDispatchRegistry(), [brokenChainJob], 10_000)[0];
+assert.equal(brokenStrip.entries.length, 1, "the never-started chain steps render no strip entries");
+assert.equal(brokenStrip.entries[0].name, "planner");
+assert.equal(brokenStrip.entries[0].durationText, "3s", "the started step's duration ends at its own finish");
+
 // --- buildStripTasks: labels resolve from the prompt at render time ---
 
 const labeled = createDispatchRegistry();

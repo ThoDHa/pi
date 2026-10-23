@@ -581,27 +581,20 @@ function createDetachedJob(id: string, mode: DetachedJob["mode"], steps: Dispatc
 }
 
 /**
- * Publish the job's current state into the shared detached-job
- * snapshots (replace-by-id via upsertDetachedJobSnapshot), so the
- * viewer extension renders detached jobs off live status without the
- * jobs Map (whose collection and wake semantics stay private to this
- * extension) crossing the extension boundary. Called at job creation
- * and again at settle. Aborted jobs are skipped: abortion only
- * happens in session teardown, whose session_start clears the shared
- * array, and the killed child settles seconds later — republishing
- * then would re-add a ghost of the dead session, the same race the
- * completion wake's registry-membership check guards.
+ * Per-slot live nodes of a detached job, in dispatch-slot order.
+ * Nodes exist only for steps that actually started (created lazily at
+ * step start), so a chain broken on a failed step never publishes its
+ * unstarted steps — no ghost rows settling to the job's outcome,
+ * matching the blocking convention where rounds start when steps
+ * start. Slots still marked running when the job finished never
+ * produced a result (the dispatch-error path), so they settle to the
+ * job's outcome like the blocking paths' failRunningAgents cleanup —
+ * the tree must never show a ghost hourglass.
  */
-/**
- * Per-slot live nodes of a detached job at settle: slots still marked
- * running when the job finished never produced a result (the
- * dispatch-error path), so they settle to the job's outcome like the
- * blocking paths' failRunningAgents cleanup — the tree must never
- * show a ghost hourglass.
- */
-function detachedAgentNodes(job: DetachedJob, slotNodes: DispatchAgentNode[]): DispatchAgentNode[] {
-	if (job.finishedAt === undefined) return slotNodes.map((node) => ({ ...node }));
-	return slotNodes.map((node) => {
+function detachedAgentNodes(job: DetachedJob, slotNodes: ReadonlyMap<number, DispatchAgentNode>): DispatchAgentNode[] {
+	const started = [...slotNodes.entries()].sort(([a], [b]) => a - b).map(([, node]) => node);
+	if (job.finishedAt === undefined) return started.map((node) => ({ ...node }));
+	return started.map((node) => {
 		if (node.status !== "running") return { ...node };
 		return {
 			...node,
@@ -616,16 +609,17 @@ function detachedAgentNodes(job: DetachedJob, slotNodes: DispatchAgentNode[]): D
  * snapshots (replace-by-id via upsertDetachedJobSnapshot), so the
  * viewer extension renders detached jobs off live status without the
  * jobs Map (whose collection and wake semantics stay private to this
- * extension) crossing the extension boundary. Called at job creation,
- * on every per-agent streaming update (with the slot nodes the
- * onUpdate wiring merges into), and again at settle. Aborted jobs are
+ * extension) crossing the extension boundary. Called at job creation
+ * (no step has started: an empty node map publishes an empty agents
+ * array), on every per-agent streaming update, and again at settle.
+ * Aborted jobs are
  * skipped: abortion only happens in session teardown, whose
  * session_start clears the shared array, and the killed child settles
  * seconds later — republishing then would re-add a ghost of the dead
  * session, the same race the completion wake's registry-membership
  * check guards.
  */
-function publishDetachedJobSnapshot(job: DetachedJob, slotNodes?: DispatchAgentNode[]): void {
+function publishDetachedJobSnapshot(job: DetachedJob, slotNodes: ReadonlyMap<number, DispatchAgentNode>): void {
 	if (job.abort.signal.aborted) return;
 	const { detachedJobs } = getSharedDispatchState();
 	upsertDetachedJobSnapshot(detachedJobs, {
@@ -636,14 +630,7 @@ function publishDetachedJobSnapshot(job: DetachedJob, slotNodes?: DispatchAgentN
 		taskPreview: job.taskPreview,
 		startedAt: job.startedAt,
 		finishedAt: job.finishedAt,
-		agents: slotNodes
-			? detachedAgentNodes(job, slotNodes)
-			: job.agentNames.map((name) => ({
-					agent: name,
-					status: job.status,
-					startedAt: job.startedAt,
-					...(job.finishedAt !== undefined ? { finishedAt: job.finishedAt } : {}),
-				})),
+		agents: detachedAgentNodes(job, slotNodes),
 	});
 }
 
@@ -660,16 +647,25 @@ async function runDetachedJob(
 	// publication carries: the detached counterpart of the blocking
 	// paths' syncRegistryAgent, keeping detached detail streaming into
 	// the strip and the navigator while the tool call has already
-	// returned.
-	const slotNodes: DispatchAgentNode[] = steps.map((step, index) => ({
-		agent: step.agent,
-		step: job.mode === "chain" ? index + 1 : undefined,
-		status: "running",
-		startedAt: job.startedAt,
-		cwd: step.cwd ?? defaultCwd,
-	}));
+	// returned. Created lazily at step start, so never-started chain
+	// steps never enter a snapshot; a node's startedAt is its own
+	// step's start, matching the blocking rounds' timing.
+	const slotNodes = new Map<number, DispatchAgentNode>();
+	const startSlot = (slot: number): DispatchAgentNode => {
+		const existing = slotNodes.get(slot);
+		if (existing) return existing;
+		const node: DispatchAgentNode = {
+			agent: steps[slot].agent,
+			step: job.mode === "chain" ? slot + 1 : undefined,
+			status: "running",
+			startedAt: Date.now(),
+			cwd: steps[slot].cwd ?? defaultCwd,
+		};
+		slotNodes.set(slot, node);
+		return node;
+	};
 	const publishSlotUpdate = (slot: number, result: SingleResult) => {
-		mergeAgentUpdate(slotNodes[slot], agentUpdateFromResult(result, steps[slot].cwd ?? defaultCwd, Date.now()));
+		mergeAgentUpdate(startSlot(slot), agentUpdateFromResult(result, steps[slot].cwd ?? defaultCwd, Date.now()));
 		publishDetachedJobSnapshot(job, slotNodes);
 	};
 	// The per-slot streaming callback handed to runSingleAgent: it only
@@ -683,8 +679,9 @@ async function runDetachedJob(
 	try {
 		let results: SingleResult[];
 		if (job.mode === "parallel") {
-			results = await mapWithConcurrencyLimit(steps, MAX_CONCURRENCY, (step, slot) =>
-				runSingleAgent(
+			results = await mapWithConcurrencyLimit(steps, MAX_CONCURRENCY, (step, slot) => {
+				startSlot(slot);
+				return runSingleAgent(
 					defaultCwd,
 					dispatchDefaults,
 					agents,
@@ -695,8 +692,8 @@ async function runDetachedJob(
 					job.abort.signal,
 					slotUpdate(slot),
 					makeDetails,
-				),
-			);
+				);
+			});
 			results.forEach((result, slot) => publishSlotUpdate(slot, result));
 		} else if (job.mode === "chain") {
 			results = [];
@@ -704,6 +701,7 @@ async function runDetachedJob(
 			for (let i = 0; i < steps.length; i++) {
 				const step = steps[i];
 				const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+				startSlot(i);
 				const result = await runSingleAgent(
 					defaultCwd,
 					dispatchDefaults,
@@ -723,6 +721,7 @@ async function runDetachedJob(
 			}
 		} else {
 			const step = steps[0];
+			startSlot(0);
 			const result = await runSingleAgent(
 				defaultCwd,
 				dispatchDefaults,
@@ -1172,7 +1171,7 @@ export default function (pi: ExtensionAPI) {
 
 				const job = createDetachedJob(`job-${nextJobId++}`, mode, steps);
 				jobs.set(job.id, job);
-				publishDetachedJobSnapshot(job);
+				publishDetachedJobSnapshot(job, new Map());
 				void runDetachedJob(job, steps, agents, dispatchDefaults, ctx.cwd, makeDetails(mode), wakeOnCompletion);
 				return {
 					content: [

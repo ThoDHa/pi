@@ -197,9 +197,10 @@ function jobAgentEntry(node: DispatchAgentNode, fallbackEnd: number): StripAgent
  * agent entries lead so the budget's tail cut spares live content. A
  * detached job becomes one task view labeled with its taskPreview.
  * Its per-slot agent nodes (the EXT-1-3 wiring) stream per-agent
- * glyph, activity, and duration onto the strip when present;
- * snapshots without them fall back to one entry per agent name keyed
- * off job.status.
+ * glyph, activity, and duration onto the strip when the snapshot
+ * carries them (an empty array means nothing has started yet and
+ * renders no entries); snapshots without the array fall back to one
+ * entry per agent name keyed off job.status.
  */
 export function buildStripTasks(
 	registry: DispatchRegistry,
@@ -223,8 +224,8 @@ export function buildStripTasks(
 		const glyph: "running" | "done" | "failed" =
 			job.status === "done" ? "done" : job.status === "failed" ? "failed" : "running";
 		const fallbackEnd = job.finishedAt ?? now;
-		const entries: StripAgentEntry[] = job.agents?.length
-			? job.agents.map((node) => jobAgentEntry(node, fallbackEnd))
+		const entries: StripAgentEntry[] = job.agents
+			? job.agents.map((node) => agentEntry(node, fallbackEnd))
 			: job.agentNames.map((name) => ({ kind: "agent", name, glyph, durationText: formatDuration(fallbackEnd - job.startedAt) }));
 		views.push({
 			label: job.taskPreview || "(detached)",

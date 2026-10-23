@@ -136,7 +136,9 @@ function registryAgentView(node: DispatchAgentNode, taskId: string, roundIndex: 
  * is the task node, its agents hang directly off it, glyphs keyed off
  * job.status). Labels resolve through the shared EXT-1-2 heuristic at
  * render time. Snapshots predating the per-agent wiring (no `agents`
- * array) fall back to agentNames children keyed off job.status.
+ * array) fall back to agentNames children keyed off job.status; a
+ * present-but-empty `agents` array means nothing has started yet
+ * (lazy node creation) and renders no agent children.
  */
 export function buildNavigatorTasks(registry: DispatchRegistry, jobs: Iterable<NavigatorJobLike>, now: number): NavigatorTaskView[] {
 	const views: NavigatorTaskView[] = [];
@@ -169,7 +171,7 @@ export function buildNavigatorTasks(registry: DispatchRegistry, jobs: Iterable<N
 	}
 
 	for (const job of jobs) {
-		const nodes: readonly DispatchAgentNode[] = job.agents?.length
+		const nodes: readonly DispatchAgentNode[] = job.agents
 			? job.agents
 			: job.agentNames.map((name) => ({
 					agent: name,
