@@ -66,9 +66,8 @@ export interface DispatchRoundNode {
 
 export interface DispatchTaskNode {
 	id: string;
-	label: string;
 	mode: DispatchMode;
-	/** The dispatch prompt text the label was resolved from. */
+	/** The dispatch prompt text the display label is resolved from (viewer-side, at render time). */
 	prompt: string;
 	startedAt: number;
 	rounds: DispatchRoundNode[];
@@ -83,7 +82,7 @@ export interface DispatchAgentUpdate {
 }
 
 export interface DispatchRegistry {
-	startTask(input: { mode: DispatchMode; prompt: string; label: string; now?: number }): DispatchTaskNode;
+	startTask(input: { mode: DispatchMode; prompt: string; now?: number }): DispatchTaskNode;
 	/**
 	 * Append a round with one running agent node per slot. Throws on an
 	 * unknown task id: rounds are only ever started on a task this
@@ -118,7 +117,6 @@ export function createDispatchRegistry(): DispatchRegistry {
 		startTask(input) {
 			const task: DispatchTaskNode = {
 				id: `task-${nextTaskId++}`,
-				label: input.label,
 				mode: input.mode,
 				prompt: input.prompt,
 				startedAt: input.now ?? Date.now(),
@@ -214,6 +212,40 @@ export interface SharedDispatchState {
 export function getSharedDispatchState(): SharedDispatchState {
 	globalThis.__piSubagentDispatchState ??= { registry: createDispatchRegistry(), detachedJobs: [] };
 	return globalThis.__piSubagentDispatchState;
+}
+
+export type StatusGlyphName = "running" | "done" | "failed" | "mixed";
+
+/**
+ * The fleet glyph conventions shared with the blocking path's
+ * ⏳/✓/✗ renderers. Lives here so the subagent extension's detached
+ * surfaces and the viewer's strip render statuses identically.
+ */
+export function statusGlyph(status: StatusGlyphName): string {
+	switch (status) {
+		case "running":
+			return "⏳";
+		case "done":
+			return "✓";
+		case "failed":
+			return "✗";
+		case "mixed":
+			return "◐";
+	}
+}
+
+/**
+ * Duration formatting shared by every dispatch surface: seconds under
+ * a minute, minutes plus seconds under an hour, hours plus minutes
+ * beyond.
+ */
+export function formatDuration(ms: number): string {
+	const totalSeconds = Math.max(0, Math.round(ms / 1000));
+	if (totalSeconds < 60) return `${totalSeconds}s`;
+	const minutes = Math.floor(totalSeconds / 60);
+	const seconds = totalSeconds % 60;
+	if (minutes < 60) return seconds > 0 ? `${minutes}m${seconds}s` : `${minutes}m`;
+	return `${Math.floor(minutes / 60)}h${minutes % 60}m`;
 }
 
 /** Structural subset of a streamed message, so pi message types satisfy it without an import. */

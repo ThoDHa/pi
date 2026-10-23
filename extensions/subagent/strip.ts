@@ -1,38 +1,32 @@
 /**
  * Ambient strip rendering
  *
- * Pure rendering layer for the dispatch strip widget: glyph and
- * duration formatting shared with the detached job surfaces, the
- * assembly of strip task views from the dispatch registry and the
- * detached jobs registry, and the strip's self-managed line budget
- * (live tasks prioritized, the navigator-key hint line always last,
- * overflow summarized as "+N more"). The widget component in index.ts
- * maps the returned segments through theme.fg.
+ * Pure rendering layer for the dispatch strip widget: the assembly of
+ * strip task views from the dispatch registry and the detached jobs
+ * registry, with labels resolved from the task prompt at render time,
+ * and the strip's self-managed line budget (live tasks prioritized,
+ * the navigator-key hint line always last, overflow summarized as
+ * "+N more"). The widget component in index.ts maps the returned
+ * segments through theme.fg. The glyph and duration helpers both
+ * surfaces render from live in the shared contract module
+ * (./registry.ts).
  *
  * Dependency-free by design (no pi imports) so plain-node suites can
  * pin the budget and glyph behavior directly.
  */
 
-import type { DispatchAgentNode, DispatchRegistry, DispatchRoundNode } from "./registry.ts";
+import { resolveTaskLabel } from "./labels.ts";
+import {
+	type DispatchAgentNode,
+	type DispatchRegistry,
+	type DispatchRoundNode,
+	formatDuration,
+	statusGlyph,
+	type StatusGlyphName,
+} from "./registry.ts";
 
 /** Strip widget line budget. Content lines are capped at maxLines minus the overflow and hint reservations. */
 export const STRIP_MAX_LINES = 12;
-
-export type StripGlyphName = "running" | "done" | "failed" | "mixed";
-
-/** The fleet glyph conventions shared with the blocking path's ⏳/✓/✗ renderers. */
-export function statusGlyph(status: StripGlyphName): string {
-	switch (status) {
-		case "running":
-			return "⏳";
-		case "done":
-			return "✓";
-		case "failed":
-			return "✗";
-		case "mixed":
-			return "◐";
-	}
-}
 
 export type StripColor = "muted" | "dim" | "accent" | "warning" | "success" | "error" | "toolTitle";
 
@@ -57,7 +51,7 @@ export interface StripAgentEntry {
 export interface StripRoundEntry {
 	kind: "round";
 	label: string;
-	glyph: StripGlyphName;
+	glyph: StatusGlyphName;
 	summary: string;
 	durationText: string;
 }
@@ -81,21 +75,7 @@ export interface StripJobLike {
 	finishedAt?: number;
 }
 
-/**
- * Duration formatting shared with index.ts (moved verbatim from
- * there): seconds under a minute, minutes plus seconds under an hour,
- * hours plus minutes beyond.
- */
-export function formatDuration(ms: number): string {
-	const totalSeconds = Math.max(0, Math.round(ms / 1000));
-	if (totalSeconds < 60) return `${totalSeconds}s`;
-	const minutes = Math.floor(totalSeconds / 60);
-	const seconds = totalSeconds % 60;
-	if (minutes < 60) return seconds > 0 ? `${minutes}m${seconds}s` : `${minutes}m`;
-	return `${Math.floor(minutes / 60)}h${minutes % 60}m`;
-}
-
-const GLYPH_COLORS: Record<StripGlyphName, StripColor> = {
+const GLYPH_COLORS: Record<StatusGlyphName, StripColor> = {
 	running: "warning",
 	done: "success",
 	failed: "error",
@@ -160,7 +140,7 @@ export function renderStripLines(
 	return [...lines.slice(0, maxContent), { segments: [{ text: `+${omitted} more`, color: "muted" }] }, hintLine];
 }
 
-function roundStatus(round: DispatchRoundNode): StripGlyphName {
+function roundStatus(round: DispatchRoundNode): StatusGlyphName {
 	const failed = round.agents.filter((agent) => agent.status === "failed").length;
 	if (failed === 0) return "done";
 	return failed === round.agents.length ? "failed" : "mixed";
@@ -196,7 +176,8 @@ function agentEntry(agent: DispatchAgentNode, now: number): StripAgentEntry {
 
 /**
  * Assemble the strip's task views from the blocking-path dispatch
- * registry plus the detached jobs registry. A finished round of a
+ * registry plus the detached jobs registry. Task labels resolve from
+ * the prompt at render time; a finished round of a
  * live task collapses to one round entry; within a task, live rounds'
  * agent entries lead so the budget's tail cut spares live content. A
  * detached job becomes one task view labeled with its taskPreview,
@@ -217,7 +198,7 @@ export function buildStripTasks(
 			for (const agent of round.agents) entries.push(agentEntry(agent, now));
 		}
 		for (const round of finishedRounds) entries.push(collapsedRoundEntry(round, now));
-		views.push({ label: task.label, mode: task.mode, live, entries });
+		views.push({ label: resolveTaskLabel(task.prompt), mode: task.mode, live, entries });
 	}
 
 	for (const job of jobs) {

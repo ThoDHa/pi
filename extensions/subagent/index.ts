@@ -35,16 +35,15 @@ import {
 import { Container, Markdown, Spacer, Text, truncateToWidth, type Component, type KeyId, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
-import { resolveTaskLabel } from "./labels.ts";
 import { releasePromptDir, writePromptToTempFile } from "./prompt-temp.ts";
-import { createDispatchRegistry, extractLastActivity, type DispatchRegistry } from "./registry.ts";
 import {
-	buildStripTasks,
+	createDispatchRegistry,
+	extractLastActivity,
 	formatDuration,
-	renderStripLines,
 	statusGlyph,
-	STRIP_MAX_LINES,
-} from "./strip.ts";
+	type DispatchRegistry,
+} from "./registry.ts";
+import { buildStripTasks, renderStripLines, STRIP_MAX_LINES } from "./strip.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -1188,7 +1187,6 @@ export default function (pi: ExtensionAPI) {
 				const taskNode = dispatchRegistry.startTask({
 					mode: "chain",
 					prompt: params.chain[0].task,
-					label: resolveTaskLabel(params.chain[0].task),
 				});
 				try {
 					const results: SingleResult[] = [];
@@ -1264,7 +1262,6 @@ export default function (pi: ExtensionAPI) {
 				const taskNode = dispatchRegistry.startTask({
 					mode: "parallel",
 					prompt: params.tasks[0].task,
-					label: resolveTaskLabel(params.tasks[0].task),
 				});
 				const dispatchRound = dispatchRegistry.startRound(
 					taskNode.id,
@@ -1355,7 +1352,6 @@ export default function (pi: ExtensionAPI) {
 				const taskNode = dispatchRegistry.startTask({
 					mode: "single",
 					prompt: params.task,
-					label: resolveTaskLabel(params.task),
 				});
 				const dispatchRound = dispatchRegistry.startRound(taskNode.id, [{ agent: params.agent }]);
 				try {

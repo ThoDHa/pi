@@ -9,22 +9,17 @@
  * always last, live tasks prioritized before finished ones, finished
  * rounds collapsed, the "+N more" overflow summary (content lines are
  * capped at maxLines minus the overflow and hint reservations), the
- * no-dispatch placeholder, and the glyph/color conventions shared
- * with the blocking path. Also covers buildStripTasks assembling
+ * no-dispatch placeholder, the glyph/color conventions shared
+ * with the blocking path, and render-time task-label derivation from
+ * the prompt. Also covers buildStripTasks assembling
  * views from a live registry plus detached jobs: live rounds first,
  * collapsed finished rounds, detached jobs reusing taskPreview and
  * keying glyphs off job.status.
  */
 
 import assert from "node:assert/strict";
-import { createDispatchRegistry } from "../extensions/subagent/registry.ts";
-import {
-	buildStripTasks,
-	formatDuration,
-	renderStripLines,
-	statusGlyph,
-	STRIP_MAX_LINES,
-} from "../extensions/subagent/strip.ts";
+import { createDispatchRegistry, formatDuration, statusGlyph } from "../extensions/subagent/registry.ts";
+import { buildStripTasks, renderStripLines, STRIP_MAX_LINES } from "../extensions/subagent/strip.ts";
 
 /** Join a strip line's segment texts into the plain line string. */
 function lineText(line) {
@@ -42,7 +37,7 @@ assert.equal(statusGlyph("done"), "✓");
 assert.equal(statusGlyph("failed"), "✗");
 assert.equal(statusGlyph("mixed"), "◐");
 
-// --- formatDuration (moved verbatim from index.ts) ---
+// --- formatDuration (shared contract module) ---
 
 assert.equal(formatDuration(45_000), "45s");
 assert.equal(formatDuration(62_000), "1m2s");
@@ -179,7 +174,7 @@ assert.ok(rendered.includes("+8 more"), "omitted lines are summarized (18 conten
 // --- buildStripTasks: registry rounds (live first, finished collapsed) ---
 
 const registry = createDispatchRegistry();
-const chain = registry.startTask({ mode: "chain", prompt: "Task: EXT-7-1 steps", label: "EXT-7-1", now: 1_000 });
+const chain = registry.startTask({ mode: "chain", prompt: "Task: EXT-7-1 steps", now: 1_000 });
 registry.startRound(chain.id, [{ agent: "scout", step: 1 }], 1_000);
 registry.updateAgent(chain.id, 1, 0, { status: "done", finishedAt: 61_000 });
 registry.startRound(chain.id, [{ agent: "planner", step: 2 }], 62_000);
@@ -205,7 +200,7 @@ const views = buildStripTasks(registry, [detachedRunning, detachedFailed], 122_0
 assert.equal(views.length, 3);
 
 const chainView = views[0];
-assert.equal(chainView.label, "EXT-7-1");
+assert.equal(chainView.label, "EXT-7-1", "label derives from the prompt's fleet reference at render time");
 assert.equal(chainView.live, true, "task with a running agent is live");
 assert.equal(chainView.entries.length, 2, "one entry per round: live round entry + collapsed finished round");
 assert.equal(chainView.entries[0].kind, "agent");
@@ -232,10 +227,19 @@ assert.equal(detachedFailedView.live, false);
 assert.equal(detachedFailedView.entries[0].glyph, "failed", "detached glyph keys off job.status");
 assert.equal(detachedFailedView.entries[0].durationText, "30s", "finished detached duration = finishedAt - startedAt");
 
+// --- buildStripTasks: labels resolve from the prompt at render time ---
+
+const labeled = createDispatchRegistry();
+labeled.startTask({ mode: "single", prompt: "Task: EXT-9-2 parser fixes", now: 1_000 });
+labeled.startTask({ mode: "single", prompt: "Reply ready for the fleet", now: 1_000 });
+const labeledViews = buildStripTasks(labeled, [], 2_000);
+assert.equal(labeledViews[0].label, "EXT-9-2", "fleet-reference prompts label by the reference");
+assert.equal(labeledViews[1].label, "Reply ready for the fleet", "plain prompts label by first words");
+
 // --- buildStripTasks: mixed failed round collapses with the mixed glyph ---
 
 const mixed = createDispatchRegistry();
-const parallelTask = mixed.startTask({ mode: "parallel", prompt: "fan", label: "fan", now: 1_000 });
+const parallelTask = mixed.startTask({ mode: "parallel", prompt: "fan", now: 1_000 });
 mixed.startRound(parallelTask.id, [{ agent: "a" }, { agent: "b" }, { agent: "c" }], 1_000);
 mixed.updateAgent(parallelTask.id, 1, 0, { status: "done", finishedAt: 2_000 });
 mixed.updateAgent(parallelTask.id, 1, 1, { status: "failed", finishedAt: 3_000 });

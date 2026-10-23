@@ -25,9 +25,9 @@ const NOW = 1_000_000;
 // --- startTask / startRound: shape and sequential ids ---
 
 const registry = createDispatchRegistry();
-const single = registry.startTask({ mode: "single", prompt: "Task: EXT-1-2 checkpoint 1", label: "EXT-1-2", now: NOW });
+const single = registry.startTask({ mode: "single", prompt: "Task: EXT-1-2 checkpoint 1", now: NOW });
 assert.equal(single.id, "task-1");
-assert.equal(single.label, "EXT-1-2");
+assert.equal("label" in single, false, "task nodes carry the prompt, not a publication-time label");
 assert.equal(single.mode, "single");
 assert.equal(single.prompt, "Task: EXT-1-2 checkpoint 1");
 assert.equal(single.startedAt, NOW);
@@ -40,7 +40,7 @@ assert.equal(round.agents[0].agent, "worker");
 assert.equal(round.agents[0].status, "running");
 assert.equal(round.agents[0].startedAt, NOW);
 
-const second = registry.startTask({ mode: "parallel", prompt: "fan out", label: "fan out", now: NOW });
+const second = registry.startTask({ mode: "parallel", prompt: "fan out", now: NOW });
 assert.equal(second.id, "task-2", "task ids increment sequentially");
 
 // --- updateAgent: running -> done with usage/result snapshots ---
@@ -66,7 +66,7 @@ assert.equal(finishedAgent?.usage?.turns, 3);
 
 // --- chain shape: one round per step, failed step keeps its status ---
 
-const chain = registry.startTask({ mode: "chain", prompt: "step one", label: "step one", now: NOW });
+const chain = registry.startTask({ mode: "chain", prompt: "step one", now: NOW });
 const chainRound1 = registry.startRound(chain.id, [{ agent: "scout", step: 1 }], NOW);
 const chainRound2 = registry.startRound(chain.id, [{ agent: "planner", step: 2 }], NOW + 1_000);
 assert.equal(chainRound1.index, 1);
@@ -86,7 +86,7 @@ assert.deepEqual(registry.tasks().map((task) => task.id), ["task-1", "task-2", c
 
 // --- parallel shape: several agent slots in one round ---
 
-const parallel = registry.startTask({ mode: "parallel", prompt: "fan out", label: "fan out", now: NOW });
+const parallel = registry.startTask({ mode: "parallel", prompt: "fan out", now: NOW });
 registry.startRound(parallel.id, [{ agent: "a" }, { agent: "b" }, { agent: "a" }], NOW);
 registry.updateAgent(parallel.id, 1, 1, { status: "done", finishedAt: NOW + 1_000 });
 assert.equal(registry.getTask(parallel.id)?.rounds[0]?.agents.length, 3);
@@ -117,7 +117,7 @@ assert.equal(parallelAgents[1]?.finishedAt, NOW + 1_000, "already-finished agent
 registry.reset();
 assert.deepEqual(registry.tasks(), []);
 assert.equal(registry.getTask(single.id), undefined);
-const afterReset = registry.startTask({ mode: "single", prompt: "fresh", label: "fresh", now: NOW });
+const afterReset = registry.startTask({ mode: "single", prompt: "fresh", now: NOW });
 assert.equal(afterReset.id, "task-1", "id counter restarts after reset");
 
 // --- extractLastActivity over streaming messages ---
