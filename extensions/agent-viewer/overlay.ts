@@ -213,7 +213,7 @@ export class NavigatorOverlay implements Focusable {
 		const body = new HStack(
 			[
 				{ component: new VStack(treeRows.map((line) => new Text(line, 0, 0))), basis: treeW },
-				{ component: new VStack(detailLines.map((line) => new Text(line, 0, 0))) },
+				{ component: new VStack(detailLines.map((line) => new Text(line, 0, 0))), basis: detailW },
 			],
 			{ gap: PANE_GAP, align: "start" },
 		).render(innerW);
@@ -228,7 +228,7 @@ export class NavigatorOverlay implements Focusable {
 			lines.push(`${theme.fg("border", "│")}${padded}${theme.fg("border", "│")}`);
 		}
 		const hints = FOOTER_HINTS;
-		lines.push(`${theme.fg("border", "│")}${pad(theme.fg("muted", hints), innerW)}${theme.fg("border", "│")}`);
+		lines.push(`${theme.fg("border", "│")}${pad(truncateToWidth(theme.fg("muted", hints), innerW), innerW)}${theme.fg("border", "│")}`);
 		lines.push(theme.fg("border", `╰${border}╯`));
 		return lines;
 	}
