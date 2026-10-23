@@ -22,6 +22,7 @@
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, type Component, type KeyId, type TUI } from "@earendil-works/pi-tui";
 import { getSharedDispatchState, type DetachedJobSnapshot, type DispatchRegistry } from "../subagent/registry.ts";
+import { NavigatorOverlay } from "./overlay.ts";
 import { buildStripTasks, renderStripLines, STRIP_MAX_LINES } from "./strip.ts";
 
 const STRIP_WIDGET_KEY = "subagent-dispatch-strip";
@@ -124,6 +125,9 @@ export default function (pi: ExtensionAPI) {
 	// the editor's shortcut setup on both startup and /reload. A
 	// changed subagentViewer key therefore binds after /reload.
 	let stripVisible = false;
+	// Double-open guard for the navigator: while the overlay is showing,
+	// a second open-key press must not stack a second ctx.ui.custom.
+	let navigatorOpen = false;
 	const registerViewerShortcuts = () => {
 		const viewerKeys = readViewerKeys(pi.getSettings());
 		pi.registerShortcut(viewerKeys.stripKey, {
@@ -144,8 +148,31 @@ export default function (pi: ExtensionAPI) {
 							stripKey: viewerKeys.stripKey,
 							navigatorKey: viewerKeys.navigatorKey,
 						}),
-					{ placement: "aboveEditor" },
+					{
+						placement: "aboveEditor",
+					},
 				);
+			},
+		});
+		pi.registerShortcut(viewerKeys.navigatorKey, {
+			description: "Open the subagent navigator overlay",
+			handler: async (ctx) => {
+				if (navigatorOpen) return;
+				navigatorOpen = true;
+				try {
+					const shared = getSharedDispatchState();
+					await ctx.ui.custom(
+						(tui, theme, _keybindings, done) =>
+							new NavigatorOverlay(tui, theme, {
+								registry: shared.registry,
+								detachedJobs: shared.detachedJobs,
+								navigatorKey: viewerKeys.navigatorKey,
+							}, done),
+						{ overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "85%" } },
+					);
+				} finally {
+					navigatorOpen = false;
+				}
 			},
 		});
 	};
@@ -154,8 +181,10 @@ export default function (pi: ExtensionAPI) {
 		// Session invalidation cleared the widget (disposing the poll
 		// interval), so visibility resets with the rest of the session
 		// state and the next toggle shows the strip against the new
-		// session.
+		// session. The navigator cannot outlive the session either; the
+		// guard resets with it.
 		stripVisible = false;
+		navigatorOpen = false;
 		registerViewerShortcuts();
 	});
 }
