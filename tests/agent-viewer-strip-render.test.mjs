@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
  * Unit suite for the ambient strip's pure rendering layer
- * (extensions/subagent/strip.ts). Plain node, no test framework:
+ * (extensions/agent-viewer/strip.ts). Plain node, no test framework:
  *
- *   node tests/subagent-strip-render.test.mjs
+ *   node tests/agent-viewer-strip-render.test.mjs
  *
  * Covers the line budget the strip owns: the navigator-key hint line
  * always last, live tasks prioritized before finished ones, finished
@@ -19,7 +19,7 @@
 
 import assert from "node:assert/strict";
 import { createDispatchRegistry, formatDuration, statusGlyph } from "../extensions/subagent/registry.ts";
-import { buildStripTasks, renderStripLines, STRIP_MAX_LINES } from "../extensions/subagent/strip.ts";
+import { buildStripTasks, renderStripLines, STRIP_MAX_LINES } from "../extensions/agent-viewer/strip.ts";
 
 /** Join a strip line's segment texts into the plain line string. */
 function lineText(line) {
@@ -250,4 +250,4 @@ assert.equal(mixedView.entries[0].kind, "round");
 assert.equal(mixedView.entries[0].glyph, "mixed", "partially failed round uses the mixed glyph");
 assert.equal(mixedView.entries[0].summary, "2/3 done, 1 failed");
 
-console.log("subagent-strip-render: all assertions passed");
+console.log("agent-viewer-strip-render: all assertions passed");

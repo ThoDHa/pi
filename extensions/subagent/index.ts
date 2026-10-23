@@ -30,20 +30,19 @@ import {
 	formatReadLineRange,
 	getAgentDir,
 	getMarkdownTheme,
-	type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Spacer, Text, truncateToWidth, type Component, type KeyId, type TUI } from "@earendil-works/pi-tui";
+import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { releasePromptDir, writePromptToTempFile } from "./prompt-temp.ts";
 import {
-	createDispatchRegistry,
 	extractLastActivity,
 	formatDuration,
+	getSharedDispatchState,
 	statusGlyph,
+	type DetachedJobSnapshot,
 	type DispatchRegistry,
 } from "./registry.ts";
-import { buildStripTasks, renderStripLines, STRIP_MAX_LINES } from "./strip.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -57,13 +56,6 @@ const JOBS_WAIT_MAX_TIMEOUT_S = 900;
 const JOB_ERROR_PREVIEW_CHARS = 200;
 const JOB_RESULT_CUSTOM_TYPE = "subagent-job-result";
 const FAILED_TASK_STOP_REASON = "timeout";
-const STRIP_WIDGET_KEY = "subagent-dispatch-strip";
-const STRIP_POLL_INTERVAL_MS = 500;
-// Hardcoded defaults so both hotkeys work with no `subagentViewer`
-// settings block present; both are unused in pi's built-in keybindings
-// (checked against docs/keybindings.md at pi 1.4.0).
-const DEFAULT_STRIP_KEY = "alt+s";
-const DEFAULT_NAVIGATOR_KEY = "alt+n";
 
 // SUBAGENT_TIMEOUT_MS raises the per-child hard timeout for legitimately
 // long single-child work; it is floored at the default so the env var
@@ -581,6 +573,35 @@ function createDetachedJob(id: string, mode: DetachedJob["mode"], steps: Dispatc
 	};
 }
 
+/**
+ * Publish the job's current state into the shared detached-job
+ * snapshots, replace-by-id, so the viewer extension renders detached
+ * jobs off live status without the jobs Map (whose collection and
+ * wake semantics stay private to this extension) crossing the
+ * extension boundary. Called at job creation and again at settle.
+ * Aborted jobs are skipped: abortion only happens in session
+ * teardown, whose session_start clears the shared array, and the
+ * killed child settles seconds later — republishing then would
+ * re-add a ghost of the dead session, the same race the completion
+ * wake's registry-membership check guards.
+ */
+function publishDetachedJobSnapshot(job: DetachedJob): void {
+	if (job.abort.signal.aborted) return;
+	const { detachedJobs } = getSharedDispatchState();
+	const snapshot: DetachedJobSnapshot = {
+		id: job.id,
+		mode: job.mode,
+		status: job.status,
+		agentNames: [...job.agentNames],
+		taskPreview: job.taskPreview,
+		startedAt: job.startedAt,
+		finishedAt: job.finishedAt,
+	};
+	const existing = detachedJobs.findIndex((candidate) => candidate.id === job.id);
+	if (existing >= 0) detachedJobs[existing] = snapshot;
+	else detachedJobs.push(snapshot);
+}
+
 async function runDetachedJob(
 	job: DetachedJob,
 	steps: DispatchStep[],
@@ -628,6 +649,7 @@ async function runDetachedJob(
 		job.error = error instanceof Error ? error.message : String(error);
 	} finally {
 		job.finishedAt = Date.now();
+		publishDetachedJobSnapshot(job);
 		job.resolveDone();
 		onJobFinished(job);
 	}
@@ -735,93 +757,10 @@ const JobsParams = Type.Object({
 	),
 });
 
-interface StripWidgetSources {
-	registry: DispatchRegistry;
-	jobs: Map<string, DetachedJob>;
-	stripKey: string;
-	navigatorKey: string;
-}
-
-/**
- * Build the ambient strip widget component: a poll-and-render loop
- * (doom-overlay pattern) that re-renders from the dispatch registry
- * and the detached jobs registry on an interval, plus a dispose that
- * clears the interval (setWidget also calls dispose when the widget
- * is hidden or cleared). Lines render through the theme with the
- * blocking path's glyph conventions and are truncated to the
- * viewport width; the strip owns its line budget via
- * renderStripLines, so pi's string-array widget cap never applies.
- */
-function createStripWidget(tui: TUI, theme: Theme, sources: StripWidgetSources): Component & { dispose(): void } {
-	let interval: ReturnType<typeof setInterval> | null = null;
-	const renderLines = (width: number): string[] => {
-		const views = buildStripTasks(sources.registry, sources.jobs.values(), Date.now());
-		const stripLines = renderStripLines(views, {
-			hint: `${sources.navigatorKey} navigator · ${sources.stripKey} hide`,
-			maxLines: STRIP_MAX_LINES,
-		});
-		return stripLines.map((line) =>
-			truncateToWidth(
-				line.segments
-					.map((segment) => {
-						const text = segment.bold ? theme.bold(segment.text) : segment.text;
-						return segment.color ? theme.fg(segment.color, text) : text;
-					})
-					.join(""),
-				width,
-			),
-		);
-	};
-	interval = setInterval(() => tui.requestRender(), STRIP_POLL_INTERVAL_MS);
-	return {
-		render(width: number) {
-			return renderLines(width);
-		},
-		invalidate() {},
-		dispose() {
-			if (interval) {
-				clearInterval(interval);
-				interval = null;
-			}
-		},
-	};
-}
-
-/**
- * A settings value is accepted as a shortcut key only when it is a
- * non-blank string; anything else falls back to the hardcoded default
- * so a malformed block can never leave the surfaces unbound.
- */
-function resolveShortcutKey(value: unknown, fallback: KeyId): KeyId {
-	if (typeof value !== "string") return fallback;
-	const trimmed = value.trim().toLowerCase();
-	return trimmed.length > 0 ? (trimmed as KeyId) : fallback;
-}
-
-interface ViewerKeys {
-	stripKey: KeyId;
-	navigatorKey: KeyId;
-}
-
-/**
- * Resolve the two hotkeys from the extension-owned `subagentViewer`
- * settings block. The namespace is not part of pi's Settings type
- * (unknown top-level settings keys survive end-to-end), so the block
- * is read through a validated structural cast. registerShortcut is
- * load-time with no settings-change event, so a changed key binds
- * after /reload.
- */
-function readViewerKeys(settings: ReturnType<ExtensionAPI["getSettings"]>): ViewerKeys {
-	const block = (settings as { subagentViewer?: { stripKey?: unknown; navigatorKey?: unknown } }).subagentViewer;
-	return {
-		stripKey: resolveShortcutKey(block?.stripKey, DEFAULT_STRIP_KEY),
-		navigatorKey: resolveShortcutKey(block?.navigatorKey, DEFAULT_NAVIGATOR_KEY),
-	};
-}
-
 export default function (pi: ExtensionAPI) {
+	const dispatchState = getSharedDispatchState();
+	const dispatchRegistry = dispatchState.registry;
 	const jobs = new Map<string, DetachedJob>();
-	const dispatchRegistry = createDispatchRegistry();
 	let nextJobId = 1;
 	let shuttingDown = false;
 
@@ -860,13 +799,11 @@ export default function (pi: ExtensionAPI) {
 		killRunningJobs();
 		jobs.clear();
 		dispatchRegistry.reset();
+		// In-place clear: the viewer extension may hold a reference to
+		// the shared snapshot array across the session boundary.
+		dispatchState.detachedJobs.length = 0;
 		nextJobId = 1;
 		shuttingDown = false;
-		// Session invalidation cleared the widget (disposing the poll
-		// interval), so visibility resets with the rest of the state and
-		// the next toggle shows the strip against the new session.
-		stripVisible = false;
-		registerViewerShortcuts();
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -900,38 +837,6 @@ export default function (pi: ExtensionAPI) {
 			continue: event.outcome === "completed" ? true : undefined,
 		};
 	});
-
-	// Ambient strip: hidden until the first toggle; the next toggle
-	// hides it again. getSettings and registerShortcut are action
-	// methods that throw during extension loading, so the hotkeys are
-	// resolved and registered on session_start, which pi emits before
-	// the editor's shortcut setup on both startup and /reload. A
-	// changed subagentViewer key therefore binds after /reload.
-	let stripVisible = false;
-	const registerViewerShortcuts = () => {
-		const viewerKeys = readViewerKeys(pi.getSettings());
-		pi.registerShortcut(viewerKeys.stripKey, {
-			description: "Toggle the subagent dispatch strip",
-			handler: (ctx) => {
-				stripVisible = !stripVisible;
-				if (!stripVisible) {
-					ctx.ui.setWidget(STRIP_WIDGET_KEY, undefined);
-					return;
-				}
-				ctx.ui.setWidget(
-					STRIP_WIDGET_KEY,
-					(tui, theme) =>
-						createStripWidget(tui, theme, {
-							registry: dispatchRegistry,
-							jobs,
-							stripKey: viewerKeys.stripKey,
-							navigatorKey: viewerKeys.navigatorKey,
-						}),
-					{ placement: "aboveEditor" },
-				);
-			},
-		});
-	};
 
 	pi.registerTool({
 		name: "jobs",
@@ -1171,6 +1076,7 @@ export default function (pi: ExtensionAPI) {
 
 				const job = createDetachedJob(`job-${nextJobId++}`, mode, steps);
 				jobs.set(job.id, job);
+				publishDetachedJobSnapshot(job);
 				void runDetachedJob(job, steps, agents, dispatchDefaults, ctx.cwd, wakeOnCompletion);
 				return {
 					content: [

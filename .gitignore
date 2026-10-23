@@ -14,3 +14,4 @@
 !/extensions/permission-gate.ts
 !/extensions/protected-paths.ts
 !/extensions/subagent/
+!/extensions/agent-viewer/

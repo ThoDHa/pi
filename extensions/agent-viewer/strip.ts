@@ -9,7 +9,7 @@
  * "+N more"). The widget component in index.ts maps the returned
  * segments through theme.fg. The glyph and duration helpers both
  * surfaces render from live in the shared contract module
- * (./registry.ts).
+ * (../subagent/registry.ts).
  *
  * Dependency-free by design (no pi imports) so plain-node suites can
  * pin the budget and glyph behavior directly.
@@ -23,7 +23,7 @@ import {
 	formatDuration,
 	statusGlyph,
 	type StatusGlyphName,
-} from "./registry.ts";
+} from "../subagent/registry.ts";
 
 /** Strip widget line budget. Content lines are capped at maxLines minus the overflow and hint reservations. */
 export const STRIP_MAX_LINES = 12;
