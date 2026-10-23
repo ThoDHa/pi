@@ -1,0 +1,51 @@
+/**
+ * Dispatch task-label heuristic
+ *
+ * A dispatch carries no task-ID field, only its prompt text, so the
+ * label for a task node is parsed from that text: the first fleet
+ * task reference (EXT-N or EXT-N-M) when the prompt carries one, the
+ * prompt's first words up to a fixed width otherwise.
+ */
+
+/** Fixed upper width for first-words fallback labels, ellipsis included. */
+export const TASK_LABEL_MAX_WIDTH = 60;
+
+const FLEET_REFERENCE_PATTERN = /\bEXT-\d+(?:-\d+)?\b/i;
+
+/**
+ * First fleet task reference in the prompt text, normalized to
+ * uppercase ("ext-4-1" -> "EXT-4-1"), or null when the prompt names
+ * no EXT-N[-M] task. Multi-reference prompts yield the first
+ * reference, matching the fleet convention of naming the dispatched
+ * task before the ones it coordinates with.
+ */
+export function findFleetTaskReference(prompt: string): string | null {
+	const match = FLEET_REFERENCE_PATTERN.exec(prompt);
+	return match ? match[0].toUpperCase() : null;
+}
+
+/**
+ * Label for a dispatch task node from its prompt text: the first
+ * fleet EXT-N[-M] reference when present, otherwise the prompt's
+ * first words collapsed to single spaces and truncated at
+ * TASK_LABEL_MAX_WIDTH on a word boundary with a trailing ellipsis
+ * (a single word longer than the width is hard-sliced). An empty or
+ * blank prompt yields an empty label.
+ */
+export function resolveTaskLabel(prompt: string): string {
+	const reference = findFleetTaskReference(prompt);
+	if (reference) return reference;
+
+	const collapsed = prompt.replace(/\s+/g, " ").trim();
+	if (collapsed.length <= TASK_LABEL_MAX_WIDTH) return collapsed;
+
+	const ellipsis = "…";
+	let filled = "";
+	for (const word of collapsed.split(" ")) {
+		const candidate = filled ? `${filled} ${word}` : word;
+		if (candidate.length > TASK_LABEL_MAX_WIDTH - ellipsis.length) break;
+		filled = candidate;
+	}
+	if (!filled) filled = collapsed.slice(0, TASK_LABEL_MAX_WIDTH - ellipsis.length);
+	return `${filled}${ellipsis}`;
+}
