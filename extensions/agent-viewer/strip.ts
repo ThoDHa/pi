@@ -177,16 +177,6 @@ function agentEntry(agent: DispatchAgentNode, now: number): StripAgentEntry {
 	};
 }
 
-function jobAgentEntry(node: DispatchAgentNode, fallbackEnd: number): StripAgentEntry {
-	return {
-		kind: "agent",
-		name: node.agent,
-		glyph: node.status,
-		activity: node.lastActivity,
-		durationText: formatDuration((node.finishedAt ?? fallbackEnd) - node.startedAt),
-	};
-}
-
 /**
  * Assemble the strip's task views from the blocking-path dispatch
  * registry plus the detached jobs registry. Task labels resolve from
