@@ -87,18 +87,7 @@ export interface NavigatorJobLike {
 	agents?: readonly DispatchAgentNode[];
 }
 
-function agentGlyph(node: DispatchAgentNode): "running" | "done" | "failed" {
-	return node.status;
-}
-
-function roundGlyph(agents: NavigatorAgentView[]): StatusGlyphName {
-	if (agents.some((agent) => agent.status === "running")) return "running";
-	const failed = agents.filter((agent) => agent.status === "failed").length;
-	if (failed === 0) return "done";
-	return failed === agents.length ? "failed" : "mixed";
-}
-
-function taskGlyph(agents: NavigatorAgentView[]): StatusGlyphName {
+function aggregateGlyph(agents: NavigatorAgentView[]): StatusGlyphName {
 	if (agents.some((agent) => agent.status === "running")) return "running";
 	const failed = agents.filter((agent) => agent.status === "failed").length;
 	if (failed === 0) return "done";
@@ -111,10 +100,11 @@ function roundSummary(agents: NavigatorAgentView[]): string {
 	return failed > 0 ? `${done}/${agents.length} done, ${failed} failed` : `${done}/${agents.length} done`;
 }
 
-function registryAgentView(node: DispatchAgentNode, taskId: string, roundIndex: number, slot: number, now: number): NavigatorAgentView {
+/** One agent's view model shared by the registry and detached branches: the field mapping is identical, only the ref and the duration fallback end differ. */
+function agentView(node: DispatchAgentNode, ref: NavigatorAgentRef, fallbackEnd: number): NavigatorAgentView {
 	return {
 		name: node.agent,
-		status: agentGlyph(node),
+		status: node.status,
 		step: node.step,
 		startedAt: node.startedAt,
 		finishedAt: node.finishedAt,
@@ -124,8 +114,8 @@ function registryAgentView(node: DispatchAgentNode, taskId: string, roundIndex: 
 		cwd: node.cwd,
 		usage: node.usage,
 		result: node.result,
-		durationText: formatDuration((node.finishedAt ?? now) - node.startedAt),
-		ref: { source: "registry", ownerId: taskId, roundIndex, slot },
+		durationText: formatDuration((node.finishedAt ?? fallbackEnd) - node.startedAt),
+		ref,
 	};
 }
 
@@ -144,12 +134,12 @@ export function buildNavigatorTasks(registry: DispatchRegistry, jobs: Iterable<N
 	const views: NavigatorTaskView[] = [];
 	for (const task of registry.tasks()) {
 		const rounds: NavigatorRoundView[] = task.rounds.map((round) => {
-			const agents = round.agents.map((node, slot) => registryAgentView(node, task.id, round.index, slot, now));
+			const agents = round.agents.map((node, slot) => agentView(node, { source: "registry", ownerId: task.id, roundIndex: round.index, slot }, now));
 			const starts = round.agents.map((agent) => agent.startedAt);
 			const ends = round.agents.map((agent) => agent.finishedAt ?? now);
 			return {
 				index: round.index,
-				glyph: roundGlyph(agents),
+				glyph: aggregateGlyph(agents),
 				summary: roundSummary(agents),
 				live: agents.some((agent) => agent.status === "running"),
 				durationText: formatDuration(Math.max(...ends) - Math.min(...starts)),
@@ -164,7 +154,7 @@ export function buildNavigatorTasks(registry: DispatchRegistry, jobs: Iterable<N
 			label: resolveTaskLabel(task.prompt) || "(detached)",
 			mode: task.mode,
 			live: allAgents.some((agent) => agent.status === "running"),
-			glyph: taskGlyph(allAgents),
+			glyph: aggregateGlyph(allAgents),
 			durationText: formatDuration((finishTimes.length > 0 ? Math.max(...finishTimes) : now) - task.startedAt),
 			rounds,
 			agents: [],
@@ -180,21 +170,7 @@ export function buildNavigatorTasks(registry: DispatchRegistry, jobs: Iterable<N
 					startedAt: job.startedAt,
 					finishedAt: job.finishedAt,
 				}));
-		const agents = nodes.map((node, slot) => ({
-			name: node.agent,
-			status: agentGlyph(node),
-			step: node.step,
-			startedAt: node.startedAt,
-			finishedAt: node.finishedAt,
-			activity: node.lastActivity,
-			activityLog: node.activity ?? [],
-			model: node.model,
-			cwd: node.cwd,
-			usage: node.usage,
-			result: node.result,
-			durationText: formatDuration((node.finishedAt ?? job.finishedAt ?? now) - node.startedAt),
-			ref: { source: "detached" as const, ownerId: job.id, slot },
-		}));
+		const agents = nodes.map((node, slot) => agentView(node, { source: "detached", ownerId: job.id, slot }, job.finishedAt ?? now));
 		views.push({
 			id: job.id,
 			source: "detached",
