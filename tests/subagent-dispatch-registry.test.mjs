@@ -13,6 +13,9 @@
  * updates ignored, failRunningAgents marking only running agents
  * (the abort-cleanup path), reset for session replacement, the
  * extractLastActivity helper over streaming message lists, the
+ * extractActivityLog and mergeAgentUpdate helpers the per-agent
+ * activity wiring shares, the formatUsageSummary usage formatter,
+ * per-slot agent nodes on the detached-job snapshot, the
  * replace-by-id detached-snapshot upsert (array identity preserved),
  * and the globalThis-converged shared dispatch state the viewer
  * extension reads (one state object across module instances,
@@ -21,9 +24,13 @@
 
 import assert from "node:assert/strict";
 import {
+	ACTIVITY_LOG_MAX,
 	createDispatchRegistry,
+	extractActivityLog,
 	extractLastActivity,
+	formatUsageSummary,
 	getSharedDispatchState,
+	mergeAgentUpdate,
 	upsertDetachedJobSnapshot,
 } from "../extensions/subagent/registry.ts";
 
@@ -153,6 +160,100 @@ const longText = "y".repeat(200);
 const activity = extractLastActivity([{ role: "assistant", content: [{ type: "text", text: longText }] }]);
 assert.ok(activity !== undefined && activity.length < 200, "long text activity is truncated");
 
+// --- extractActivityLog: ordered activity entries for the navigator detail pane ---
+
+assert.deepEqual(extractActivityLog([]), []);
+assert.deepEqual(
+	extractActivityLog([{ role: "assistant", content: [{ type: "thinking", text: "hmm" }] }]),
+	[],
+	"thinking-only messages carry no activity entries",
+);
+
+const logged = extractActivityLog([
+	{ role: "user", content: [{ type: "text", text: "prompt" }] },
+	{
+		role: "assistant",
+		timestamp: 1_000,
+		content: [
+			{ type: "thinking", text: "hmm" },
+			{ type: "text", text: "starting the sweep" },
+			{ type: "toolCall", name: "bash", arguments: { command: "rg alpha in files" } },
+		],
+	},
+	{ role: "assistant", timestamp: 2_000, content: [{ type: "text", text: "sweep done" }] },
+]);
+assert.equal(logged.length, 3, "one entry per activity-bearing content part, in stream order");
+assert.deepEqual(logged[0], { at: 1_000, kind: "text", text: "starting the sweep" });
+assert.equal(logged[1].kind, "toolCall");
+assert.equal(logged[1].at, 1_000);
+assert.equal(logged[1].name, "bash");
+assert.deepEqual(logged[1].args, { command: "rg alpha in files" });
+assert.equal(logged[1].text, "$ rg alpha in files", "toolCall entries carry the shared one-line description");
+assert.equal(logged[2].at, 2_000);
+assert.equal(logged[2].text, "sweep done");
+
+const untimed = extractActivityLog([{ role: "assistant", content: [{ type: "text", text: "no timestamp" }] }]);
+assert.equal(untimed[0].at, 0, "a message without a timestamp stamps its entry 0");
+
+const flooded = Array.from({ length: 60 }, (_, i) => ({
+	role: "assistant",
+	timestamp: i,
+	content: [{ type: "text", text: `line ${i}` }],
+}));
+const capped = extractActivityLog(flooded);
+assert.equal(capped.length, ACTIVITY_LOG_MAX, "the activity log is capped");
+assert.equal(capped[0].text, `line ${flooded.length - ACTIVITY_LOG_MAX}`, "the cap keeps the most recent entries");
+assert.equal(capped[capped.length - 1].text, `line ${flooded.length - 1}`);
+
+// --- mergeAgentUpdate: the defined-field merge both publishers share ---
+
+const mergedNode = { agent: "worker", status: "running", startedAt: NOW };
+mergeAgentUpdate(mergedNode, {
+	lastActivity: "$ rg pattern",
+	usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0.01, contextTokens: 100, turns: 2 },
+	model: "openai/gpt-5",
+	cwd: "/repo",
+});
+assert.equal(mergedNode.status, "running", "an update without a status keeps the node's status");
+assert.equal(mergedNode.lastActivity, "$ rg pattern");
+assert.equal(mergedNode.model, "openai/gpt-5");
+assert.equal(mergedNode.cwd, "/repo");
+mergeAgentUpdate(mergedNode, { status: "done", finishedAt: NOW + 5_000, lastActivity: undefined });
+assert.equal(mergedNode.status, "done");
+assert.equal(mergedNode.finishedAt, NOW + 5_000);
+assert.equal(mergedNode.lastActivity, "$ rg pattern", "undefined update fields never clobber node fields");
+
+// registry.updateAgent merges through the same helper: an activity-array
+// update lands on the registry node like every other defined field.
+const activityRegistry = createDispatchRegistry();
+const activityTask = activityRegistry.startTask({ mode: "single", prompt: "p", now: NOW });
+activityRegistry.startRound(activityTask.id, [{ agent: "scout" }], NOW);
+activityRegistry.updateAgent(activityTask.id, 1, 0, {
+	activity: [{ at: NOW, kind: "text", text: "hello" }],
+	model: "openai/gpt-5",
+	cwd: "/repo",
+});
+const activityNode = activityRegistry.getTask(activityTask.id)?.rounds[0]?.agents[0];
+assert.deepEqual(activityNode?.activity, [{ at: NOW, kind: "text", text: "hello" }]);
+assert.equal(activityNode?.model, "openai/gpt-5");
+assert.equal(activityNode?.cwd, "/repo");
+
+// --- formatUsageSummary: plain usage text shared with the detail pane ---
+
+assert.equal(
+	formatUsageSummary({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 }),
+	"",
+	"silent usage renders empty, not a row of zeros",
+);
+assert.equal(
+	formatUsageSummary({ input: 12_000, output: 800, cacheRead: 340_000, cacheWrite: 0, cost: 0.0123, contextTokens: 45_000, turns: 3 }),
+	"3 turns ↑12k ↓800 R340k $0.0123 ctx:45k",
+);
+assert.equal(
+	formatUsageSummary({ input: 500, output: 200, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 }),
+	"1 turn ↑500 ↓200",
+);
+
 // --- getSharedDispatchState: one globalThis-converged state ---
 
 const shared = getSharedDispatchState();
@@ -202,6 +303,34 @@ assert.equal(upsertJobs.length, 2, "replace-by-id does not grow the array");
 assert.equal(upsertJobs[0].status, "done", "the existing snapshot is replaced by id");
 assert.equal(upsertJobs[0].id, "job-1", "replacement keeps the snapshot's position");
 assert.equal(upsertJobs[1].id, "job-2", "later snapshots are untouched by the replace");
+
+// Per-slot agent nodes join the snapshot additively (EXT-1-3 wiring): the
+// strip keeps reading agentNames, the navigator reads agents.
+upsertDetachedJobSnapshot(upsertJobs, {
+	id: "job-4",
+	mode: "parallel",
+	status: "running",
+	agentNames: ["worker", "reviewer"],
+	taskPreview: "fan out the reconciliation",
+	startedAt: NOW,
+	agents: [
+		{
+			agent: "worker",
+			status: "running",
+			startedAt: NOW,
+			lastActivity: "$ rg pattern",
+			model: "openai/gpt-5",
+			cwd: "/repo",
+		},
+		{ agent: "reviewer", status: "running", startedAt: NOW },
+	],
+});
+assert.equal(upsertJobs[2].agents?.length, 2, "snapshots carry one node per dispatch slot");
+assert.equal(upsertJobs[2].agents?.[0].agent, "worker");
+assert.equal(upsertJobs[2].agents?.[0].lastActivity, "$ rg pattern");
+assert.equal(upsertJobs[2].agents?.[0].model, "openai/gpt-5");
+assert.equal(upsertJobs[2].agents?.[0].cwd, "/repo");
+assert.equal(upsertJobs[2].agents?.[1].agent, "reviewer");
 // An alias comparison of one local binding cannot fail, so the identity
 // property is pinned on the real contract surface instead: an upsert into
 // the array obtained via getSharedDispatchState() must mutate that array

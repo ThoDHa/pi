@@ -54,6 +54,12 @@ export interface DispatchAgentNode {
 	finishedAt?: number;
 	/** Plain-text description of the agent's most recent streamed activity. */
 	lastActivity?: string;
+	/** Recent streamed activity, oldest first, capped at ACTIVITY_LOG_MAX entries. */
+	activity?: DispatchActivityEntry[];
+	/** Model id the agent runs with, when known. */
+	model?: string;
+	/** Effective working directory of the agent process, when known. */
+	cwd?: string;
 	usage?: DispatchUsageSnapshot;
 	result?: DispatchResultSnapshot;
 }
@@ -76,10 +82,32 @@ export interface DispatchTaskNode {
 export interface DispatchAgentUpdate {
 	status?: DispatchAgentStatus;
 	lastActivity?: string;
+	activity?: DispatchActivityEntry[];
+	model?: string;
+	cwd?: string;
 	usage?: DispatchUsageSnapshot;
 	result?: DispatchResultSnapshot;
 	finishedAt?: number;
 }
+
+/**
+ * One streamed activity entry: a text snippet or a tool call, stamped
+ * with the source message's timestamp. `text` carries the shared
+ * one-line description (the same shapes the strip renders), `name`
+ * and `args` preserve the raw tool call for the navigator's detail
+ * pane. Entries are produced by extractActivityLog and rendered by
+ * both extensions read-only.
+ */
+export interface DispatchActivityEntry {
+	at: number;
+	kind: "text" | "toolCall";
+	text: string;
+	name?: string;
+	args?: Record<string, unknown>;
+}
+
+/** Upper bound on per-agent activity entries kept in the shared state. */
+export const ACTIVITY_LOG_MAX = 50;
 
 export interface DispatchRegistry {
 	startTask(input: { mode: DispatchMode; prompt: string; now?: number }): DispatchTaskNode;
@@ -145,11 +173,7 @@ export function createDispatchRegistry(): DispatchRegistry {
 		updateAgent(taskId, roundIndex, slot, update) {
 			const agent = findAgent(taskId, roundIndex, slot);
 			if (!agent) return;
-			if (update.status !== undefined) agent.status = update.status;
-			if (update.lastActivity !== undefined) agent.lastActivity = update.lastActivity;
-			if (update.usage !== undefined) agent.usage = update.usage;
-			if (update.result !== undefined) agent.result = update.result;
-			if (update.finishedAt !== undefined) agent.finishedAt = update.finishedAt;
+			mergeAgentUpdate(agent, update);
 		},
 
 		failRunningAgents(taskId, now) {
@@ -180,10 +204,32 @@ export function createDispatchRegistry(): DispatchRegistry {
 }
 
 /**
+ * Merge the defined fields of the update into an agent node in place;
+ * undefined update fields never clobber node fields. Both publishers
+ * share this merge: the blocking paths via
+ * DispatchRegistry.updateAgent, the detached wiring directly on its
+ * slot nodes.
+ */
+export function mergeAgentUpdate(node: DispatchAgentNode, update: DispatchAgentUpdate): void {
+	if (update.status !== undefined) node.status = update.status;
+	if (update.lastActivity !== undefined) node.lastActivity = update.lastActivity;
+	if (update.activity !== undefined) node.activity = update.activity;
+	if (update.model !== undefined) node.model = update.model;
+	if (update.cwd !== undefined) node.cwd = update.cwd;
+	if (update.usage !== undefined) node.usage = update.usage;
+	if (update.result !== undefined) node.result = update.result;
+	if (update.finishedAt !== undefined) node.finishedAt = update.finishedAt;
+}
+
+/**
  * Live state of one detached job, published replace-by-id into the
- * shared state at job creation and settle. Carries exactly what the
- * render surfaces read (the jobs Map itself stays private to the
- * subagent extension); per-agent activity joins in EXT-1-3.
+ * shared state at job creation, on every per-agent streaming update,
+ * and at settle. Carries exactly what the render surfaces read (the
+ * jobs Map itself stays private to the subagent extension); the
+ * per-slot `agents` nodes join additively for EXT-1-3, so snapshots
+ * published before that wiring (still alive on globalThis across a
+ * /reload) may omit them and render surfaces fall back to
+ * agentNames.
  */
 export interface DetachedJobSnapshot {
 	id: string;
@@ -193,6 +239,8 @@ export interface DetachedJobSnapshot {
 	taskPreview: string;
 	startedAt: number;
 	finishedAt?: number;
+	/** Per-dispatch-slot live nodes; slot order matches the job's steps. */
+	agents?: DispatchAgentNode[];
 }
 
 /** The one cross-extension channel: live dispatch state shared by the subagent and agent-viewer extensions. */
@@ -260,9 +308,46 @@ export function formatDuration(ms: number): string {
 	return `${Math.floor(minutes / 60)}h${minutes % 60}m`;
 }
 
+/** Token-count formatting shared by the usage surfaces: plain under 1k, one decimal under 10k, rounded kilo under 1M, one-decimal mega beyond. */
+export function formatTokenCount(count: number): string {
+	if (count < 1000) return count.toString();
+	if (count < 10_000) return `${(count / 1000).toFixed(1)}k`;
+	if (count < 1_000_000) return `${Math.round(count / 1000)}k`;
+	return `${(count / 1_000_000).toFixed(1)}M`;
+}
+
+/**
+ * Plain-text usage summary shared by the dispatch surfaces: the
+ * non-zero parts of a usage snapshot (turns, input, output, cache
+ * read/write, cost, context) rendered without theme styling so both
+ * extensions and the plain-node suites produce identical text. Empty
+ * string when nothing streamed yet.
+ */
+export function formatUsageSummary(usage: {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+	contextTokens?: number;
+	turns?: number;
+}): string {
+	const parts: string[] = [];
+	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
+	if (usage.input) parts.push(`↑${formatTokenCount(usage.input)}`);
+	if (usage.output) parts.push(`↓${formatTokenCount(usage.output)}`);
+	if (usage.cacheRead) parts.push(`R${formatTokenCount(usage.cacheRead)}`);
+	if (usage.cacheWrite) parts.push(`W${formatTokenCount(usage.cacheWrite)}`);
+	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
+	if (usage.contextTokens && usage.contextTokens > 0) parts.push(`ctx:${formatTokenCount(usage.contextTokens)}`);
+	return parts.join(" ");
+}
+
 /** Structural subset of a streamed message, so pi message types satisfy it without an import. */
 export interface ActivityMessage {
 	role: string;
+	/** Unix ms the message streamed, when the source carries one. */
+	timestamp?: number;
 	content: Array<{
 		type: string;
 		text?: string;
@@ -323,4 +408,36 @@ export function extractLastActivity(messages: ActivityMessage[]): string | undef
 		}
 	}
 	return undefined;
+}
+
+/**
+ * Full recent activity across a result's messages for the navigator's
+ * detail pane: one entry per activity-bearing content part of every
+ * assistant message, in stream order, each stamped with its message
+ * timestamp (0 when the source carries none) and, for tool calls, the
+ * raw name and arguments beside the shared one-line description.
+ * Thinking-only messages contribute nothing. Capped at the most
+ * recent ACTIVITY_LOG_MAX entries so a long run cannot grow the
+ * shared state without bound.
+ */
+export function extractActivityLog(messages: ActivityMessage[]): DispatchActivityEntry[] {
+	const entries: DispatchActivityEntry[] = [];
+	for (const message of messages) {
+		if (message.role !== "assistant") continue;
+		const at = message.timestamp ?? 0;
+		for (const part of message.content) {
+			if (part.type === "text" && part.text?.trim()) {
+				entries.push({ at, kind: "text", text: truncateActivity(part.text) });
+			} else if (part.type === "toolCall" && part.name) {
+				entries.push({
+					at,
+					kind: "toolCall",
+					text: describeToolCall(part.name, part.arguments ?? {}),
+					name: part.name,
+					args: part.arguments,
+				});
+			}
+		}
+	}
+	return entries.length > ACTIVITY_LOG_MAX ? entries.slice(entries.length - ACTIVITY_LOG_MAX) : entries;
 }
