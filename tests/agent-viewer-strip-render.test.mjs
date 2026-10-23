@@ -93,7 +93,8 @@ const finishedTask = {
 const laterLive = { ...liveTask, label: "later live" };
 const ordered = renderStripLines([finishedTask, laterLive], { hint: "hint" });
 assert.ok(lineContains(ordered[0], "later live"), "live task header comes first");
-assert.ok(lineContains(ordered.some((line) => line) && ordered.find((l) => lineContains(l, "earlier finished")), "earlier finished"), "finished task still renders after the live one");
+const finishedLine = ordered.find((line) => lineContains(line, "earlier finished"));
+assert.ok(finishedLine, "finished task still renders after the live one");
 
 // --- collapsed round entries ---
 
