@@ -17,6 +17,7 @@
 
 import { resolveTaskLabel } from "./labels.ts";
 import {
+	type DetachedJobSnapshot,
 	type DispatchAgentNode,
 	type DispatchRegistry,
 	type DispatchRoundNode,
@@ -63,18 +64,6 @@ export interface StripTaskView {
 	mode: string;
 	live: boolean;
 	entries: StripEntry[];
-}
-
-/** Structural subset of a detached job, so the jobs Map satisfies it without an import. */
-export interface StripJobLike {
-	mode: string;
-	status: string;
-	agentNames: readonly string[];
-	taskPreview: string;
-	startedAt: number;
-	finishedAt?: number;
-	/** Per-slot live nodes (the EXT-1-3 wiring); absent on snapshots published before that wiring landed. */
-	agents?: readonly DispatchAgentNode[];
 }
 
 /** Glyph-to-color conventions shared with the navigator overlay's panes (same extension, one map). */
@@ -194,7 +183,7 @@ function agentEntry(agent: DispatchAgentNode, now: number): StripAgentEntry {
  */
 export function buildStripTasks(
 	registry: DispatchRegistry,
-	jobs: Iterable<StripJobLike>,
+	jobs: Iterable<DetachedJobSnapshot>,
 	now: number,
 ): StripTaskView[] {
 	const views: StripTaskView[] = [];

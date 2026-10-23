@@ -184,6 +184,7 @@ registry.startRound(chain.id, [{ agent: "planner", step: 2 }], 62_000);
 registry.updateAgent(chain.id, 2, 0, { lastActivity: "read plan.md" });
 
 const detachedRunning = {
+	id: "job-1",
 	mode: "parallel",
 	status: "running",
 	agentNames: ["worker", "reviewer"],
@@ -195,6 +196,7 @@ const detachedRunning = {
 	],
 };
 const detachedFailed = {
+	id: "job-2",
 	mode: "single",
 	status: "failed",
 	agentNames: ["scout"],
@@ -240,6 +242,7 @@ assert.equal(detachedFailedView.entries[0].durationText, "30s", "finished detach
 // --- buildStripTasks: snapshots without node data fall back to agentNames ---
 
 const legacyJob = {
+	id: "job-3",
 	mode: "single",
 	status: "failed",
 	agentNames: ["scout"],
@@ -256,6 +259,7 @@ assert.equal(legacyView.entries[0].durationText, "30s");
 // --- buildStripTasks: empty and partial agents arrays (lazy detached node creation) ---
 
 const notStartedJob = {
+	id: "job-4",
 	mode: "chain",
 	status: "running",
 	agentNames: ["first", "second", "third"],
@@ -267,6 +271,7 @@ const notStartedStrip = buildStripTasks(createDispatchRegistry(), [notStartedJob
 assert.equal(notStartedStrip.entries.length, 0, "a job whose steps have not started shows only its header");
 
 const brokenChainJob = {
+	id: "job-5",
 	mode: "chain",
 	status: "failed",
 	agentNames: ["planner", "worker", "reviewer"],

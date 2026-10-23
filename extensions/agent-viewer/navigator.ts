@@ -15,6 +15,7 @@
 
 import { resolveTaskLabel } from "./labels.ts";
 import {
+	type DetachedJobSnapshot,
 	type DispatchActivityEntry,
 	type DispatchAgentNode,
 	type DispatchMode,
@@ -75,18 +76,6 @@ export interface NavigatorTaskView {
 	agents: NavigatorAgentView[];
 }
 
-/** Structural subset of a detached-job snapshot, so callers can pass snapshots or test fixtures directly. */
-export interface NavigatorJobLike {
-	id: string;
-	mode: DispatchMode;
-	status: DispatchAgentStatus;
-	agentNames: readonly string[];
-	taskPreview: string;
-	startedAt: number;
-	finishedAt?: number;
-	agents?: readonly DispatchAgentNode[];
-}
-
 function aggregateGlyph(agents: NavigatorAgentView[]): StatusGlyphName {
 	if (agents.some((agent) => agent.status === "running")) return "running";
 	const failed = agents.filter((agent) => agent.status === "failed").length;
@@ -130,7 +119,7 @@ function agentView(node: DispatchAgentNode, ref: NavigatorAgentRef, fallbackEnd:
  * present-but-empty `agents` array means nothing has started yet
  * (lazy node creation) and renders no agent children.
  */
-export function buildNavigatorTasks(registry: DispatchRegistry, jobs: Iterable<NavigatorJobLike>, now: number): NavigatorTaskView[] {
+export function buildNavigatorTasks(registry: DispatchRegistry, jobs: Iterable<DetachedJobSnapshot>, now: number): NavigatorTaskView[] {
 	const views: NavigatorTaskView[] = [];
 	for (const task of registry.tasks()) {
 		const rounds: NavigatorRoundView[] = task.rounds.map((round) => {
