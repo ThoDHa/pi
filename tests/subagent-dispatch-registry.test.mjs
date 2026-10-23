@@ -12,13 +12,20 @@
  * running -> done/failed with usage/result snapshots, unknown-id
  * updates ignored, failRunningAgents marking only running agents
  * (the abort-cleanup path), reset for session replacement, the
- * extractLastActivity helper over streaming message lists, and the
- * globalThis-converged shared dispatch state the viewer extension
- * reads (one state object across module instances, in-place clears).
+ * extractLastActivity helper over streaming message lists, the
+ * replace-by-id detached-snapshot upsert (array identity preserved),
+ * and the globalThis-converged shared dispatch state the viewer
+ * extension reads (one state object across module instances,
+ * in-place clears).
  */
 
 import assert from "node:assert/strict";
-import { createDispatchRegistry, extractLastActivity, getSharedDispatchState } from "../extensions/subagent/registry.ts";
+import {
+	createDispatchRegistry,
+	extractLastActivity,
+	getSharedDispatchState,
+	upsertDetachedJobSnapshot,
+} from "../extensions/subagent/registry.ts";
 
 const NOW = 1_000_000;
 
@@ -165,6 +172,38 @@ assert.equal(getSharedDispatchState().detachedJobs.length, 1, "publication is vi
 shared.detachedJobs.length = 0;
 assert.equal(getSharedDispatchState().detachedJobs.length, 0, "in-place clear empties the shared state");
 assert.equal(getSharedDispatchState().detachedJobs, shared.detachedJobs, "clear keeps the array identity");
+
+// --- upsertDetachedJobSnapshot: replace-by-id publication mechanic ---
+
+const upsertJobs = [
+	{ id: "job-1", mode: "single", status: "running", agentNames: ["scout"], taskPreview: "map the auth module", startedAt: NOW },
+];
+const upsertJobsRef = upsertJobs;
+upsertDetachedJobSnapshot(upsertJobs, {
+	id: "job-2",
+	mode: "parallel",
+	status: "running",
+	agentNames: ["worker", "reviewer"],
+	taskPreview: "fan out the reconciliation",
+	startedAt: NOW,
+});
+assert.equal(upsertJobs.length, 2, "an unseen id is appended");
+assert.equal(upsertJobs[1].id, "job-2");
+
+upsertDetachedJobSnapshot(upsertJobs, {
+	id: "job-1",
+	mode: "single",
+	status: "done",
+	agentNames: ["scout"],
+	taskPreview: "map the auth module",
+	startedAt: NOW,
+	finishedAt: NOW + 30_000,
+});
+assert.equal(upsertJobs.length, 2, "replace-by-id does not grow the array");
+assert.equal(upsertJobs[0].status, "done", "the existing snapshot is replaced by id");
+assert.equal(upsertJobs[0].id, "job-1", "replacement keeps the snapshot's position");
+assert.equal(upsertJobs[1].id, "job-2", "later snapshots are untouched by the replace");
+assert.equal(upsertJobs, upsertJobsRef, "the array identity is preserved (in-place mutation)");
 
 // pi evaluates the contract module once per extension entrypoint, so
 // convergence must hold across module instances, not just calls: a

@@ -214,6 +214,18 @@ export function getSharedDispatchState(): SharedDispatchState {
 	return globalThis.__piSubagentDispatchState;
 }
 
+/**
+ * Insert or replace a detached-job snapshot by id: an unseen id is
+ * appended, a known id replaces its snapshot in place, keeping the
+ * array's identity and the snapshot's position (references held
+ * across extensions and across session reloads stay valid).
+ */
+export function upsertDetachedJobSnapshot(detachedJobs: DetachedJobSnapshot[], snapshot: DetachedJobSnapshot): void {
+	const existing = detachedJobs.findIndex((candidate) => candidate.id === snapshot.id);
+	if (existing >= 0) detachedJobs[existing] = snapshot;
+	else detachedJobs.push(snapshot);
+}
+
 export type StatusGlyphName = "running" | "done" | "failed" | "mixed";
 
 /**

@@ -40,7 +40,7 @@ import {
 	formatDuration,
 	getSharedDispatchState,
 	statusGlyph,
-	type DetachedJobSnapshot,
+	upsertDetachedJobSnapshot,
 	type DispatchRegistry,
 } from "./registry.ts";
 
@@ -575,20 +575,20 @@ function createDetachedJob(id: string, mode: DetachedJob["mode"], steps: Dispatc
 
 /**
  * Publish the job's current state into the shared detached-job
- * snapshots, replace-by-id, so the viewer extension renders detached
- * jobs off live status without the jobs Map (whose collection and
- * wake semantics stay private to this extension) crossing the
- * extension boundary. Called at job creation and again at settle.
- * Aborted jobs are skipped: abortion only happens in session
- * teardown, whose session_start clears the shared array, and the
- * killed child settles seconds later — republishing then would
- * re-add a ghost of the dead session, the same race the completion
- * wake's registry-membership check guards.
+ * snapshots (replace-by-id via upsertDetachedJobSnapshot), so the
+ * viewer extension renders detached jobs off live status without the
+ * jobs Map (whose collection and wake semantics stay private to this
+ * extension) crossing the extension boundary. Called at job creation
+ * and again at settle. Aborted jobs are skipped: abortion only
+ * happens in session teardown, whose session_start clears the shared
+ * array, and the killed child settles seconds later — republishing
+ * then would re-add a ghost of the dead session, the same race the
+ * completion wake's registry-membership check guards.
  */
 function publishDetachedJobSnapshot(job: DetachedJob): void {
 	if (job.abort.signal.aborted) return;
 	const { detachedJobs } = getSharedDispatchState();
-	const snapshot: DetachedJobSnapshot = {
+	upsertDetachedJobSnapshot(detachedJobs, {
 		id: job.id,
 		mode: job.mode,
 		status: job.status,
@@ -596,10 +596,7 @@ function publishDetachedJobSnapshot(job: DetachedJob): void {
 		taskPreview: job.taskPreview,
 		startedAt: job.startedAt,
 		finishedAt: job.finishedAt,
-	};
-	const existing = detachedJobs.findIndex((candidate) => candidate.id === job.id);
-	if (existing >= 0) detachedJobs[existing] = snapshot;
-	else detachedJobs.push(snapshot);
+	});
 }
 
 async function runDetachedJob(
