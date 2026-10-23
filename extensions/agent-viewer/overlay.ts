@@ -142,13 +142,13 @@ export class NavigatorOverlay implements Focusable {
 		}
 	}
 
-	/** left collapses, right expands. Tasks hide their subtree; rounds override the auto state (live expanded, completed collapsed); agent rows are leaves. */
+	/** left collapses, right expands. Tasks hide their subtree (collapsedTasks holds raw task ids, matching the flatten contract); rounds override the auto state (live expanded, completed collapsed); agent rows are leaves. */
 	private toggleRow(expand: boolean): void {
 		const row = this.rows[this.selectedIndex];
 		if (!row) return;
 		if (row.kind === "task") {
-			if (expand) this.expansion.collapsedTasks.delete(row.id);
-			else this.expansion.collapsedTasks.add(row.id);
+			if (expand) this.expansion.collapsedTasks.delete(row.taskId);
+			else this.expansion.collapsedTasks.add(row.taskId);
 		} else if (row.kind === "round") {
 			this.expansion.roundOverrides.set(row.id, expand);
 		}
