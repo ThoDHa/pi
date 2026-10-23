@@ -174,8 +174,10 @@ function agentEntry(agent: DispatchAgentNode, now: number): StripAgentEntry {
  * header never renders bare; a finished round of a
  * live task collapses to one round entry; within a task, live rounds'
  * agent entries lead so the budget's tail cut spares live content. A
- * detached job becomes one task view labeled with its taskPreview.
- * Its per-slot agent nodes (the EXT-1-3 wiring) stream per-agent
+ * detached job becomes one task view labeled through the same
+ * resolveTaskLabel heuristic as blocking tasks, falling back to
+ * "(detached)" when the resolution comes up empty. Its per-slot
+ * agent nodes (the EXT-1-3 wiring) stream per-agent
  * glyph, activity, and duration onto the strip when the snapshot
  * carries them (an empty array means nothing has started yet and
  * renders no entries); snapshots without the array fall back to one
@@ -207,7 +209,7 @@ export function buildStripTasks(
 			? job.agents.map((node) => agentEntry(node, fallbackEnd))
 			: job.agentNames.map((name) => ({ kind: "agent", name, glyph, durationText: formatDuration(fallbackEnd - job.startedAt) }));
 		views.push({
-			label: job.taskPreview || "(detached)",
+			label: resolveTaskLabel(job.taskPreview) || "(detached)",
 			mode: job.mode,
 			live: job.status === "running",
 			entries,

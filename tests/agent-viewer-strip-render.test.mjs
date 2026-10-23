@@ -13,10 +13,12 @@
  * with the blocking path, and render-time task-label derivation from
  * the prompt. Also covers buildStripTasks assembling
  * views from a live registry plus detached jobs: live rounds first,
- * collapsed finished rounds, detached jobs reusing taskPreview and
- * keying glyphs off job.status, and detached per-agent nodes (the
- * EXT-1-3 wiring) streaming per-agent activity and status onto the
- * strip with the agentNames fallback for snapshots predating it.
+ * collapsed finished rounds, detached labels resolving through the
+ * same heuristic as blocking tasks (fleet reference wins, first-words
+ * fallback, "(detached)" on an empty preview) and keying glyphs off
+ * job.status, and detached per-agent nodes (the EXT-1-3 wiring)
+ * streaming per-agent activity and status onto the strip with the
+ * agentNames fallback for snapshots predating it.
  */
 
 import assert from "node:assert/strict";
@@ -188,7 +190,7 @@ const detachedRunning = {
 	mode: "parallel",
 	status: "running",
 	agentNames: ["worker", "reviewer"],
-	taskPreview: "fan out the reconciliation",
+	taskPreview: "Task: EXT-5-1 fan out the reconciliation",
 	startedAt: 90_000,
 	agents: [
 		{ agent: "worker", status: "running", startedAt: 90_000, lastActivity: "$ rg pattern" },
@@ -205,8 +207,18 @@ const detachedFailed = {
 	finishedAt: 60_000,
 };
 
-const views = buildStripTasks(registry, [detachedRunning, detachedFailed], 122_000);
-assert.equal(views.length, 3);
+const detachedBlank = {
+	id: "job-6",
+	mode: "single",
+	status: "done",
+	agentNames: ["scout"],
+	taskPreview: "",
+	startedAt: 30_000,
+	finishedAt: 60_000,
+};
+
+const views = buildStripTasks(registry, [detachedRunning, detachedFailed, detachedBlank], 122_000);
+assert.equal(views.length, 4);
 
 const chainView = views[0];
 assert.equal(chainView.label, "EXT-7-1", "label derives from the prompt's fleet reference at render time");
@@ -224,7 +236,7 @@ assert.equal(chainView.entries[1].summary, "1/1 done");
 assert.equal(chainView.entries[1].durationText, "1m", "collapsed round duration = finish - start");
 
 const detachedRunningView = views[1];
-assert.equal(detachedRunningView.label, "fan out the reconciliation", "detached label reuses taskPreview");
+assert.equal(detachedRunningView.label, "EXT-5-1", "detached labels honor the fleet-reference heuristic like blocking tasks");
 assert.equal(detachedRunningView.live, true);
 assert.equal(detachedRunningView.entries.length, 2);
 assert.equal(detachedRunningView.entries[0].name, "worker");
@@ -235,9 +247,13 @@ assert.equal(detachedRunningView.entries[1].glyph, "done", "per-agent glyphs com
 assert.equal(detachedRunningView.entries[1].durationText, "10s", "finished node duration = finishedAt - startedAt");
 
 const detachedFailedView = views[2];
+assert.equal(detachedFailedView.label, "scout the repo", "detached labels fall back to first words like blocking tasks");
 assert.equal(detachedFailedView.live, false);
 assert.equal(detachedFailedView.entries[0].glyph, "failed", "detached glyph keys off job.status");
 assert.equal(detachedFailedView.entries[0].durationText, "30s", "finished detached duration = finishedAt - startedAt");
+
+const detachedBlankView = views[3];
+assert.equal(detachedBlankView.label, "(detached)", "an empty taskPreview falls back to (detached) instead of a bare header");
 
 // --- buildStripTasks: snapshots without node data fall back to agentNames ---
 
