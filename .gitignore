@@ -9,7 +9,7 @@
 !/extensions/
 !/tests/
 /tests/*
-!/tests/permission-gate.test.mjs
+!/tests/*.test.mjs
 /extensions/*
 !/extensions/permission-gate.ts
 !/extensions/protected-paths.ts
