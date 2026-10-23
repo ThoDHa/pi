@@ -11,12 +11,14 @@
  * single/parallel, one per chain step), agent status transitions
  * running -> done/failed with usage/result snapshots, unknown-id
  * updates ignored, failRunningAgents marking only running agents
- * (the abort-cleanup path), reset for session replacement, and the
- * extractLastActivity helper over streaming message lists.
+ * (the abort-cleanup path), reset for session replacement, the
+ * extractLastActivity helper over streaming message lists, and the
+ * globalThis-converged shared dispatch state the viewer extension
+ * reads (one state object across module instances, in-place clears).
  */
 
 import assert from "node:assert/strict";
-import { createDispatchRegistry, extractLastActivity } from "../extensions/subagent/registry.ts";
+import { createDispatchRegistry, extractLastActivity, getSharedDispatchState } from "../extensions/subagent/registry.ts";
 
 const NOW = 1_000_000;
 
@@ -143,5 +145,32 @@ assert.equal(extractLastActivity(onlyThinking), undefined);
 const longText = "y".repeat(200);
 const activity = extractLastActivity([{ role: "assistant", content: [{ type: "text", text: longText }] }]);
 assert.ok(activity !== undefined && activity.length < 200, "long text activity is truncated");
+
+// --- getSharedDispatchState: one globalThis-converged state ---
+
+const shared = getSharedDispatchState();
+assert.equal(getSharedDispatchState(), shared, "repeated calls return the same state object");
+assert.ok(shared.registry, "state carries the dispatch registry");
+assert.deepEqual(shared.detachedJobs, [], "state starts with no detached-job snapshots");
+
+shared.detachedJobs.push({
+	id: "job-1",
+	mode: "single",
+	status: "running",
+	agentNames: ["scout"],
+	taskPreview: "map the auth module",
+	startedAt: NOW,
+});
+assert.equal(getSharedDispatchState().detachedJobs.length, 1, "publication is visible through every reference");
+shared.detachedJobs.length = 0;
+assert.equal(getSharedDispatchState().detachedJobs.length, 0, "in-place clear empties the shared state");
+assert.equal(getSharedDispatchState().detachedJobs, shared.detachedJobs, "clear keeps the array identity");
+
+// pi evaluates the contract module once per extension entrypoint, so
+// convergence must hold across module instances, not just calls: a
+// second evaluation (distinct module URL via query string) must
+// observe the same globalThis state object.
+const secondInstance = await import("../extensions/subagent/registry.ts?second-instance");
+assert.equal(secondInstance.getSharedDispatchState(), shared, "a fresh module evaluation converges on the same globalThis state");
 
 console.log("subagent-dispatch-registry: all assertions passed");

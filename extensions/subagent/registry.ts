@@ -1,16 +1,29 @@
 /**
- * Active-dispatch registry
+ * Active-dispatch registry and shared dispatch state
  *
  * Extension-scope live state for the blocking dispatch paths of the
- * subagent tool, shaped task -> dispatch round -> agent node. The
- * ambient strip consumes it now and the navigator (checkpoint 2)
- * consumes the same landed shape; evolution after landing is additive
- * only. Detached jobs are not published here: they stay readable
- * through their jobs registry's live job.status.
+ * subagent tool, shaped task -> dispatch round -> agent node, plus
+ * replace-by-id snapshots of detached jobs published alongside it.
+ * This module is the shared contract between the subagent extension
+ * (which publishes both) and the agent-viewer extension (which renders
+ * them): pi evaluates each entrypoint's modules in a fresh instance,
+ * so module-level state would exist twice — the one state object both
+ * sides read converges on globalThis via getSharedDispatchState(),
+ * which is process-lifetime and survives session reload. Reset and
+ * clearing happen in place (registry.reset(), array.length = 0) so
+ * references held across extensions stay valid.
  *
  * Dependency-free by design (no pi imports) so plain-node suites can
  * exercise the lifecycle directly.
  */
+
+declare global {
+	// Language-level escape required by the cross-extension contract: pi
+	// gives every extension entrypoint a fresh module instance (jiti,
+	// moduleCache: false), so the shared dispatch state must live on
+	// globalThis, which no module system scopes.
+	var __piSubagentDispatchState: SharedDispatchState | undefined;
+}
 
 export type DispatchMode = "single" | "parallel" | "chain";
 
@@ -166,6 +179,41 @@ export function createDispatchRegistry(): DispatchRegistry {
 			nextTaskId = 1;
 		},
 	};
+}
+
+/**
+ * Live state of one detached job, published replace-by-id into the
+ * shared state at job creation and settle. Carries exactly what the
+ * render surfaces read (the jobs Map itself stays private to the
+ * subagent extension); per-agent activity joins in EXT-1-3.
+ */
+export interface DetachedJobSnapshot {
+	id: string;
+	mode: DispatchMode;
+	status: DispatchAgentStatus;
+	agentNames: string[];
+	taskPreview: string;
+	startedAt: number;
+	finishedAt?: number;
+}
+
+/** The one cross-extension channel: live dispatch state shared by the subagent and agent-viewer extensions. */
+export interface SharedDispatchState {
+	registry: DispatchRegistry;
+	detachedJobs: DetachedJobSnapshot[];
+}
+
+/**
+ * The shared dispatch state, converged on globalThis. Safe to call
+ * from every module instance: the first evaluation creates the object
+ * (`??=`) and every later one returns it, so both extensions hold one
+ * registry and one snapshot list. Reset happens in place on
+ * session_start (registry.reset(), array.length = 0), never by
+ * replacement, so references held across extensions stay valid.
+ */
+export function getSharedDispatchState(): SharedDispatchState {
+	globalThis.__piSubagentDispatchState ??= { registry: createDispatchRegistry(), detachedJobs: [] };
+	return globalThis.__piSubagentDispatchState;
 }
 
 /** Structural subset of a streamed message, so pi message types satisfy it without an import. */
