@@ -14,7 +14,9 @@
  * the prompt. Also covers buildStripTasks assembling
  * views from a live registry plus detached jobs: live rounds first,
  * collapsed finished rounds, detached jobs reusing taskPreview and
- * keying glyphs off job.status.
+ * keying glyphs off job.status, and detached per-agent nodes (the
+ * EXT-1-3 wiring) streaming per-agent activity and status onto the
+ * strip with the agentNames fallback for snapshots predating it.
  */
 
 import assert from "node:assert/strict";
@@ -187,6 +189,10 @@ const detachedRunning = {
 	agentNames: ["worker", "reviewer"],
 	taskPreview: "fan out the reconciliation",
 	startedAt: 90_000,
+	agents: [
+		{ agent: "worker", status: "running", startedAt: 90_000, lastActivity: "$ rg pattern" },
+		{ agent: "reviewer", status: "done", startedAt: 90_000, finishedAt: 100_000 },
+	],
 };
 const detachedFailed = {
 	mode: "single",
@@ -221,12 +227,31 @@ assert.equal(detachedRunningView.live, true);
 assert.equal(detachedRunningView.entries.length, 2);
 assert.equal(detachedRunningView.entries[0].name, "worker");
 assert.equal(detachedRunningView.entries[0].glyph, "running");
-assert.equal(detachedRunningView.entries[0].durationText, "32s", "detached duration = now - startedAt");
+assert.equal(detachedRunningView.entries[0].activity, "$ rg pattern", "per-agent activity streams onto the strip via the snapshot nodes");
+assert.equal(detachedRunningView.entries[0].durationText, "32s", "node duration = now - node startedAt");
+assert.equal(detachedRunningView.entries[1].glyph, "done", "per-agent glyphs come from the node status, not the job status");
+assert.equal(detachedRunningView.entries[1].durationText, "10s", "finished node duration = finishedAt - startedAt");
 
 const detachedFailedView = views[2];
 assert.equal(detachedFailedView.live, false);
 assert.equal(detachedFailedView.entries[0].glyph, "failed", "detached glyph keys off job.status");
 assert.equal(detachedFailedView.entries[0].durationText, "30s", "finished detached duration = finishedAt - startedAt");
+
+// --- buildStripTasks: snapshots without node data fall back to agentNames ---
+
+const legacyJob = {
+	mode: "single",
+	status: "failed",
+	agentNames: ["scout"],
+	taskPreview: "legacy snapshot",
+	startedAt: 30_000,
+	finishedAt: 60_000,
+};
+const legacyView = buildStripTasks(createDispatchRegistry(), [legacyJob], 122_000)[0];
+assert.equal(legacyView.entries.length, 1);
+assert.equal(legacyView.entries[0].glyph, "failed", "the job-status glyph covers snapshots predating the per-agent nodes");
+assert.equal(legacyView.entries[0].activity, undefined);
+assert.equal(legacyView.entries[0].durationText, "30s");
 
 // --- buildStripTasks: labels resolve from the prompt at render time ---
 

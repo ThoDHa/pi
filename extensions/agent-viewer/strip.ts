@@ -73,9 +73,12 @@ export interface StripJobLike {
 	taskPreview: string;
 	startedAt: number;
 	finishedAt?: number;
+	/** Per-slot live nodes (the EXT-1-3 wiring); absent on snapshots published before that wiring landed. */
+	agents?: readonly DispatchAgentNode[];
 }
 
-const GLYPH_COLORS: Record<StatusGlyphName, StripColor> = {
+/** Glyph-to-color conventions shared with the navigator overlay's panes (same extension, one map). */
+export const GLYPH_COLORS: Record<StatusGlyphName, StripColor> = {
 	running: "warning",
 	done: "success",
 	failed: "error",
@@ -174,6 +177,16 @@ function agentEntry(agent: DispatchAgentNode, now: number): StripAgentEntry {
 	};
 }
 
+function jobAgentEntry(node: DispatchAgentNode, fallbackEnd: number): StripAgentEntry {
+	return {
+		kind: "agent",
+		name: node.agent,
+		glyph: node.status,
+		activity: node.lastActivity,
+		durationText: formatDuration((node.finishedAt ?? fallbackEnd) - node.startedAt),
+	};
+}
+
 /**
  * Assemble the strip's task views from the blocking-path dispatch
  * registry plus the detached jobs registry. Task labels resolve from
@@ -182,8 +195,11 @@ function agentEntry(agent: DispatchAgentNode, now: number): StripAgentEntry {
  * header never renders bare; a finished round of a
  * live task collapses to one round entry; within a task, live rounds'
  * agent entries lead so the budget's tail cut spares live content. A
- * detached job becomes one task view labeled with its taskPreview,
- * one agent entry per agent name, glyphs keyed off job.status.
+ * detached job becomes one task view labeled with its taskPreview.
+ * Its per-slot agent nodes (the EXT-1-3 wiring) stream per-agent
+ * glyph, activity, and duration onto the strip when present;
+ * snapshots without them fall back to one entry per agent name keyed
+ * off job.status.
  */
 export function buildStripTasks(
 	registry: DispatchRegistry,
@@ -206,12 +222,15 @@ export function buildStripTasks(
 	for (const job of jobs) {
 		const glyph: "running" | "done" | "failed" =
 			job.status === "done" ? "done" : job.status === "failed" ? "failed" : "running";
-		const durationText = formatDuration((job.finishedAt ?? now) - job.startedAt);
+		const fallbackEnd = job.finishedAt ?? now;
+		const entries: StripAgentEntry[] = job.agents?.length
+			? job.agents.map((node) => jobAgentEntry(node, fallbackEnd))
+			: job.agentNames.map((name) => ({ kind: "agent", name, glyph, durationText: formatDuration(fallbackEnd - job.startedAt) }));
 		views.push({
 			label: job.taskPreview || "(detached)",
 			mode: job.mode,
 			live: job.status === "running",
-			entries: job.agentNames.map((name) => ({ kind: "agent", name, glyph, durationText })),
+			entries,
 		});
 	}
 	return views;
