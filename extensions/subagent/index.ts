@@ -611,8 +611,10 @@ function detachedAgentNodes(job: DetachedJob, slotNodes: ReadonlyMap<number, Dis
  * jobs Map (whose collection and wake semantics stay private to this
  * extension) crossing the extension boundary. Called at job creation
  * (no step has started: an empty node map publishes an empty agents
- * array), on every per-agent streaming update, and again at settle.
- * Aborted jobs are
+ * array), at each step start (so the running node is visible to the
+ * strip and the navigator before the first streamed event, closing
+ * the agents:0 window), on every per-agent streaming update, and
+ * again at settle. Aborted jobs are
  * skipped: abortion only happens in session teardown, whose
  * session_start clears the shared array, and the killed child settles
  * seconds later — republishing then would re-add a ghost of the dead
@@ -662,6 +664,7 @@ async function runDetachedJob(
 			cwd: steps[slot].cwd ?? defaultCwd,
 		};
 		slotNodes.set(slot, node);
+		publishDetachedJobSnapshot(job, slotNodes);
 		return node;
 	};
 	const publishSlotUpdate = (slot: number, result: SingleResult) => {
