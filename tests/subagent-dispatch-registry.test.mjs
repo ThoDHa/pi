@@ -12,9 +12,12 @@
  * running -> done/failed with usage/result snapshots, unknown-id
  * updates ignored, failRunningAgents marking only running agents
  * (the abort-cleanup path), reset for session replacement, the
- * extractLastActivity helper over streaming message lists, the
- * extractActivityLog and mergeAgentUpdate helpers the per-agent
- * activity wiring shares, the formatUsageSummary usage formatter,
+ * extractLastActivity helper over streaming message lists (thinking
+ * parts never become the last activity), the extractActivityLog and
+ * mergeAgentUpdate helpers the per-agent activity wiring shares
+ * (thinking entries interleaved in stream order, empty and redacted
+ * thinking skipped, the shared ACTIVITY_LOG_MAX cap), the
+ * formatUsageSummary usage formatter,
  * per-slot agent nodes on the detached-job snapshot, the
  * replace-by-id detached-snapshot upsert (array identity preserved),
  * and the globalThis-converged shared dispatch state the viewer
@@ -149,12 +152,21 @@ const textLast = [{ role: "assistant", content: [{ type: "text", text: "first li
 assert.equal(extractLastActivity(textLast), "first line second line", "multi-line activity collapses to one strip line");
 
 const thinkingThenTool = [
-	{ role: "assistant", content: [{ type: "thinking", text: "hmm" }, { type: "toolCall", name: "read", arguments: { file_path: "/tmp/x.ts" } }] },
+	{ role: "assistant", content: [{ type: "thinking", thinking: "hmm" }, { type: "toolCall", name: "read", arguments: { file_path: "/tmp/x.ts" } }] },
 ];
 assert.equal(extractLastActivity(thinkingThenTool), "read /tmp/x.ts");
 
-const onlyThinking = [{ role: "assistant", content: [{ type: "thinking", text: "hmm" }] }];
+const onlyThinking = [{ role: "assistant", content: [{ type: "thinking", thinking: "hmm" }] }];
 assert.equal(extractLastActivity(onlyThinking), undefined);
+
+const thinkingAfterText = [
+	{ role: "assistant", content: [{ type: "text", text: "final answer" }, { type: "thinking", thinking: "hmm" }] },
+];
+assert.equal(
+	extractLastActivity(thinkingAfterText),
+	"final answer",
+	"a trailing thinking part does not become the last activity",
+);
 
 const longText = "y".repeat(200);
 const activity = extractLastActivity([{ role: "assistant", content: [{ type: "text", text: longText }] }]);
@@ -164,9 +176,20 @@ assert.ok(activity !== undefined && activity.length < 200, "long text activity i
 
 assert.deepEqual(extractActivityLog([]), []);
 assert.deepEqual(
-	extractActivityLog([{ role: "assistant", content: [{ type: "thinking", text: "hmm" }] }]),
-	[],
-	"thinking-only messages carry no activity entries",
+	extractActivityLog([
+		{
+			role: "assistant",
+			timestamp: 500,
+			content: [
+				{ type: "thinking", thinking: "" },
+				{ type: "thinking", thinkingSignature: "redacted" },
+				{ type: "thinking" },
+				{ type: "text", text: "visible" },
+			],
+		},
+	]),
+	[{ at: 500, kind: "text", text: "visible" }],
+	"empty and redacted thinking blocks carry no entries",
 );
 
 const logged = extractActivityLog([
@@ -175,22 +198,23 @@ const logged = extractActivityLog([
 		role: "assistant",
 		timestamp: 1_000,
 		content: [
-			{ type: "thinking", text: "hmm" },
+			{ type: "thinking", thinking: "hmm" },
 			{ type: "text", text: "starting the sweep" },
 			{ type: "toolCall", name: "bash", arguments: { command: "rg alpha in files" } },
 		],
 	},
 	{ role: "assistant", timestamp: 2_000, content: [{ type: "text", text: "sweep done" }] },
 ]);
-assert.equal(logged.length, 3, "one entry per activity-bearing content part, in stream order");
-assert.deepEqual(logged[0], { at: 1_000, kind: "text", text: "starting the sweep" });
-assert.equal(logged[1].kind, "toolCall");
-assert.equal(logged[1].at, 1_000);
-assert.equal(logged[1].name, "bash");
-assert.deepEqual(logged[1].args, { command: "rg alpha in files" });
-assert.equal(logged[1].text, "$ rg alpha in files", "toolCall entries carry the shared one-line description");
-assert.equal(logged[2].at, 2_000);
-assert.equal(logged[2].text, "sweep done");
+assert.equal(logged.length, 4, "one entry per activity-bearing content part, in stream order");
+assert.deepEqual(logged[0], { at: 1_000, kind: "thinking", text: "hmm" }, "a thinking part emits exactly the contract's entry shape");
+assert.deepEqual(logged[1], { at: 1_000, kind: "text", text: "starting the sweep" });
+assert.equal(logged[2].kind, "toolCall");
+assert.equal(logged[2].at, 1_000);
+assert.equal(logged[2].name, "bash");
+assert.deepEqual(logged[2].args, { command: "rg alpha in files" });
+assert.equal(logged[2].text, "$ rg alpha in files", "toolCall entries carry the shared one-line description");
+assert.equal(logged[3].at, 2_000);
+assert.equal(logged[3].text, "sweep done");
 
 const untimed = extractActivityLog([{ role: "assistant", content: [{ type: "text", text: "no timestamp" }] }]);
 assert.equal(untimed[0].at, 0, "a message without a timestamp stamps its entry 0");
@@ -205,9 +229,24 @@ assert.equal(capped.length, ACTIVITY_LOG_MAX, "the activity log is capped");
 assert.equal(capped[0].text, `line ${flooded.length - ACTIVITY_LOG_MAX}`, "the cap keeps the most recent entries");
 assert.equal(capped[capped.length - 1].text, `line ${flooded.length - 1}`);
 
+const thinkingFlood = Array.from({ length: 30 }, (_, i) => ({
+	role: "assistant",
+	timestamp: i,
+	content: [{ type: "thinking", thinking: `thought ${i}` }, { type: "text", text: `line ${i}` }],
+}));
+const thinkingCapped = extractActivityLog(thinkingFlood);
+assert.equal(thinkingCapped.length, ACTIVITY_LOG_MAX, "thinking entries count against the activity cap");
+assert.deepEqual(
+	thinkingCapped[0],
+	{ at: 5, kind: "thinking", text: "thought 5" },
+	"the cap walk includes thinking when deciding what survives",
+);
+assert.deepEqual(thinkingCapped[1], { at: 5, kind: "text", text: "line 5" });
+assert.equal(thinkingCapped[ACTIVITY_LOG_MAX - 1].kind, "text");
+
 // --- extractActivityLog: tail-scan output identity with the forward-walk reference ---
 
-// The pre-tail-scan algorithm, verbatim in semantics: full forward
+// The forward-walk reference of the module's current semantics: full
 // walk building every entry, then a tail slice. The module's
 // extractActivityLog must reproduce its output byte-for-byte on every
 // fixture, including where the cap splits a message's parts.
@@ -237,6 +276,8 @@ function forwardActivityLog(messages) {
 				entries.push({ at, kind: "text", text: truncate(part.text) });
 			} else if (part.type === "toolCall" && part.name) {
 				entries.push({ at, kind: "toolCall", text: describe(part.name, part.arguments ?? {}), name: part.name, args: part.arguments });
+			} else if (part.type === "thinking" && part.thinking?.trim()) {
+				entries.push({ at, kind: "thinking", text: truncate(part.thinking) });
 			}
 		}
 	}
@@ -247,7 +288,7 @@ const dense = Array.from({ length: 40 }, (_, i) => ({
 	role: "assistant",
 	timestamp: i,
 	content: [
-		{ type: "thinking", text: `skip ${i}` },
+		{ type: "thinking", thinking: `thought ${i}` },
 		{ type: "text", text: `alpha step ${i}` },
 		{ type: "text", text: `beta step ${i}` },
 		{ type: "text", text: `gamma step ${i}` },
@@ -270,9 +311,9 @@ assert.deepEqual(extractActivityLog(exactCap), forwardActivityLog(exactCap), "id
 
 const sparseMixed = [
 	{ role: "user", content: [{ type: "text", text: "prompt" }] },
-	{ role: "assistant", content: [{ type: "thinking", text: "hmm" }] },
+	{ role: "assistant", content: [{ type: "thinking", thinking: "a  multi-line\nthought" }] },
 	{ role: "assistant", timestamp: 5, content: [{ type: "text", text: "a  spaced\nout" }] },
-	{ role: "assistant", content: [{ type: "text", text: "b" }, { type: "toolCall", name: "edit", arguments: { file_path: "/tmp/x.ts" } }] },
+	{ role: "assistant", content: [{ type: "text", text: "b" }, { type: "thinking", thinking: "weigh the edit" }, { type: "toolCall", name: "edit", arguments: { file_path: "/tmp/x.ts" } }] },
 	{ role: "assistant", timestamp: 6, content: [{ type: "text", text: "tail" }] },
 ];
 assert.deepEqual(extractActivityLog(sparseMixed), forwardActivityLog(sparseMixed), "identity under the cap with untimed and thinking-only messages");

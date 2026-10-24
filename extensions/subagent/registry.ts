@@ -91,16 +91,16 @@ export interface DispatchAgentUpdate {
 }
 
 /**
- * One streamed activity entry: a text snippet or a tool call, stamped
- * with the source message's timestamp. `text` carries the shared
- * one-line description (the same shapes the strip renders), `name`
- * and `args` preserve the raw tool call for the navigator's detail
- * pane. Entries are produced by extractActivityLog and rendered by
- * both extensions read-only.
+ * One streamed activity entry: a text snippet, a tool call, or a
+ * thinking snippet, stamped with the source message's timestamp.
+ * `text` carries the shared one-line description (the same shapes the
+ * strip renders), `name` and `args` preserve the raw tool call for
+ * the navigator's detail pane. Entries are produced by
+ * extractActivityLog and rendered by both extensions read-only.
  */
 export interface DispatchActivityEntry {
 	at: number;
-	kind: "text" | "toolCall";
+	kind: "text" | "toolCall" | "thinking";
 	text: string;
 	name?: string;
 	args?: Record<string, unknown>;
@@ -353,6 +353,8 @@ export interface ActivityMessage {
 	content: Array<{
 		type: string;
 		text?: string;
+		/** Thinking text; redacted blocks carry only a signature. */
+		thinking?: string;
 		name?: string;
 		arguments?: Record<string, unknown>;
 		file_path?: unknown;
@@ -418,13 +420,14 @@ export function extractLastActivity(messages: ActivityMessage[]): string | undef
  * assistant message, in stream order, each stamped with its message
  * timestamp (0 when the source carries none) and, for tool calls, the
  * raw name and arguments beside the shared one-line description.
- * Thinking-only messages contribute nothing. Capped at the most
- * recent ACTIVITY_LOG_MAX entries so a long run cannot grow the
- * shared state without bound: the cap is collected by walking the
- * stream in reverse and stopping once the cap is full, so the scan
- * cost tracks the cap rather than the run length; the output is
- * byte-identical to the full forward walk it replaced (pinned by the
- * identity suite).
+ * Thinking parts emit thinking entries collapsed like text; redacted
+ * thinking blocks carry only a signature and contribute nothing.
+ * Capped at the most recent ACTIVITY_LOG_MAX entries so a long run
+ * cannot grow the shared state without bound: the cap is collected
+ * by walking the stream in reverse and stopping once the cap is
+ * full, so the scan cost tracks the cap rather than the run length;
+ * the output is byte-identical to the full forward walk it replaced
+ * (pinned by the identity suite).
  */
 export function extractActivityLog(messages: ActivityMessage[]): DispatchActivityEntry[] {
 	const collected: DispatchActivityEntry[] = [];
@@ -444,6 +447,8 @@ export function extractActivityLog(messages: ActivityMessage[]): DispatchActivit
 					name: part.name,
 					args: part.arguments,
 				});
+			} else if (part.type === "thinking" && part.thinking?.trim()) {
+				collected.push({ at, kind: "thinking", text: truncateActivity(part.thinking) });
 			}
 		}
 	}
