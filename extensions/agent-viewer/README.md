@@ -22,7 +22,7 @@ The extension registers a global hotkey (default `alt+s`) that toggles an ambien
 - One header line per dispatch, labeled with the dispatch's task label and mode
 - One line per live agent: status glyph (⏳ running, ✓ done, ✗ failed), agent name, most recent streamed activity (tool call or text snippet), and elapsed duration
 - Finished rounds collapsed to a single summary line per round (`✓ round 1 · 3/3 done · 2m`)
-- Detached jobs appear alongside blocking dispatches, one agent line per agent name, glyphs keyed off the live `job.status`
+- Detached jobs appear alongside blocking dispatches, one line per started per-slot agent node carrying that node's status glyph, streamed activity, and duration (steps that have not started yet add no line); the one-line-per-agent-name rendering keyed off `job.status` remains only as a mixed-version defense for snapshots published before the per-agent wiring
 - A hint line naming the navigator key, always last
 
 The strip owns its own line budget (12 lines): live tasks render before finished ones, and content that does not fit is summarized as a `+N more` line above the hint, so the terminal never truncates the widget.
@@ -31,7 +31,7 @@ The strip owns its own line budget (12 lines): live tasks render before finished
 
 A second hotkey (default `alt+n`) opens the navigator: a blocking overlay (`ctx.ui.custom` with `overlay: true`) over every dispatch in the shared state, refreshed ~3× a second by the same polling the strip uses.
 
-- **Left tree pane:** one row per dispatch task (labeled by the same heuristic as the strip), expanding to its dispatch rounds and their agents. Completed rounds render as a single summary glyph line; the live round auto-expands. Detached jobs render as task nodes with their agents directly beneath, keyed off the live `job.status`.
+- **Left tree pane:** one row per dispatch task (labeled by the same heuristic as the strip), expanding to its dispatch rounds and their agents. Completed rounds render as a single summary glyph line; the live round auto-expands. Detached jobs render as task nodes with their started agents directly beneath, each keyed off its own node status (snapshots published before the per-agent wiring fall back to `agentNames` children keyed off `job.status`).
 - **Right detail pane:** for a selected agent, a status header (status, model, cwd, context tokens, step for chain agents, duration) plus its streamed activity — timestamped lines for text snippets and tool calls with their arguments — the usage summary, and the final result when settled. For a task or round selection, a summary with one line per child. Selection follows a blocking or a detached agent alike; detached detail streams through the per-task `onUpdate` wiring in the subagent extension's `runDetachedJob`.
 - **Keys (fixed in v1):** `↑`/`↓` move the cursor, `←`/`→` collapse/expand the selected task or round, `tab`/`shift+tab` jump to the next/previous task, `esc` closes. The surface is strictly read-only: nothing in the overlay steers, aborts, or injects into a dispatch.
 
@@ -39,7 +39,7 @@ Pressing the open key while the navigator is already showing does nothing (no se
 
 ### Task labels
 
-Dispatch payloads carry no task-ID field, so the label is parsed from the prompt text: the first `EXT-N` or `EXT-N-M` fleet task reference when the prompt names one (first match wins on multi-reference prompts), otherwise the prompt's first words truncated to 60 characters. Labels resolve at render time, and detached jobs reuse their existing task preview as the label.
+Dispatch payloads carry no task-ID field, so the label is parsed from the prompt text: the first `EXT-N` or `EXT-N-M` fleet task reference when the prompt names one (first match wins on multi-reference prompts), otherwise the prompt's first words truncated to 60 characters. Labels resolve at render time, and detached jobs resolve their task preview through the same heuristic on both surfaces.
 
 ### Hotkey configuration
 
