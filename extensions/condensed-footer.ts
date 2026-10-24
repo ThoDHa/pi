@@ -24,7 +24,7 @@
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { getSharedDispatchState, type DetachedJobSnapshot } from "./subagent/registry.ts";
+import { getSharedDispatchState, statusGlyph, type DetachedJobSnapshot } from "./subagent/registry.ts";
 
 /** Token/byte usage shape the footer reads off session entries. */
 export interface FooterUsage {
@@ -247,7 +247,7 @@ export function layoutFooterLine(input: FooterLineInput, width: number, fg: Foot
 	const up = input.inputTokens > 0 ? `↑${formatTokens(input.inputTokens)}` : null;
 	const down = input.outputTokens > 0 ? `↓${formatTokens(input.outputTokens)}` : null;
 	const cost = input.cost > 0 ? `$${input.cost.toFixed(3)}` : null;
-	const jobs = input.runningJobs > 0 ? `⏳${input.runningJobs}` : null;
+	const jobs = input.runningJobs > 0 ? `${statusGlyph("running")}${input.runningJobs}` : null;
 	const model =
 		input.modelId === null ? "no-model" : input.thinkingLevel ? `${input.modelId}:${input.thinkingLevel}` : input.modelId;
 
