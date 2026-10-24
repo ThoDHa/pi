@@ -6,7 +6,7 @@
  * user-facing about dispatch observation: the toggleable dispatch
  * strip above the editor, its hotkey registration from the
  * `subagentViewer` settings block, and the task-label heuristic. The
- * navigator overlay (checkpoint 2) joins the surfaces here and
+ * navigator view (checkpoint 2) joins the surfaces here and
  * registers the navigator key the strip's hint line already names.
  *
  * This extension owns no dispatch state: the strip polls the shared
@@ -22,8 +22,8 @@
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, type Component, type KeyId, type TUI } from "@earendil-works/pi-tui";
 import { getSharedDispatchState, type DetachedJobSnapshot, type DispatchRegistry } from "../subagent/registry.ts";
-import { NavigatorOverlay } from "./overlay.ts";
 import { buildStripTasks, renderStripLines, STRIP_MAX_LINES } from "./strip.ts";
+import { NavigatorView } from "./view.ts";
 
 const STRIP_WIDGET_KEY = "subagent-dispatch-strip";
 const STRIP_POLL_INTERVAL_MS = 500;
@@ -125,7 +125,7 @@ export default function (pi: ExtensionAPI) {
 	// the editor's shortcut setup on both startup and /reload. A
 	// changed subagentViewer key therefore binds after /reload.
 	let stripVisible = false;
-	// Double-open guard for the navigator: while the overlay is showing,
+	// Double-open guard for the navigator: while the view is showing,
 	// a second open-key press must not stack a second ctx.ui.custom.
 	let navigatorOpen = false;
 	const registerViewerShortcuts = () => {
@@ -155,19 +155,22 @@ export default function (pi: ExtensionAPI) {
 			},
 		});
 		pi.registerShortcut(viewerKeys.navigatorKey, {
-			description: "Open the subagent navigator overlay",
+			description: "Open the subagent navigator view",
 			handler: async (ctx) => {
 				if (navigatorOpen) return;
 				navigatorOpen = true;
 				try {
 					const shared = getSharedDispatchState();
+					// No overlay option: the non-overlay custom installs the
+					// view in the editor slot (full width, focus-owned, inside
+					// the root layout), the /tree idiom, replacing the editor
+					// until escape resolves done.
 					await ctx.ui.custom(
-						(tui, theme, _keybindings, done) =>
-							new NavigatorOverlay(tui, theme, {
+						(tui, theme, keybindings, done) =>
+							new NavigatorView(tui, theme, keybindings, {
 								registry: shared.registry,
 								detachedJobs: shared.detachedJobs,
 							}, done),
-						{ overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "85%" } },
 					);
 				} finally {
 					navigatorOpen = false;

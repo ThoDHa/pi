@@ -1,12 +1,12 @@
 /**
- * Navigator overlay's pure model
+ * Navigator view's pure model
  *
- * The tree and detail-pane logic for the navigator overlay: task
+ * The tree and detail-pane logic for the navigator view: task
  * views assembled from the dispatch registry plus detached-job
  * snapshots, a flatten/visibility function turning views plus
  * expansion state into renderable rows, cursor helpers for the fixed
- * v1 in-overlay keys, and the detail-pane model resolver. The overlay
- * component in overlay.ts renders these rows and models through the
+ * v1 in-view keys, and the detail-pane model resolver. The view
+ * component in view.ts renders these rows and models through the
  * theme; this module owns no presentation.
  *
  * Dependency-free by design (no pi imports) so plain-node suites can
@@ -117,7 +117,10 @@ function agentView(node: DispatchAgentNode, ref: NavigatorAgentRef, fallbackEnd:
  * render time. Snapshots predating the per-agent wiring (no `agents`
  * array) fall back to agentNames children keyed off job.status; a
  * present-but-empty `agents` array means nothing has started yet
- * (lazy node creation) and renders no agent children.
+ * (lazy node creation) and renders no agent children. The list is
+ * partitioned live-first (running tasks above settled ones, stable
+ * within each group) so active work leads the tree the way the strip
+ * orders its lines.
  */
 export function buildNavigatorTasks(registry: DispatchRegistry, jobs: Iterable<DetachedJobSnapshot>, now: number): NavigatorTaskView[] {
 	const views: NavigatorTaskView[] = [];
@@ -172,10 +175,11 @@ export function buildNavigatorTasks(registry: DispatchRegistry, jobs: Iterable<D
 			agents,
 		});
 	}
-	return views;
+
+	return [...views.filter((view) => view.live), ...views.filter((view) => !view.live)];
 }
 
-/** Expansion state the overlay owns across polls: collapsed tasks and the user's sticky round expand/collapse overrides. */
+/** Expansion state the view owns across polls: collapsed tasks and the user's sticky round expand/collapse overrides. */
 export interface NavigatorExpansionState {
 	collapsedTasks: Set<string>;
 	/** Round id -> expanded; a round without an override auto-expands while live and stays collapsed once completed. */
@@ -203,7 +207,7 @@ export interface NavigatorRow {
 }
 
 /**
- * Flatten task views into the visible rows the overlay renders.
+ * Flatten task views into the visible rows the view renders.
  * Tasks render as header rows and hide their whole subtree when
  * collapsed. Rounds render as single glyph-line rows: a round is
  * expanded only while live or when the user overrode it, so completed

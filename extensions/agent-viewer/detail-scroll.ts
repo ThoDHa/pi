@@ -1,18 +1,18 @@
 /**
  * Navigator detail-pane scroll model
  *
- * Pure windowing state for the navigator overlay's detail pane. The
- * pane lives in a ctx.ui.custom overlay, which pi composites from
- * plain rendered lines: pi-tui's ScrollView never receives
- * updateLayout there, so its scrollTop cannot move and the component
- * cannot be hosted in the pane. The follow-end contract of ScrollView
- * is therefore implemented here over plain line lists: the window
- * follows the newest line by default, an effective upward scroll
- * releases the follow, and reaching the bottom again reacquires it.
- * While released, the window is stabilized on line identity keys
+ * Pure windowing state for the navigator view's detail pane, plus the
+ * view's body-height budget. The window model implements the
+ * follow-end contract of pi-tui's ScrollView over plain line lists:
+ * the window follows the newest line by default, an effective upward
+ * scroll releases the follow, and reaching the bottom again reacquires
+ * it. While released, the window is stabilized on line identity keys
  * rather than a bare index, because the activity log evicts from its
  * head once it reaches its cap and an index-pinned window would
- * silently drift forward through the log.
+ * silently drift forward through the log. A real ScrollView is
+ * deliberately not adopted even though the editor-slot hosting would
+ * run its layout: the pure model is already pinned headlessly and
+ * keeps the suites framework-free.
  *
  * Dependency-free by design (no pi imports) so plain-node suites can
  * pin the window math directly.
@@ -20,14 +20,19 @@
 
 import type { DispatchActivityEntry } from "../subagent/registry.ts";
 
-/** Body rows kept before a "+N more" tail line; the overlay's maxHeight clips beyond this too. */
-export const MAX_BODY_ROWS = 40;
+/**
+ * Rows the dock claims besides the view slot, against pi's
+ * createChatViewport layout: the transcript's one-line minimum, the
+ * status and footer rows (one to two lines), and one row of shrink
+ * slack. The slot's own share of the terminal is whatever remains.
+ */
+export const VIEW_DOCK_ROWS = 4;
 
-/** Share of the terminal height the overlay requests; coupled to overlayOptions.maxHeight in index.ts. */
-export const OVERLAY_MAX_HEIGHT_PERCENT = 85;
+/** Chrome rows the view renders around its body: the header line above, the hints line below. */
+export const VIEW_CHROME_ROWS = 2;
 
-/** Frame lines around the overlay body: top border, footer hints, bottom border. */
-export const OVERLAY_FRAME_LINES = 3;
+/** Rows reserved before the body budget: the dock's claims plus the view's own chrome. */
+export const VIEW_RESERVED_ROWS = VIEW_DOCK_ROWS + VIEW_CHROME_ROWS;
 
 /** Context lines of overlap a pageUp/pageDown step keeps, so paging never loses the reading thread. */
 export const PAGE_SCROLL_OVERLAP_LINES = 1;
@@ -51,13 +56,14 @@ export function createDetailScrollState(): DetailScrollState {
 }
 
 /**
- * Body rows the overlay's tree and detail panes share: the overlay's
- * maxHeight share of the terminal minus its three frame lines,
- * floored at one and capped at MAX_BODY_ROWS (which the overlay's
- * maxHeight would clip beyond anyway).
+ * Body rows the view's tree and detail panes share: the terminal
+ * minus the reserved rows, floored at one. Best-effort by nature (the
+ * dock's exact share of the terminal is pi's to allot), so when the
+ * strip widget is toggled on above the slot the dock may shrink the
+ * view and clip the tail; the budget keeps the ordinary frame exact.
  */
-export function overlayBodyRows(terminalRows: number): number {
-	return Math.min(MAX_BODY_ROWS, Math.max(1, Math.floor((terminalRows * OVERLAY_MAX_HEIGHT_PERCENT) / 100) - OVERLAY_FRAME_LINES));
+export function viewBodyRows(terminalRows: number): number {
+	return Math.max(1, terminalRows - VIEW_RESERVED_ROWS);
 }
 
 /** Rows one pageUp/pageDown moves: the viewport minus the overlap, never below one so a page always moves. */

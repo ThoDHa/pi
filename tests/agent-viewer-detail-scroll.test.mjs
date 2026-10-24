@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Unit suite for the navigator overlay's pure detail-pane scroll
+ * Unit suite for the navigator view's pure detail-pane scroll
  * model (extensions/agent-viewer/detail-scroll.ts). Plain node, no
  * test framework:
  *
@@ -15,32 +15,32 @@
  * out of the log clamps without reacquiring; paging to the bottom,
  * end, and home behaviors; the indicator suppressing once the window
  * itself reaches the newest line; short content keeping every scroll
- * key neutral; and the viewport discovery arithmetic shared with the
- * overlay frame.
+ * key neutral; and the body-budget arithmetic shared with the view
+ * frame.
  */
 
 import assert from "node:assert/strict";
 import {
 	BLANK_LINE_KEY,
 	HEADER_LINE_KEY,
-	MAX_BODY_ROWS,
-	OVERLAY_FRAME_LINES,
-	OVERLAY_MAX_HEIGHT_PERCENT,
 	PAGE_SCROLL_OVERLAP_LINES,
 	PLACEHOLDER_LINE_KEY,
 	RESULT_LINE_KEY,
 	SCROLL_NEW_INDICATOR,
 	USAGE_LINE_KEY,
+	VIEW_CHROME_ROWS,
+	VIEW_DOCK_ROWS,
+	VIEW_RESERVED_ROWS,
 	activityLineKey,
 	createDetailScrollState,
 	detailWindow,
 	fieldLineKey,
 	memberLineKey,
-	overlayBodyRows,
 	pageStepRows,
 	scrollDetailBy,
 	scrollDetailTo,
 	stabilizeDetailScroll,
+	viewBodyRows,
 } from "../extensions/agent-viewer/detail-scroll.ts";
 
 const VIEWPORT = 10;
@@ -284,17 +284,16 @@ function heldState(keys, viewport) {
 	assert.deepEqual(detailWindow(state, keys, VIEWPORT), { start: 0, end: 5, newOutput: false });
 }
 
-// --- viewport discovery: the body budget shared with the overlay frame ---
+// --- viewport discovery: the body budget shared with the view frame ---
 
 {
-	assert.equal(
-		overlayBodyRows(40),
-		Math.floor((40 * OVERLAY_MAX_HEIGHT_PERCENT) / 100) - OVERLAY_FRAME_LINES,
-		"a 40-row terminal gives its 85% share minus the three frame lines",
-	);
-	assert.equal(overlayBodyRows(40), 31);
-	assert.equal(overlayBodyRows(80), MAX_BODY_ROWS, "the body budget caps at MAX_BODY_ROWS");
-	assert.equal(overlayBodyRows(2), 1, "a tiny terminal floors at one body row");
+	assert.equal(VIEW_DOCK_ROWS, 4, "the dock claims the transcript minimum, status plus footer, and one slack row");
+	assert.equal(VIEW_CHROME_ROWS, 2, "the view renders a header line and a hints line around the body");
+	assert.equal(VIEW_RESERVED_ROWS, VIEW_DOCK_ROWS + VIEW_CHROME_ROWS, "the total reserve sums the dock and the chrome");
+	assert.equal(viewBodyRows(40), 40 - VIEW_RESERVED_ROWS, "the body budget is the terminal minus the reserved rows");
+	assert.equal(viewBodyRows(2), 1, "a tiny terminal floors at one body row");
+	assert.equal(viewBodyRows(VIEW_RESERVED_ROWS), 1, "a terminal exactly the size of the reserve still shows one body row");
+	assert.equal(viewBodyRows(VIEW_RESERVED_ROWS - 1), 1, "a terminal smaller than the reserve clamps to one body row");
 }
 
 console.log("agent-viewer-detail-scroll: all assertions passed");

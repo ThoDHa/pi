@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * Unit suite for the navigator overlay's pure tree layer
+ * Unit suite for the navigator view's pure tree layer
  * (extensions/agent-viewer/navigator.ts). Plain node, no test
  * framework:
  *
  *   node tests/agent-viewer-navigator-tree.test.mjs
  *
- * Covers the tree model the overlay renders: buildNavigatorTasks
+ * Covers the tree model the view renders: buildNavigatorTasks
  * assembling task -> dispatch round -> agent views from the dispatch
  * registry plus detached-job snapshots (detached jobs as task nodes
  * with their agents as children, labels from the EXT-1-2 heuristic,
@@ -190,6 +190,73 @@ ordered.updateAgent(lateFirst.id, 1, 1, { status: "done", finishedAt: 3_000 });
 const lateFirstView = buildNavigatorTasks(ordered, [], 10_000)[0];
 assert.equal(lateFirstView.durationText, "8s", "task duration ends at the latest slot finish, not the last slot's");
 
+// --- buildNavigatorTasks: live tasks partition above settled ones, stable within groups ---
+
+{
+	const mixedRegistry = createDispatchRegistry();
+	const settledTask = mixedRegistry.startTask({ mode: "single", prompt: "settled probe", now: 1_000 });
+	mixedRegistry.startRound(settledTask.id, [{ agent: "early" }], 1_000);
+	mixedRegistry.updateAgent(settledTask.id, 1, 0, { status: "done", finishedAt: 2_000 });
+	const settledDetached = {
+		id: "job-settled",
+		mode: "single",
+		status: "done",
+		agentNames: ["finished"],
+		taskPreview: "settled detached probe",
+		startedAt: 1_000,
+		finishedAt: 3_000,
+	};
+	const liveDetached = {
+		id: "job-live",
+		mode: "single",
+		status: "running",
+		agentNames: ["busy"],
+		taskPreview: "live detached probe",
+		startedAt: 4_000,
+	};
+	const mixed = buildNavigatorTasks(mixedRegistry, [settledDetached, liveDetached], 5_000);
+	assert.deepEqual(
+		mixed.map((view) => view.id),
+		["job-live", settledTask.id, "job-settled"],
+		"live tasks lead settled ones across registry and detached sources",
+	);
+	assert.deepEqual(
+		mixed.filter((view) => view.live).map((view) => view.id),
+		["job-live"],
+		"the live group keeps insertion order",
+	);
+	assert.deepEqual(
+		mixed.filter((view) => !view.live).map((view) => view.id),
+		[settledTask.id, "job-settled"],
+		"the settled group keeps insertion order (registry task, then detached snapshot order)",
+	);
+
+	// Partitioning is a no-op when liveness is uniform.
+	assert.deepEqual(
+		buildNavigatorTasks(mixedRegistry, [settledDetached], 5_000).map((view) => view.id),
+		[settledTask.id, "job-settled"],
+		"an all-settled list keeps its insertion order",
+	);
+	const liveRegistry = createDispatchRegistry();
+	const firstLive = liveRegistry.startTask({ mode: "single", prompt: "first live probe", now: 1_000 });
+	liveRegistry.startRound(firstLive.id, [{ agent: "a1" }], 1_000);
+	const secondLive = liveRegistry.startTask({ mode: "single", prompt: "second live probe", now: 2_000 });
+	liveRegistry.startRound(secondLive.id, [{ agent: "a2" }], 2_000);
+	assert.deepEqual(
+		buildNavigatorTasks(liveRegistry, [liveDetached], 3_000).map((view) => view.id),
+		[firstLive.id, secondLive.id, "job-live"],
+		"an all-live list keeps its insertion order",
+	);
+
+	// The tree renders rows in the partitioned order.
+	const mixedRows = flattenNavigatorTree(mixed, createExpansionState());
+	assert.deepEqual(
+		mixedRows.map((row) => row.taskId),
+		["job-live", "job-live", settledTask.id, settledTask.id, "job-settled", "job-settled"],
+		"the live task's rows render before the settled tasks' rows",
+	);
+}
+
 // --- flattenNavigatorTree: rows, depths, completed collapsed, live expanded ---
 
 const state = createExpansionState();
@@ -271,7 +338,7 @@ assert.equal(nextTaskRow(rows, 4, 1), 0, "Tab past the last task wraps to the fi
 assert.equal(nextTaskRow(rows, 0, -1), 4, "Shift+Tab wraps backwards to the last task row");
 assert.equal(nextTaskRow(rows, 5, -1), 4, "Shift+Tab from a nested row finds its own task row");
 
-// --- toggleNavigatorRow: the collapse/expand semantics the overlay's left/right keys drive ---
+// --- toggleNavigatorRow: the collapse/expand semantics the view's left/right keys drive ---
 
 const toggleState = createExpansionState();
 const toggleRows = flattenNavigatorTree(tasks, toggleState);

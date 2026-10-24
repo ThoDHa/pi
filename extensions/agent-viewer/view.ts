@@ -1,21 +1,35 @@
 /**
- * Navigator overlay component
+ * Navigator view component
  *
- * The keyboard-driven overlay over every live dispatch: a left tree
- * pane of rows produced by the pure flatten function in navigator.ts,
- * a right detail pane streaming the selected agent's activity, and a
- * footer of keybind hints. Reads the shared dispatch state on a poll
- * interval (doom-overlay pattern: interval plus requestRender, cleared
- * in dispose) and renders through the theme with the fleet glyph
- * conventions. Strictly read-only: the fixed v1 keys move the cursor,
- * collapse or expand, and page the detail pane; nothing steers a
- * dispatch. Escape resolves done(undefined), which pi turns into
- * closing the overlay.
+ * The keyboard-driven view over every live dispatch, hosted in the
+ * editor slot: ctx.ui.custom without the overlay option installs the
+ * component in place of the editor via pi's dialog stack (the /tree
+ * idiom), giving it the slot's full width, layout-engine hosting, and
+ * keyboard focus. A left tree pane of rows produced by the pure
+ * flatten function in navigator.ts, a right detail pane streaming the
+ * selected agent's activity, a header line carrying the tool-noise
+ * filter state, and a hints line at the bottom; there is no box
+ * border because the view is the pane, not a floating card. Reads the
+ * shared dispatch state on a poll interval (doom-overlay pattern:
+ * interval plus requestRender, cleared in dispose) and renders
+ * through the theme with the fleet glyph conventions. Strictly
+ * read-only: the fixed v1 keys move the cursor, collapse or expand,
+ * page the detail pane, and toggle tool-noise visibility; nothing
+ * steers a dispatch. Escape resolves done(undefined), which pi turns
+ * into closing the view and restoring the editor.
+ *
+ * The tool-noise toggle hides the file-reading tool calls (read,
+ * grep, find, ls) so the default detail pane leads with thinking and
+ * assistant text; ctrl+t and ctrl+t's cycle alias ctrl+o flip it,
+ * matched through the injected KeybindingsManager against pi's
+ * app.tree.filter action ids (user remaps honored, the TreeSelector
+ * precedent) with raw matchesKey fallbacks.
  */
 
-import type { Theme, TUI } from "@earendil-works/pi-coding-agent";
-import { CURSOR_MARKER, type Component, type Focusable, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { KeybindingsManager, Theme, TUI } from "@earendil-works/pi-coding-agent";
+import { CURSOR_MARKER, type Focusable, type KeyId, type Keybinding, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { HStack, Text, VStack } from "@earendil-works/pi-tui";
+import { filterActivityEntries } from "./activity-filter.ts";
 import { statusGlyph, type DetachedJobSnapshot, type DispatchRegistry } from "../subagent/registry.ts";
 import {
 	BLANK_LINE_KEY,
@@ -31,11 +45,11 @@ import {
 	detailWindow,
 	fieldLineKey,
 	memberLineKey,
-	overlayBodyRows,
 	pageStepRows,
 	scrollDetailBy,
 	scrollDetailTo,
 	stabilizeDetailScroll,
+	viewBodyRows,
 } from "./detail-scroll.ts";
 import {
 	buildNavigatorTasks,
@@ -63,7 +77,10 @@ const TREE_PANE_MIN_WIDTH = 26;
 const DETAIL_PANE_MIN_WIDTH = 30;
 const PANE_GAP = 3;
 
-const FOOTER_HINTS = "↑/↓ move · ←/→ collapse/expand · tab next task · pgup/pgdn scroll · esc close";
+const HINTS_LINE = "↑/↓ move · ←/→ collapse/expand · tab next task · pgup/pgdn scroll · ctrl+t tools · esc close";
+
+/** Marker prefixing a thinking line, so thought reads as thought and not as streamed output. */
+const THINKING_MARKER = "…";
 
 const BLANK_DETAIL_LINE: DetailLine = { text: "", key: BLANK_LINE_KEY };
 
@@ -73,7 +90,7 @@ function formatClock(at: number): string {
 	return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-export class NavigatorOverlay implements Focusable {
+export class NavigatorView implements Focusable {
 	/** Focusable interface - set by TUI when focus changes. */
 	focused = false;
 
@@ -83,15 +100,18 @@ export class NavigatorOverlay implements Focusable {
 	private selectedId: string | null = null;
 	private selectedIndex = 0;
 	private scroll: DetailScrollState = createDetailScrollState();
+	private showToolNoise = false;
 	private interval: ReturnType<typeof setInterval> | null = null;
 	private readonly tui: TUI;
 	private readonly theme: Theme;
+	private readonly keybindings: KeybindingsManager;
 	private readonly sources: NavigatorSources;
 	private readonly done: (result: undefined) => void;
 
-	constructor(tui: TUI, theme: Theme, sources: NavigatorSources, done: (result: undefined) => void) {
+	constructor(tui: TUI, theme: Theme, keybindings: KeybindingsManager, sources: NavigatorSources, done: (result: undefined) => void) {
 		this.tui = tui;
 		this.theme = theme;
+		this.keybindings = keybindings;
 		this.sources = sources;
 		this.done = done;
 		this.refresh();
@@ -142,6 +162,23 @@ export class NavigatorOverlay implements Focusable {
 		this.selectedId = id;
 	}
 
+	/** Toggle tool-noise visibility and re-anchor: filtering reshapes the line list, so a held window could point past the new tail. */
+	private toggleToolNoise(): void {
+		this.showToolNoise = !this.showToolNoise;
+		this.scroll = createDetailScrollState();
+		this.tui.requestRender();
+	}
+
+	/**
+	 * Match a key against a pi action id through the injected manager
+	 * (user remaps honored), falling back to the raw key when the
+	 * manager does not fire, so the toggle works against a manager
+	 * built without the app.tree.filter ids too.
+	 */
+	private matchesAction(data: string, action: Keybinding, fallbackKey: KeyId): boolean {
+		return this.keybindings.matches(data, action) || matchesKey(data, fallbackKey);
+	}
+
 	handleInput(data: string): void {
 		if (matchesKey(data, "escape")) {
 			this.done(undefined);
@@ -187,6 +224,14 @@ export class NavigatorOverlay implements Focusable {
 			this.jumpDetail(Number.POSITIVE_INFINITY);
 			return;
 		}
+		if (this.matchesAction(data, "app.tree.filter.noTools", "ctrl+t")) {
+			this.toggleToolNoise();
+			return;
+		}
+		if (this.matchesAction(data, "app.tree.filter.cycleForward", "ctrl+o")) {
+			this.toggleToolNoise();
+			return;
+		}
 	}
 
 	/** left collapses, right expands; the row semantics live in the pure toggleNavigatorRow (suite-pinned), the component only dispatches keys and re-reads. */
@@ -199,13 +244,13 @@ export class NavigatorOverlay implements Focusable {
 
 	/** Page the detail pane one viewport (minus its overlap line) up or down; the tail-following state lives in the pure DetailScrollState. */
 	private pageDetail(direction: -1 | 1): void {
-		const viewport = this.detailViewportRows(overlayBodyRows(this.tui.terminal.rows));
+		const viewport = this.detailViewportRows(viewBodyRows(this.tui.terminal.rows));
 		scrollDetailBy(this.scroll, direction * pageStepRows(viewport), this.detailKeys(), viewport);
 	}
 
 	/** Jump the detail pane to a line index (clamped; Infinity lands on the tail). */
 	private jumpDetail(target: number): void {
-		const viewport = this.detailViewportRows(overlayBodyRows(this.tui.terminal.rows));
+		const viewport = this.detailViewportRows(viewBodyRows(this.tui.terminal.rows));
 		scrollDetailTo(this.scroll, target, this.detailKeys(), viewport);
 	}
 
@@ -267,14 +312,19 @@ export class NavigatorOverlay implements Focusable {
 				});
 			}
 		}
-		if (model.activity.length > 0) {
+		const activity = filterActivityEntries(model.activity, this.showToolNoise);
+		if (activity.length > 0) {
 			lines.push(BLANK_DETAIL_LINE);
-			for (const entry of model.activity) {
+			for (const entry of activity) {
 				const clock = theme.fg("muted", entry.at ? formatClock(entry.at) : "--:--:--");
-				lines.push({
-					text: `${clock} ${theme.fg(entry.kind === "toolCall" ? "toolOutput" : "dim", entry.text)}`,
-					key: activityLineKey(entry),
-				});
+				if (entry.kind === "thinking") {
+					lines.push({ text: `${clock} ${theme.fg("dim", `${THINKING_MARKER} ${entry.text}`)}`, key: activityLineKey(entry) });
+				} else {
+					lines.push({
+						text: `${clock} ${theme.fg(entry.kind === "toolCall" ? "toolOutput" : "dim", entry.text)}`,
+						key: activityLineKey(entry),
+					});
+				}
 			}
 		}
 		if (model.usageText) {
@@ -292,11 +342,11 @@ export class NavigatorOverlay implements Focusable {
 
 	render(width: number): string[] {
 		const theme = this.theme;
-		const innerW = Math.max(TREE_PANE_MIN_WIDTH + PANE_GAP + DETAIL_PANE_MIN_WIDTH, width - 2);
-		const treeW = Math.max(TREE_PANE_MIN_WIDTH, Math.floor(innerW * 0.44));
-		const detailW = innerW - treeW - PANE_GAP;
+		const bodyWidth = Math.max(TREE_PANE_MIN_WIDTH + PANE_GAP + DETAIL_PANE_MIN_WIDTH, width);
+		const treeW = Math.max(TREE_PANE_MIN_WIDTH, Math.floor(bodyWidth * 0.44));
+		const detailW = bodyWidth - treeW - PANE_GAP;
 
-		const bodyRows = overlayBodyRows(this.tui.terminal.rows);
+		const bodyRows = viewBodyRows(this.tui.terminal.rows);
 		const treeRows = this.rows.map((row) => this.renderTreeRow(row));
 		const detailLines = this.renderDetailLines();
 		const keys = detailLines.map((line) => line.key);
@@ -313,20 +363,12 @@ export class NavigatorOverlay implements Focusable {
 				{ component: new VStack(detailTexts.map((line) => new Text(line, 0, 0))), basis: detailW },
 			],
 			{ gap: PANE_GAP, align: "start" },
-		).render(innerW);
-		const clipped = omitted > 0 ? body.slice(0, bodyRows - 1) : body;
+		).render(bodyWidth);
+		const clipped = omitted > 0 ? body.slice(0, bodyRows - 1) : body.slice(0, bodyRows);
 		if (omitted > 0) clipped.push(theme.fg("muted", `… +${omitted} more`));
 
-		const pad = (text: string, target: number) => text + " ".repeat(Math.max(0, target - visibleWidth(text)));
-		const border = theme.fg("border", "─".repeat(innerW));
-		const lines: string[] = [theme.fg("border", `╭${border}╮`)];
-		for (const bodyLine of clipped) {
-			const padded = pad(truncateToWidth(bodyLine, innerW), innerW);
-			lines.push(`${theme.fg("border", "│")}${padded}${theme.fg("border", "│")}`);
-		}
-		const hints = FOOTER_HINTS;
-		lines.push(`${theme.fg("border", "│")}${pad(truncateToWidth(theme.fg("muted", hints), innerW), innerW)}${theme.fg("border", "│")}`);
-		lines.push(theme.fg("border", `╰${border}╯`));
-		return lines;
+		const filterState = this.showToolNoise ? "tools shown" : "tools hidden";
+		const header = `${theme.fg("accent", theme.bold("Navigator"))} ${theme.fg("muted", `· ${filterState} · ctrl+t`)}`;
+		return [header, ...clipped, theme.fg("muted", HINTS_LINE)].map((line) => truncateToWidth(line, width));
 	}
 }
