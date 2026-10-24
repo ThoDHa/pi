@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
- * Unit suite for the navigator overlay's pure detail-pane model
+ * Unit suite for the navigator view's pure detail-pane model
  * (extensions/agent-viewer/navigator.ts). Plain node, no test
  * framework:
  *
  *   node tests/agent-viewer-navigator-detail.test.mjs
  *
  * Covers resolveDetailModel, which turns the selected tree row plus
- * the current task views into the model the overlay's right pane
+ * the current task views into the model the view's right pane
  * renders: agent targets resolve through their tree ref (registry and
  * detached alike) and carry the status header fields (model, cwd,
  * tokens, step, duration), the timestamped activity log, the shared

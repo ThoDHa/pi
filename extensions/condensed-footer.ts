@@ -221,7 +221,7 @@ export function countDetachedFleet(jobs: readonly DetachedJobSnapshot[]): Detach
 			for (const agent of job.agents) {
 				if (agent.status === "running") runningAgents++;
 			}
-		} else if (job.agentNames?.length) {
+		} else if (job.agentNames.length) {
 			runningAgents += job.agentNames.length;
 		} else {
 			runningAgents++;

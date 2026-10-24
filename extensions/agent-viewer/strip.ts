@@ -66,7 +66,7 @@ export interface StripTaskView {
 	entries: StripEntry[];
 }
 
-/** Glyph-to-color conventions shared with the navigator overlay's panes (same extension, one map). */
+/** Glyph-to-color conventions shared with the navigator view's panes (same extension, one map). */
 export const GLYPH_COLORS: Record<StatusGlyphName, StripColor> = {
 	running: "warning",
 	done: "success",
