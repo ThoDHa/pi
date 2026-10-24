@@ -13,9 +13,11 @@
  * records a user preference that later session starts respect, so a restored
  * built-in footer survives `/new` instead of being replaced again.
  *
- * ⏳N counts the subagent extension's detached jobs still running, read
+ * While detached jobs run, the marker reads ⏳J·A: J is the subagent
+ * extension's detached jobs still running and A their running agents
+ * (a parallel dispatch is one job with many agents). Both counts are read
  * fresh from the shared dispatch state on every frame; a 500 ms render poll
- * keeps the count live between session entries and is cleared on dispose.
+ * keeps them live between session entries and is cleared on dispose.
  *
  * The formatters mirror the built-in footer's, whose module the package
  * exports map blocks from importing, so they are carried here.
@@ -90,6 +92,7 @@ export interface FooterLineInput {
 	contextWindow: number | null;
 	contextPercent: number | null;
 	runningJobs: number;
+	runningAgents: number;
 	modelId: string | null;
 	/** Thinking level to append as `:level`; null when the model lacks reasoning. */
 	thinkingLevel: string | null;
@@ -194,13 +197,37 @@ export function collectFooterStats(source: FooterStatsSource, cache: FooterStats
 
 export const JOB_POLL_INTERVAL_MS = 500;
 
-/** Count the detached-job snapshots whose job-level status is still running. */
-export function countRunningDetachedJobs(jobs: readonly DetachedJobSnapshot[]): number {
-	let running = 0;
+/** Running detached jobs and the agents running inside them. */
+export interface DetachedFleetCounts {
+	jobs: number;
+	agents: number;
+}
+
+/**
+ * Count the detached-job snapshots whose job-level status is still running,
+ * plus the agents running inside those jobs. Per running job the agent count
+ * walks the live per-slot nodes and counts status "running"; a snapshot from
+ * before the nodes exist (lazy/empty `agents`) falls back to `agentNames`,
+ * and with neither source it counts as 1, so detail-less jobs stay visible.
+ * Done and failed jobs contribute to neither count.
+ */
+export function countDetachedFleet(jobs: readonly DetachedJobSnapshot[]): DetachedFleetCounts {
+	let runningJobs = 0;
+	let runningAgents = 0;
 	for (const job of jobs) {
-		if (job.status === "running") running++;
+		if (job.status !== "running") continue;
+		runningJobs++;
+		if (job.agents?.length) {
+			for (const agent of job.agents) {
+				if (agent.status === "running") runningAgents++;
+			}
+		} else if (job.agentNames?.length) {
+			runningAgents += job.agentNames.length;
+		} else {
+			runningAgents++;
+		}
 	}
-	return running;
+	return { jobs: runningJobs, agents: runningAgents };
 }
 
 /** Start the render poll that carries running-jobs changes to frames between session entries. */
@@ -247,7 +274,7 @@ export function layoutFooterLine(input: FooterLineInput, width: number, fg: Foot
 	const up = input.inputTokens > 0 ? `↑${formatTokens(input.inputTokens)}` : null;
 	const down = input.outputTokens > 0 ? `↓${formatTokens(input.outputTokens)}` : null;
 	const cost = input.cost > 0 ? `$${input.cost.toFixed(3)}` : null;
-	const jobs = input.runningJobs > 0 ? `${statusGlyph("running")}${input.runningJobs}` : null;
+	const jobs = input.runningJobs > 0 ? `${statusGlyph("running")}${input.runningJobs}·${input.runningAgents}` : null;
 	const model =
 		input.modelId === null ? "no-model" : input.thinkingLevel ? `${input.modelId}:${input.thinkingLevel}` : input.modelId;
 
@@ -322,7 +349,7 @@ export default function (pi: ExtensionAPI) {
 				},
 				render(width: number): string[] {
 					const stats = collectFooterStats(ctx, cache);
-					const runningJobs = countRunningDetachedJobs(getSharedDispatchState().detachedJobs);
+					const fleet = countDetachedFleet(getSharedDispatchState().detachedJobs);
 					return [
 						layoutFooterLine(
 							{
@@ -337,7 +364,8 @@ export default function (pi: ExtensionAPI) {
 								contextTokens: stats.contextTokens,
 								contextWindow: stats.contextWindow,
 								contextPercent: stats.contextPercent,
-								runningJobs,
+								runningJobs: fleet.jobs,
+								runningAgents: fleet.agents,
 								modelId: ctx.model?.id ?? null,
 								thinkingLevel: ctx.model?.reasoning ? (ctx.thinkingLevel ?? "off") : null,
 							},

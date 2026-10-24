@@ -13,8 +13,8 @@
  * model accent, branch and token counts muted, cwd dim, statuses in their
  * owner's colors), zero-usage, unknown-context, and missing-branch shapes,
  * the whole-session usage scan memoization keyed on (session, leaf, entry
- * count, model), the live running-jobs count read from the shared dispatch
- * state per render, the 500 ms render poll and its dispose, and the /footer
+ * count, model), the live running job and agent counts read from the shared
+ * dispatch state per render, the 500 ms render poll and its dispose, and the /footer
  * toggle reinstalling or restoring the built-in footer with the choice
  * persisting across session starts. Also pins the shared formatters
  * (formatTokens, shortenCwd, sanitizeStatusText).
@@ -24,7 +24,7 @@ import assert from "node:assert/strict";
 import { importPiTui } from "./provision-pi-tui.mjs";
 
 const { visibleWidth } = await importPiTui();
-const { default: condensedFooter, collectFooterStats, countRunningDetachedJobs, createFooterStatsCache, formatTokens, JOB_POLL_INTERVAL_MS, layoutFooterLine, sanitizeStatusText, shortenCwd, startFooterJobPolling } = await import("../extensions/condensed-footer.ts");
+const { default: condensedFooter, collectFooterStats, countDetachedFleet, createFooterStatsCache, formatTokens, JOB_POLL_INTERVAL_MS, layoutFooterLine, sanitizeStatusText, shortenCwd, startFooterJobPolling } = await import("../extensions/condensed-footer.ts");
 const { getSharedDispatchState, upsertDetachedJobSnapshot } = await import("../extensions/subagent/registry.ts");
 
 const identityFg = (_color, text) => text;
@@ -45,10 +45,11 @@ const richInput = {
 	contextWindow: 200000,
 	contextPercent: 45.3,
 	runningJobs: 0,
+	runningAgents: 0,
 	modelId: "kimi-k2",
 	thinkingLevel: "high",
 };
-const jobsInput = { ...richInput, runningJobs: 2 };
+const jobsInput = { ...richInput, runningJobs: 2, runningAgents: 2 };
 
 /** First width (scanning down from `from`) where `marker` is gone from the line. */
 function dropWidth(input, marker, from = 200) {
@@ -88,8 +89,15 @@ test("wide terminal flushes right segment at the exact width with minimum 2-spac
 
 test("running jobs lead the right segment at full width", () => {
 	const line = layoutFooterLine(jobsInput, 120, identityFg);
-	assert.ok(line.endsWith("⏳2 ↑1.5k ↓23k $1.234 45k/200k 45.3% kimi-k2:high"));
+	assert.ok(line.endsWith("⏳2·2 ↑1.5k ↓23k $1.234 45k/200k 45.3% kimi-k2:high"));
 	assert.equal(visibleWidth(line), 120);
+});
+
+test("one job with two running agents renders both counts ⏳1·2 without collapsing", () => {
+	const line = layoutFooterLine({ ...richInput, runningJobs: 1, runningAgents: 2 }, 120, identityFg);
+	assert.ok(line.includes("⏳1·2"), "the user's parallel-dispatch scenario must read jobs·agents");
+	const equal = layoutFooterLine(jobsInput, 120, identityFg);
+	assert.ok(equal.includes("⏳2·2"), "equal counts must still render both numbers");
 });
 
 test("exactly-fitting terminal leaves the minimum 2-space gap", () => {
@@ -152,14 +160,14 @@ test("the jobs marker survives the branch drop and falls at its own rung", () =>
 	const window = dropWidth(jobsInput, "45k/200k");
 	const output = dropWidth(jobsInput, "↓23k");
 	const branch = dropWidth(jobsInput, "(main)");
-	const jobs = dropWidth(jobsInput, "⏳2");
+	const jobs = dropWidth(jobsInput, "⏳2·2");
 	assert.ok(statuses > model && model > cost && cost > window && window > output && output > branch);
 	assert.ok(branch > jobs, `branch ${branch} must drop before jobs ${jobs}`);
 	const afterBranch = layoutFooterLine(jobsInput, branch, identityFg);
 	assert.ok(afterBranch.includes("(main)") === false);
-	assert.ok(afterBranch.includes("⏳2"), "jobs marker must outlive the branch");
+	assert.ok(afterBranch.includes("⏳2·2"), "jobs marker must outlive the branch");
 	const atJobsRung = layoutFooterLine(jobsInput, jobs, identityFg);
-	assert.ok(!atJobsRung.includes("⏳2"), "jobs marker must drop at its rung");
+	assert.ok(!atJobsRung.includes("⏳2·2"), "jobs marker must drop at its rung");
 	assert.ok(atJobsRung.includes("45.3%"));
 	assert.ok(atJobsRung.includes("↑1.5k"));
 });
@@ -235,7 +243,7 @@ test("branch and token counts render muted, cwd dim, model accent, statuses keep
 	});
 	assert.deepEqual(byColor.dim, ["~/proj"]);
 	assert.deepEqual(byColor.muted, ["(main)", "↑1.5k", "↓23k", "$1.234", "45k/200k 45.3%"]);
-	assert.deepEqual(byColor.warning, ["⏳2"]);
+	assert.deepEqual(byColor.warning, ["⏳2·2"]);
 	assert.deepEqual(byColor.accent, ["kimi-k2:high"]);
 	assert.ok(byColor.muted.every((text) => !text.includes("manager")));
 	assert.ok(byColor.dim.every((text) => !text.includes("manager")));
@@ -248,7 +256,7 @@ test("branch and token counts render muted, cwd dim, model accent, statuses keep
 test("jobs marker renders only while jobs are running", () => {
 	assert.ok(!layoutFooterLine(richInput, 120, identityFg).includes("⏳"));
 	const line = layoutFooterLine(jobsInput, 120, taggingFg);
-	assert.ok(line.includes(tagged("warning", "⏳2")));
+	assert.ok(line.includes(tagged("warning", "⏳2·2")));
 });
 
 // --- zero-usage, missing branch, empty statuses ---------------------------
@@ -266,6 +274,7 @@ test("fresh session renders only cwd, percent, and model", () => {
 			contextWindow: null,
 			contextPercent: 0,
 			runningJobs: 0,
+			runningAgents: 0,
 			modelId: null,
 			thinkingLevel: "high",
 		},
@@ -359,20 +368,73 @@ test("repeat renders reuse the memoized scan until session key inputs move", () 
 	assert.equal(scanCount(), 3);
 });
 
-// --- running-jobs count -----------------------------------------------------
+// --- running job and agent counts ------------------------------------------
 
 function jobSnapshot(id, status) {
 	return { id, mode: "single", status, agentNames: [], taskPreview: `task ${id}`, startedAt: 0 };
 }
 
-test("countRunningDetachedJobs counts only running snapshots", () => {
-	assert.equal(countRunningDetachedJobs([]), 0);
-	assert.equal(
-		countRunningDetachedJobs([jobSnapshot("a", "running"), jobSnapshot("b", "done"), jobSnapshot("c", "failed"), jobSnapshot("d", "running")]),
-		2,
-	);
-	const lazy = { ...jobSnapshot("e", "running"), agents: [] };
-	assert.equal(countRunningDetachedJobs([lazy]), 1, "lazy-agents shape counts by job-level status");
+function agentNode(status, agent = "worker") {
+	return { agent, status, startedAt: 0 };
+}
+
+test("countDetachedFleet returns zero jobs and agents for an empty snapshot list", () => {
+	assert.deepEqual(countDetachedFleet([]), { jobs: 0, agents: 0 });
+});
+
+test("countDetachedFleet counts running jobs only and one agent per detail-less job", () => {
+	const fleet = countDetachedFleet([
+		jobSnapshot("a", "running"),
+		jobSnapshot("b", "done"),
+		jobSnapshot("c", "failed"),
+		jobSnapshot("d", "running"),
+	]);
+	assert.deepEqual(fleet, { jobs: 2, agents: 2 }, "J detail-less running jobs must read J·J");
+});
+
+test("countDetachedFleet counts every running agent of one parallel job", () => {
+	const parallel = { ...jobSnapshot("par", "running"), agents: [agentNode("running"), agentNode("running")] };
+	assert.deepEqual(countDetachedFleet([parallel]), { jobs: 1, agents: 2 });
+});
+
+test("countDetachedFleet sums the running agents across several running jobs", () => {
+	const fleet = countDetachedFleet([
+		{ ...jobSnapshot("a", "running"), agents: [agentNode("running")] },
+		{ ...jobSnapshot("b", "running"), agents: [agentNode("running")] },
+	]);
+	assert.deepEqual(fleet, { jobs: 2, agents: 2 });
+});
+
+test("countDetachedFleet counts only the running agents among mixed statuses in one job", () => {
+	const mixed = { ...jobSnapshot("mix", "running"), agents: [agentNode("running"), agentNode("done")] };
+	assert.deepEqual(countDetachedFleet([mixed]), { jobs: 1, agents: 1 });
+});
+
+test("a running job whose agents all settled renders ⏳1·0 and with a running-agent second job ⏳2·1", () => {
+	const settled = { ...jobSnapshot("chain", "running"), agents: [agentNode("done"), agentNode("failed"), agentNode("done")] };
+	assert.deepEqual(countDetachedFleet([settled]), { jobs: 1, agents: 0 }, "done and failed agents must count zero inside a running job");
+	assert.ok(layoutFooterLine({ ...richInput, runningJobs: 1, runningAgents: 0 }, 120, identityFg).includes("⏳1·0"), "A=0 must still render both counts");
+	const pair = countDetachedFleet([
+		{ ...jobSnapshot("between", "running"), agents: [agentNode("done"), agentNode("failed")] },
+		{ ...jobSnapshot("active", "running"), agents: [agentNode("running")] },
+	]);
+	assert.deepEqual(pair, { jobs: 2, agents: 1 });
+	assert.ok(layoutFooterLine({ ...richInput, runningJobs: 2, runningAgents: 1 }, 120, identityFg).includes("⏳2·1"), "the running agent must surface among settled ones");
+});
+
+test("countDetachedFleet lets done and failed jobs contribute to neither count", () => {
+	const settled = [
+		{ ...jobSnapshot("finished", "done"), agents: [agentNode("running")] },
+		{ ...jobSnapshot("errored", "failed"), agents: [agentNode("running")] },
+	];
+	assert.deepEqual(countDetachedFleet(settled), { jobs: 0, agents: 0 });
+});
+
+test("countDetachedFleet falls back to agentNames while the live agent nodes are lazy", () => {
+	const lazyNodes = { ...jobSnapshot("lazy", "running"), agentNames: ["alpha", "beta"], agents: [] };
+	assert.deepEqual(countDetachedFleet([lazyNodes]), { jobs: 1, agents: 2 }, "an empty agents array is the lazy shape");
+	const noNodes = { ...jobSnapshot("legacy", "running"), agentNames: ["solo"] };
+	assert.deepEqual(countDetachedFleet([noNodes]), { jobs: 1, agents: 1 }, "an absent agents array falls back too");
 });
 
 // --- /footer toggle and session_start install ------------------------------
@@ -550,15 +612,16 @@ test("footer component reads the running-jobs count live without rescanning entr
 	};
 	const component = factory({ requestRender() {} }, { fg: (_color, text) => text }, footerData);
 	const shared = getSharedDispatchState();
-	const snapshot = jobSnapshot("job-live", "running");
+	const snapshot = { ...jobSnapshot("job-live", "running"), agents: [agentNode("running"), agentNode("running")] };
 	upsertDetachedJobSnapshot(shared.detachedJobs, snapshot);
 	try {
 		const running = component.render(120)[0];
-		assert.ok(running.includes("⏳1"), "a running job must show its marker");
+		assert.ok(running.includes("⏳1·2"), "a running job must show both its job and agent counts");
 		assert.ok(running.includes("45k/200k 45.3%"));
 		upsertDetachedJobSnapshot(shared.detachedJobs, { ...snapshot, status: "done" });
 		const settled = component.render(120)[0];
 		assert.ok(!settled.includes("⏳"), "settled job must vanish without any entry change");
+		assert.ok(!settled.includes("·"), "both counts must drop with the job");
 		assert.ok(settled.includes("45k/200k 45.3%"), "memoized stats must stay put");
 		assert.equal(scans, 1, "entry scan must stay memoized across renders");
 	} finally {
