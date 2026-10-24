@@ -25,11 +25,16 @@
  */
 
 import assert from "node:assert/strict";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { importPiTui } from "./provision-pi-tui.mjs";
 import { createDispatchRegistry } from "../extensions/subagent/registry.ts";
-import { NavigatorOverlay } from "../extensions/agent-viewer/overlay.ts";
 import { SCROLL_NEW_INDICATOR, overlayBodyRows } from "../extensions/agent-viewer/detail-scroll.ts";
 import { buildNavigatorTasks, createExpansionState, flattenNavigatorTree } from "../extensions/agent-viewer/navigator.ts";
+
+// overlay.ts statically imports @earendil-works/pi-tui, so both its import
+// and the suite's own specifier bindings must wait for the shim provisioning
+// that importPiTui performs.
+const { truncateToWidth, visibleWidth } = await importPiTui();
+const { NavigatorOverlay } = await import("../extensions/agent-viewer/overlay.ts");
 
 const ROWS = 24;
 const BODY_ROWS = overlayBodyRows(ROWS);

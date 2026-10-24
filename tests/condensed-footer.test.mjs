@@ -21,53 +21,11 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, realpathSync, statSync, symlinkSync, unlinkSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { execFileSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { importPiTui } from "./provision-pi-tui.mjs";
 
-// pi resolves extensions with jiti from its own install tree, so the
-// @earendil-works/pi-tui specifier never resolves under plain node from this
-// repo (no node_modules up-tree). Provision a symlink to pi's scope dir so
-// the extension's runtime import loads the same package pi itself uses. A
-// link left dangling by a pi upgrade fails statSync and is recreated.
-const repoRoot = fileURLToPath(new URL("..", import.meta.url));
-const shim = join(repoRoot, "node_modules", "@earendil-works");
-let shimUsable = false;
-try {
-	shimUsable = statSync(shim).isDirectory();
-} catch {
-	// Missing or dangling: (re)provision below.
-}
-if (!shimUsable) {
-	try {
-		unlinkSync(shim);
-	} catch (error) {
-		if (error.code !== "ENOENT") throw error;
-	}
-	let piRoot = dirname(realpathSync(execFileSync("which", ["pi"], { encoding: "utf8" }).trim()));
-	while (piRoot !== dirname(piRoot) && !existsFollow(join(piRoot, "node_modules", "@earendil-works", "pi-tui"))) {
-		piRoot = dirname(piRoot);
-	}
-	if (!existsFollow(join(piRoot, "node_modules", "@earendil-works", "pi-tui"))) {
-		throw new Error("pi installation with @earendil-works/pi-tui not found; cannot provision test shim");
-	}
-	mkdirSync(join(repoRoot, "node_modules"), { recursive: true });
-	symlinkSync(join(piRoot, "node_modules", "@earendil-works"), shim, "dir");
-}
-
-function existsFollow(path) {
-	try {
-		statSync(path);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
+const { visibleWidth } = await importPiTui();
 const { default: condensedFooter, collectFooterStats, countRunningDetachedJobs, createFooterStatsCache, formatTokens, JOB_POLL_INTERVAL_MS, layoutFooterLine, sanitizeStatusText, shortenCwd, startFooterJobPolling } = await import("../extensions/condensed-footer.ts");
 const { getSharedDispatchState, upsertDetachedJobSnapshot } = await import("../extensions/subagent/registry.ts");
-const { visibleWidth } = await import("@earendil-works/pi-tui");
 
 const identityFg = (_color, text) => text;
 // Real ANSI codes: pi-tui measures them as zero width, like real theme output.

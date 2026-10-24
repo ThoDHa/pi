@@ -10,6 +10,7 @@
 !/tests/
 /tests/*
 !/tests/*.test.mjs
+!/tests/provision-pi-tui.mjs
 /extensions/*
 !/extensions/permission-gate.ts
 !/extensions/protected-paths.ts
