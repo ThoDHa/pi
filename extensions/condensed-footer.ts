@@ -3,14 +3,19 @@
  *
  * Replaces the built-in 3-line footer with a single line:
  *
- *   ~/cwd (branch) Ⓜ extension-statuses    ↑in ↓out $cost N% model[:thinking]
+ *   ~/cwd (branch) Ⓜ extension-statuses    ⏳N ↑in ↓out $cost 45k/200k 45.3% model[:thinking]
  *
  * The right segment is flushed against the terminal's right edge. When the
  * two segments no longer fit at the current width, pieces drop in this
- * order: extension statuses, model, cost, output tokens, branch. `/footer`
+ * order: extension statuses, model, cost, the used/window fragment (the
+ * percent alone stays), output tokens, branch, the jobs marker. `/footer`
  * toggles back to the built-in footer and re-installs this one. The toggle
  * records a user preference that later session starts respect, so a restored
  * built-in footer survives `/new` instead of being replaced again.
+ *
+ * ⏳N counts the subagent extension's detached jobs still running, read
+ * fresh from the shared dispatch state on every frame; a 500 ms render poll
+ * keeps the count live between session entries and is cleared on dispose.
  *
  * The formatters mirror the built-in footer's, whose module the package
  * exports map blocks from importing, so they are carried here.
@@ -19,6 +24,7 @@
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { getSharedDispatchState, type DetachedJobSnapshot } from "./subagent/registry.ts";
 
 /** Token/byte usage shape the footer reads off session entries. */
 export interface FooterUsage {
@@ -46,6 +52,8 @@ export interface FooterStats {
 	inputTokens: number;
 	outputTokens: number;
 	cost: number;
+	contextTokens: number | null;
+	contextWindow: number | null;
 	contextPercent: number | null;
 }
 
@@ -57,7 +65,7 @@ export interface FooterStatsSource {
 		getLeafId(): string | null;
 		getEntryCount(): number;
 	};
-	getContextUsage(): { percent: number | null } | undefined;
+	getContextUsage(): { tokens: number | null; contextWindow: number; percent: number | null } | undefined;
 	model: { id: string } | undefined;
 }
 
@@ -78,13 +86,16 @@ export interface FooterLineInput {
 	inputTokens: number;
 	outputTokens: number;
 	cost: number;
+	contextTokens: number | null;
+	contextWindow: number | null;
 	contextPercent: number | null;
+	runningJobs: number;
 	modelId: string | null;
 	/** Thinking level to append as `:level`; null when the model lacks reasoning. */
 	thinkingLevel: string | null;
 }
 
-export type FooterColor = "dim" | "error" | "warning";
+export type FooterColor = "dim" | "muted" | "accent" | "error" | "warning";
 export type FooterFg = (color: FooterColor, text: string) => string;
 
 export function formatTokens(count: number): string {
@@ -131,7 +142,7 @@ export function createFooterStatsCache(): FooterStatsCache {
 }
 
 /**
- * Accumulate token/cost totals and context percent for the footer. The scan
+ * Accumulate token/cost totals and context usage for the footer. The scan
  * walks the whole session and the footer renders every frame, so results are
  * memoized per (session, leaf, entry count, model) and recomputed only when
  * one of those moves.
@@ -163,11 +174,14 @@ export function collectFooterStats(source: FooterStatsSource, cache: FooterStats
 		totals.cost += usage.cost.total;
 	}
 
+	const usage = source.getContextUsage();
 	const stats: FooterStats = {
 		inputTokens: totals.input,
 		outputTokens: totals.output,
 		cost: totals.cost,
-		contextPercent: source.getContextUsage()?.percent ?? null,
+		contextTokens: usage?.tokens ?? null,
+		contextWindow: usage?.contextWindow ?? null,
+		contextPercent: usage?.percent ?? null,
 	};
 	cache.sessionManager = sessionManager;
 	cache.sessionId = sessionId;
@@ -178,17 +192,54 @@ export function collectFooterStats(source: FooterStatsSource, cache: FooterStats
 	return stats;
 }
 
+export const JOB_POLL_INTERVAL_MS = 500;
+
+/** Count the detached-job snapshots whose job-level status is still running. */
+export function countRunningDetachedJobs(jobs: readonly DetachedJobSnapshot[]): number {
+	let running = 0;
+	for (const job of jobs) {
+		if (job.status === "running") running++;
+	}
+	return running;
+}
+
+/** Start the render poll that carries running-jobs changes to frames between session entries. */
+export function startFooterJobPolling(
+	tui: { requestRender(): void },
+	intervalMs: number = JOB_POLL_INTERVAL_MS,
+): ReturnType<typeof setInterval> {
+	return setInterval(() => tui.requestRender(), intervalMs);
+}
+
 const MIN_SEGMENT_GAP = 2;
+
+/** `used/window percent` (e.g. `45k/200k 45.3%`), `?/200k ?` post-compaction, bare percent without a window. */
+function formatContextCluster(
+	tokens: number | null,
+	window: number | null,
+	percent: number | null,
+	includeWindow: boolean,
+): string {
+	const percentText = percent === null ? "?" : `${percent.toFixed(1)}%`;
+	if (!includeWindow || window === null) return percentText;
+	const used = tokens === null ? "?" : formatTokens(tokens);
+	return `${used}/${formatTokens(window)} ${percentText}`;
+}
 
 /**
  * Lay the footer out as exactly one line no wider than `width`: left segment
- * (cwd, branch, statuses) and right segment (tokens, cost, percent, model)
- * joined by enough padding to flush the right segment against the edge. When
- * they cannot coexist, pieces drop in order statuses, model, cost, output,
- * branch, and the result is width-truncated as a final floor.
+ * (cwd, branch, statuses) and right segment (jobs marker, tokens, cost,
+ * context cluster, model) joined by enough padding to flush the right
+ * segment against the edge. When they cannot coexist, pieces drop in order
+ * statuses, model, cost, the used/window fragment, output, branch, jobs, and
+ * the result is width-truncated as a final floor. Cwd, input tokens, and the
+ * percent never drop.
  *
- * `fg` receives only "dim", "error", and "warning"; the percent turns warning
- * above 70% and error above 90%.
+ * `fg` receives "dim", "muted", "accent", "error", and "warning": statuses
+ * pass through with their owner's colors, the jobs marker warns while jobs
+ * run, the context cluster turns warning above 70% and error above 90%
+ * (muted otherwise), the model takes the theme's accent, branch and token
+ * counts are muted, and cwd is dim.
  */
 export function layoutFooterLine(input: FooterLineInput, width: number, fg: FooterFg): string {
 	const statuses = input.statuses.map(sanitizeStatusText).filter((text) => text.length > 0).join(" ") || null;
@@ -196,20 +247,24 @@ export function layoutFooterLine(input: FooterLineInput, width: number, fg: Foot
 	const up = input.inputTokens > 0 ? `↑${formatTokens(input.inputTokens)}` : null;
 	const down = input.outputTokens > 0 ? `↓${formatTokens(input.outputTokens)}` : null;
 	const cost = input.cost > 0 ? `$${input.cost.toFixed(3)}` : null;
-	const percent = input.contextPercent === null ? "?" : `${input.contextPercent.toFixed(1)}%`;
+	const jobs = input.runningJobs > 0 ? `⏳${input.runningJobs}` : null;
 	const model =
 		input.modelId === null ? "no-model" : input.thinkingLevel ? `${input.modelId}:${input.thinkingLevel}` : input.modelId;
 
 	let leftStatuses = statuses;
 	let leftBranch = branch;
+	let rightJobs = jobs;
 	let rightUp = up;
 	let rightDown = down;
 	let rightCost = cost;
+	let showWindow = true;
 	let rightModel = model;
 
 	const leftPlain = (): string => [input.cwd, leftBranch, leftStatuses].filter((part) => part !== null).join(" ");
+	const clusterPlain = (): string =>
+		formatContextCluster(input.contextTokens, input.contextWindow, input.contextPercent, showWindow);
 	const rightPlain = (): string =>
-		[rightUp, rightDown, rightCost, percent, rightModel].filter((part) => part !== null).join(" ");
+		[rightJobs, rightUp, rightDown, rightCost, clusterPlain(), rightModel].filter((part) => part !== null).join(" ");
 	const fits = (): boolean => visibleWidth(leftPlain()) + MIN_SEGMENT_GAP + visibleWidth(rightPlain()) <= width;
 
 	if (!fits()) {
@@ -217,25 +272,39 @@ export function layoutFooterLine(input: FooterLineInput, width: number, fg: Foot
 			() => (leftStatuses = null),
 			() => (rightModel = null),
 			() => (rightCost = null),
+			() => (showWindow = false),
 			() => (rightDown = null),
 			() => (leftBranch = null),
+			() => (rightJobs = null),
 		]) {
 			drop();
 			if (fits()) break;
 		}
 	}
 
-	const left = leftPlain();
-	const right = rightPlain();
+	const leftParts = [fg("dim", input.cwd)];
+	if (leftBranch !== null) leftParts.push(fg("muted", leftBranch));
+	if (leftStatuses !== null) leftParts.push(leftStatuses);
+	const rightParts: string[] = [];
+	if (rightJobs !== null) rightParts.push(fg("warning", rightJobs));
+	if (rightUp !== null) rightParts.push(fg("muted", rightUp));
+	if (rightDown !== null) rightParts.push(fg("muted", rightDown));
+	if (rightCost !== null) rightParts.push(fg("muted", rightCost));
+	const clusterColor: FooterColor =
+		input.contextPercent === null
+			? "muted"
+			: input.contextPercent > 90
+				? "error"
+				: input.contextPercent > 70
+					? "warning"
+					: "muted";
+	rightParts.push(fg(clusterColor, clusterPlain()));
+	if (rightModel !== null) rightParts.push(fg("accent", rightModel));
+
+	const left = leftParts.join(" ");
+	const right = rightParts.join(" ");
 	const gap = " ".repeat(Math.max(MIN_SEGMENT_GAP, width - visibleWidth(left) - visibleWidth(right)));
-	const percentColor: FooterColor | null =
-		input.contextPercent === null ? null : input.contextPercent > 90 ? "error" : input.contextPercent > 70 ? "warning" : null;
-	const pre = [rightUp, rightDown, rightCost].filter((part) => part !== null).join(" ");
-	const post = rightModel ?? "";
-	const styledRight = percentColor
-		? [pre && fg("dim", pre), fg(percentColor, percent), post && fg("dim", post)].filter(Boolean).join(" ")
-		: fg("dim", right);
-	return truncateToWidth(fg("dim", left) + gap + styledRight, width);
+	return truncateToWidth(left + gap + right, width);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -245,10 +314,15 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setFooter((tui, theme, footerData) => {
 			const cache = createFooterStatsCache();
 			const unsubscribe = footerData.onBranchChange(() => tui.requestRender());
+			const poll = startFooterJobPolling(tui);
 			return {
-				dispose: unsubscribe,
+				dispose() {
+					unsubscribe();
+					clearInterval(poll);
+				},
 				render(width: number): string[] {
 					const stats = collectFooterStats(ctx, cache);
+					const runningJobs = countRunningDetachedJobs(getSharedDispatchState().detachedJobs);
 					return [
 						layoutFooterLine(
 							{
@@ -260,7 +334,10 @@ export default function (pi: ExtensionAPI) {
 								inputTokens: stats.inputTokens,
 								outputTokens: stats.outputTokens,
 								cost: stats.cost,
+								contextTokens: stats.contextTokens,
+								contextWindow: stats.contextWindow,
 								contextPercent: stats.contextPercent,
+								runningJobs,
 								modelId: ctx.model?.id ?? null,
 								thinkingLevel: ctx.model?.reasoning ? (ctx.thinkingLevel ?? "off") : null,
 							},
