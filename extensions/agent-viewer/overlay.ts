@@ -7,15 +7,36 @@
  * footer of keybind hints. Reads the shared dispatch state on a poll
  * interval (doom-overlay pattern: interval plus requestRender, cleared
  * in dispose) and renders through the theme with the fleet glyph
- * conventions. Strictly read-only: the fixed v1 keys move the cursor
- * and collapse or expand; nothing steers a dispatch. Escape resolves
- * done(undefined), which pi turns into closing the overlay.
+ * conventions. Strictly read-only: the fixed v1 keys move the cursor,
+ * collapse or expand, and page the detail pane; nothing steers a
+ * dispatch. Escape resolves done(undefined), which pi turns into
+ * closing the overlay.
  */
 
 import type { Theme, TUI } from "@earendil-works/pi-coding-agent";
 import { CURSOR_MARKER, type Component, type Focusable, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { HStack, Text, VStack } from "@earendil-works/pi-tui";
 import { statusGlyph, type DetachedJobSnapshot, type DispatchRegistry } from "../subagent/registry.ts";
+import {
+	BLANK_LINE_KEY,
+	HEADER_LINE_KEY,
+	PLACEHOLDER_LINE_KEY,
+	RESULT_LINE_KEY,
+	SCROLL_NEW_INDICATOR,
+	USAGE_LINE_KEY,
+	type DetailLine,
+	type DetailScrollState,
+	activityLineKey,
+	createDetailScrollState,
+	detailWindow,
+	fieldLineKey,
+	memberLineKey,
+	overlayBodyRows,
+	pageStepRows,
+	scrollDetailBy,
+	scrollDetailTo,
+	stabilizeDetailScroll,
+} from "./detail-scroll.ts";
 import {
 	buildNavigatorTasks,
 	createExpansionState,
@@ -41,10 +62,10 @@ export interface NavigatorSources {
 const TREE_PANE_MIN_WIDTH = 26;
 const DETAIL_PANE_MIN_WIDTH = 30;
 const PANE_GAP = 3;
-/** Body rows kept before a "+N more" tail line; the overlay's maxHeight clips beyond this too. */
-const MAX_BODY_ROWS = 40;
 
-const FOOTER_HINTS = "↑/↓ move · ←/→ collapse/expand · tab next task · esc close";
+const FOOTER_HINTS = "↑/↓ move · ←/→ collapse/expand · tab next task · pgup/pgdn scroll · esc close";
+
+const BLANK_DETAIL_LINE: DetailLine = { text: "", key: BLANK_LINE_KEY };
 
 function formatClock(at: number): string {
 	const date = new Date(at);
@@ -61,6 +82,7 @@ export class NavigatorOverlay implements Focusable {
 	private expansion: NavigatorExpansionState = createExpansionState();
 	private selectedId: string | null = null;
 	private selectedIndex = 0;
+	private scroll: DetailScrollState = createDetailScrollState();
 	private interval: ReturnType<typeof setInterval> | null = null;
 	private readonly tui: TUI;
 	private readonly theme: Theme;
@@ -94,14 +116,14 @@ export class NavigatorOverlay implements Focusable {
 		this.tasks = buildNavigatorTasks(this.sources.registry, this.sources.detachedJobs, Date.now());
 		this.rows = flattenNavigatorTree(this.tasks, this.expansion);
 		if (this.rows.length === 0) {
-			this.selectedId = null;
 			this.selectedIndex = 0;
+			this.adoptSelection(null);
 			return;
 		}
 		const stillVisible = this.selectedId !== null && this.rows.some((row) => row.id === this.selectedId);
 		if (!stillVisible) {
 			this.selectedIndex = Math.min(this.selectedIndex, this.rows.length - 1);
-			this.selectedId = this.rows[this.selectedIndex].id;
+			this.adoptSelection(this.rows[this.selectedIndex].id);
 			return;
 		}
 		this.selectedIndex = this.rows.findIndex((row) => row.id === this.selectedId);
@@ -111,7 +133,13 @@ export class NavigatorOverlay implements Focusable {
 		const row = this.rows[index];
 		if (!row) return;
 		this.selectedIndex = index;
-		this.selectedId = row.id;
+		this.adoptSelection(row.id);
+	}
+
+	/** Re-anchor the detail window when the selection identity changes: a different row is different content, so a held window cannot carry over. */
+	private adoptSelection(id: string | null): void {
+		if (id !== this.selectedId) this.scroll = createDetailScrollState();
+		this.selectedId = id;
 	}
 
 	handleInput(data: string): void {
@@ -143,6 +171,22 @@ export class NavigatorOverlay implements Focusable {
 			this.toggleRow(true);
 			return;
 		}
+		if (matchesKey(data, "pageUp")) {
+			this.pageDetail(-1);
+			return;
+		}
+		if (matchesKey(data, "pageDown")) {
+			this.pageDetail(1);
+			return;
+		}
+		if (matchesKey(data, "home")) {
+			this.jumpDetail(0);
+			return;
+		}
+		if (matchesKey(data, "end")) {
+			this.jumpDetail(Number.POSITIVE_INFINITY);
+			return;
+		}
 	}
 
 	/** left collapses, right expands; the row semantics live in the pure toggleNavigatorRow (suite-pinned), the component only dispatches keys and re-reads. */
@@ -151,6 +195,34 @@ export class NavigatorOverlay implements Focusable {
 		if (!row) return;
 		toggleNavigatorRow(this.expansion, row, expand);
 		this.refresh();
+	}
+
+	/** Page the detail pane one viewport (minus its overlap line) up or down; the tail-following state lives in the pure DetailScrollState. */
+	private pageDetail(direction: -1 | 1): void {
+		const viewport = this.detailViewportRows(overlayBodyRows(this.tui.terminal.rows));
+		scrollDetailBy(this.scroll, direction * pageStepRows(viewport), this.detailKeys(), viewport);
+	}
+
+	/** Jump the detail pane to a line index (clamped; Infinity lands on the tail). */
+	private jumpDetail(target: number): void {
+		const viewport = this.detailViewportRows(overlayBodyRows(this.tui.terminal.rows));
+		scrollDetailTo(this.scroll, target, this.detailKeys(), viewport);
+	}
+
+	/**
+	 * Detail-pane viewport rows for the current frame: the body budget
+	 * minus the row the tree's +N more clip occupies while the tree
+	 * overflows, so the window and its indicator always fit the rows
+	 * the frame actually shows. A scroll computed against a shorter
+	 * tree runs on the stale larger budget until the next render's
+	 * clamp, self-correcting within one poll.
+	 */
+	private detailViewportRows(bodyRows: number): number {
+		return this.rows.length > bodyRows ? bodyRows - 1 : bodyRows;
+	}
+
+	private detailKeys(): string[] {
+		return this.renderDetailLines().map((line) => line.key);
 	}
 
 	private renderTreeRow(row: NavigatorRow): string {
@@ -169,34 +241,51 @@ export class NavigatorOverlay implements Focusable {
 		return selected && this.focused ? line + CURSOR_MARKER : line;
 	}
 
-	private renderDetailLines(): string[] {
+	private renderDetailLines(): DetailLine[] {
 		const theme = this.theme;
 		const selected = this.rows.find((row) => row.id === this.selectedId) ?? null;
 		const model = resolveDetailModel(selected, this.tasks);
-		if (model.kind === "empty") return [theme.fg("muted", "No dispatches yet")];
-		const lines: string[] = [];
+		if (model.kind === "empty") return [{ text: theme.fg("muted", "No dispatches yet"), key: PLACEHOLDER_LINE_KEY }];
+		const lines: DetailLine[] = [];
 		const titleGlyph = theme.fg(GLYPH_COLORS[selected.glyph], statusGlyph(selected.glyph));
-		lines.push(`${titleGlyph} ${theme.fg("toolTitle", theme.bold(model.title))} ${theme.fg("muted", model.statusText)}`);
+		lines.push({
+			text: `${titleGlyph} ${theme.fg("toolTitle", theme.bold(model.title))} ${theme.fg("muted", model.statusText)}`,
+			key: HEADER_LINE_KEY,
+		});
 		for (const field of model.fields) {
-			lines.push(`${theme.fg("muted", `${field.label}:`)} ${theme.fg("dim", field.value)}`);
+			lines.push({
+				text: `${theme.fg("muted", `${field.label}:`)} ${theme.fg("dim", field.value)}`,
+				key: fieldLineKey(field.label),
+			});
 		}
 		if (model.members.length > 0) {
-			lines.push("");
-			for (const member of model.members) {
-				lines.push(`${theme.fg(GLYPH_COLORS[member.glyph], statusGlyph(member.glyph))} ${theme.fg("toolTitle", member.label)} ${theme.fg("muted", `· ${member.detail}`)}`);
+			lines.push(BLANK_DETAIL_LINE);
+			for (const [memberIndex, member] of model.members.entries()) {
+				lines.push({
+					text: `${theme.fg(GLYPH_COLORS[member.glyph], statusGlyph(member.glyph))} ${theme.fg("toolTitle", member.label)} ${theme.fg("muted", `· ${member.detail}`)}`,
+					key: memberLineKey(memberIndex),
+				});
 			}
 		}
 		if (model.activity.length > 0) {
-			lines.push("");
+			lines.push(BLANK_DETAIL_LINE);
 			for (const entry of model.activity) {
 				const clock = theme.fg("muted", entry.at ? formatClock(entry.at) : "--:--:--");
-				lines.push(`${clock} ${theme.fg(entry.kind === "toolCall" ? "toolOutput" : "dim", entry.text)}`);
+				lines.push({
+					text: `${clock} ${theme.fg(entry.kind === "toolCall" ? "toolOutput" : "dim", entry.text)}`,
+					key: activityLineKey(entry),
+				});
 			}
 		}
-		if (model.usageText) lines.push("", theme.fg("muted", model.usageText));
+		if (model.usageText) {
+			lines.push(BLANK_DETAIL_LINE, { text: theme.fg("muted", model.usageText), key: USAGE_LINE_KEY });
+		}
 		if (model.resultText) {
 			const failed = model.resultText.startsWith("failed");
-			lines.push(theme.fg(failed ? "error" : "success", `${failed ? "✗" : "✓"} ${model.resultText}`));
+			lines.push({
+				text: theme.fg(failed ? "error" : "success", `${failed ? "✗" : "✓"} ${model.resultText}`),
+				key: RESULT_LINE_KEY,
+			});
 		}
 		return lines;
 	}
@@ -207,17 +296,25 @@ export class NavigatorOverlay implements Focusable {
 		const treeW = Math.max(TREE_PANE_MIN_WIDTH, Math.floor(innerW * 0.44));
 		const detailW = innerW - treeW - PANE_GAP;
 
+		const bodyRows = overlayBodyRows(this.tui.terminal.rows);
 		const treeRows = this.rows.map((row) => this.renderTreeRow(row));
 		const detailLines = this.renderDetailLines();
-		const omitted = Math.max(treeRows.length, detailLines.length) - MAX_BODY_ROWS;
+		const keys = detailLines.map((line) => line.key);
+		const viewport = this.detailViewportRows(bodyRows);
+		stabilizeDetailScroll(this.scroll, keys, viewport);
+		const visible = detailWindow(this.scroll, keys, viewport);
+		const detailTexts = detailLines.slice(visible.start, visible.end).map((line) => line.text);
+		if (visible.newOutput) detailTexts.push(theme.fg("muted", SCROLL_NEW_INDICATOR));
+
+		const omitted = Math.max(0, treeRows.length - bodyRows);
 		const body = new HStack(
 			[
 				{ component: new VStack(treeRows.map((line) => new Text(line, 0, 0))), basis: treeW },
-				{ component: new VStack(detailLines.map((line) => new Text(line, 0, 0))), basis: detailW },
+				{ component: new VStack(detailTexts.map((line) => new Text(line, 0, 0))), basis: detailW },
 			],
 			{ gap: PANE_GAP, align: "start" },
 		).render(innerW);
-		const clipped = omitted > 0 ? body.slice(0, MAX_BODY_ROWS - 1) : body;
+		const clipped = omitted > 0 ? body.slice(0, bodyRows - 1) : body;
 		if (omitted > 0) clipped.push(theme.fg("muted", `… +${omitted} more`));
 
 		const pad = (text: string, target: number) => text + " ".repeat(Math.max(0, target - visibleWidth(text)));
