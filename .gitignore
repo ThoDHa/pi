@@ -13,5 +13,6 @@
 /extensions/*
 !/extensions/permission-gate.ts
 !/extensions/protected-paths.ts
+!/extensions/condensed-footer.ts
 !/extensions/subagent/
 !/extensions/agent-viewer/
