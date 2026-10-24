@@ -13,7 +13,8 @@
  * never yank it, with static lines keyed on structural slots so a
  * mutating field's text never evicts the hold; a held top line aging
  * out of the log clamps without reacquiring; paging to the bottom,
- * end, and home behaviors; the indicator suppressing once the window
+ * end, and home behaviors; a hold the resize clamped onto the tail
+ * re-following on pageDown; the indicator suppressing once the window
  * itself reaches the newest line; short content keeping every scroll
  * key neutral; and the body-budget arithmetic shared with the view
  * frame.
@@ -269,6 +270,23 @@ function heldState(keys, viewport) {
 	assert.equal(state.following, false, "the hold survives the resize");
 	assert.equal(tall.end, grown.length, "the window shows the full tail");
 	assert.equal(tall.newOutput, false, "the marker suppresses once the newest line is visible");
+}
+
+// --- reacquire by intent: pageDown at a hold the resize clamped onto the tail re-follows ---
+
+{
+	const keys = keysOf(60, "line-");
+	const grown = [...keys, "line-60", "line-61"];
+	const state = heldState(keys, VIEWPORT);
+	stabilizeDetailScroll(state, grown, 30);
+	assert.equal(state.following, false, "the taller resize keeps the hold held");
+	assert.equal(state.scrollTop, 32, "the taller viewport clamps the held window onto the tail");
+	scrollDetailBy(state, pageStepRows(30), grown, 30);
+	assert.equal(state.following, true, "pageDown at the clamped tail reacquires the follow");
+	assert.equal(state.scrollTop, 32, "the reacquired window rests on the tail");
+	assert.equal(state.heldTopKey, null, "reacquiring clears the top anchor");
+	assert.equal(state.heldTailKey, null, "reacquiring clears the tail anchor");
+	assert.equal(detailWindow(state, grown, 30).newOutput, false, "the indicator stays clear after the reacquire");
 }
 
 // --- short content: every scroll key is a clamped no-op ---

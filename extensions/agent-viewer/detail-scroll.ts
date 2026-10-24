@@ -137,11 +137,13 @@ function tailKey(keys: readonly string[]): string | null {
  * Move the window by delta lines (negative up, positive down) over the
  * rebuilt line list. An effective upward move releases the follow and
  * begins a hold anchored on the new top line; a downward move that
- * reaches the tail reacquires the follow and clears the hold. Moves
- * that cannot change the window (content fitting the viewport, a hold
- * already at its target, a following window paged down) are no-ops
- * that leave the hold keys untouched, so short content keeps every
- * scroll key neutral.
+ * reaches the tail reacquires the follow and clears the hold, including
+ * a hold already parked at the tail (a taller viewport clamps one
+ * there), so paging down there is the user asking to re-follow. Moves
+ * that cannot change the window (content fitting the viewport, a held
+ * window paged down while short of the tail, a following window paged
+ * down) are no-ops that leave the hold keys untouched, so short content
+ * keeps every scroll key neutral.
  */
 export function scrollDetailBy(state: DetailScrollState, delta: number, keys: readonly string[], viewportRows: number): void {
 	if (delta === 0 || keys.length === 0) return;
@@ -157,7 +159,7 @@ export function scrollDetailBy(state: DetailScrollState, delta: number, keys: re
 		if (release) state.heldTailKey = tailKey(keys);
 		return;
 	}
-	if (state.following || next === state.scrollTop) return;
+	if (state.following) return;
 	if (next >= maxTop) {
 		state.following = true;
 		state.scrollTop = maxTop;
@@ -165,6 +167,7 @@ export function scrollDetailBy(state: DetailScrollState, delta: number, keys: re
 		state.heldTailKey = null;
 		return;
 	}
+	if (next === state.scrollTop) return;
 	state.scrollTop = next;
 	state.heldTopKey = keys[next] ?? null;
 }

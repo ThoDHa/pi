@@ -24,7 +24,8 @@
  * their rows above settled ones; tree overflow budgets the window one
  * row short so the newest line and the indicator survive the +N more
  * clip; a taller resize while held suppresses the marker once the
- * tail is actually visible; tree toggling is unchanged; short content
+ * tail is actually visible and the following pageDown re-acquires the
+ * follow; tree toggling is unchanged; short content
  * keeps the scroll keys as no-ops; escape resolves the done callback;
  * and the hints line truncates instead of overflowing a narrow width.
  */
@@ -441,6 +442,10 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		assert.ok(resizedRender.includes("log line 30"), "the grown window shows the full tail");
 		assert.ok(!resizedRender.includes(SCROLL_NEW_INDICATOR), "the marker suppresses once the newest line is visible");
 		assert.equal(view.scroll.following, false, "the resize does not silently reacquire the follow");
+
+		view.handleInput(PAGE_DOWN);
+		assert.equal(view.scroll.following, true, "pageDown at the clamped tail reacquires the follow by intent");
+		assert.equal(view.scroll.heldTopKey, null, "the reacquire clears the hold");
 	}, tui);
 }
 
