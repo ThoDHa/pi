@@ -202,12 +202,10 @@ export function buildStripTasks(
 	}
 
 	for (const job of jobs) {
-		const glyph: "running" | "done" | "failed" =
-			job.status === "done" ? "done" : job.status === "failed" ? "failed" : "running";
 		const fallbackEnd = job.finishedAt ?? now;
 		const entries: StripAgentEntry[] = job.agents
 			? job.agents.map((node) => agentEntry(node, fallbackEnd))
-			: job.agentNames.map((name) => ({ kind: "agent", name, glyph, durationText: formatDuration(fallbackEnd - job.startedAt) }));
+			: job.agentNames.map((name) => ({ kind: "agent", name, glyph: job.status, durationText: formatDuration(fallbackEnd - job.startedAt) }));
 		views.push({
 			label: resolveTaskLabel(job.taskPreview) || "(detached)",
 			mode: job.mode,
