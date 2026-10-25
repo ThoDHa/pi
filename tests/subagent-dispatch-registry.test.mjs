@@ -31,9 +31,13 @@ import {
 	createDispatchRegistry,
 	extractActivityLog,
 	extractLastActivity,
+	extractThinkingEntries,
+	extractThinkingLog,
 	formatUsageSummary,
 	getSharedDispatchState,
 	mergeAgentUpdate,
+	THINKING_LOG_MAX_BLOCKS,
+	THINKING_LOG_MAX_BYTES,
 	upsertDetachedJobSnapshot,
 } from "../extensions/subagent/registry.ts";
 
@@ -318,6 +322,99 @@ const sparseMixed = [
 ];
 assert.deepEqual(extractActivityLog(sparseMixed), forwardActivityLog(sparseMixed), "identity under the cap with untimed and thinking-only messages");
 
+// --- extractThinkingLog: full-text thinking entries for the navigator's thinking view ---
+
+assert.deepEqual(extractThinkingLog([]), []);
+assert.deepEqual(extractThinkingEntries([], Infinity, Infinity), []);
+
+const mixedStream = [
+	{ role: "user", content: [{ type: "text", text: "prompt" }] },
+	{
+		role: "assistant",
+		timestamp: 1_000,
+		content: [
+			{ type: "thinking", thinking: "" },
+			{ type: "thinking", thinkingSignature: "redacted" },
+			{ type: "thinking" },
+			{ type: "thinking", thinking: "first thought\nsecond line" },
+			{ type: "toolCall", name: "bash", arguments: { command: "rg alpha" } },
+			{ type: "text", text: "visible text" },
+		],
+	},
+	{
+		role: "assistant",
+		content: [{ type: "thinking", thinking: "untimed thought" }],
+	},
+	{
+		role: "assistant",
+		timestamp: 2_000,
+		content: [{ type: "thinking", thinking: "latest thought" }],
+	},
+];
+assert.deepEqual(extractThinkingLog(mixedStream), [
+	{ at: 1_000, text: "first thought\nsecond line" },
+	{ at: 0, text: "untimed thought" },
+	{ at: 2_000, text: "latest thought" },
+], "one full-text entry per non-blank thinking part, in stream order, stamped with the message timestamp");
+assert.deepEqual(
+	extractThinkingLog([{ role: "assistant", content: [{ type: "toolCall", name: "bash" }, { type: "text", text: "words" }] }]),
+	[],
+	"text and toolCall parts contribute no thinking entries",
+);
+
+// Full text is the contract: no truncation, no whitespace collapsing.
+const longThought = `\tponder  line one\n\n${"x".repeat(5_000)}`;
+assert.deepEqual(
+	extractThinkingLog([{ role: "assistant", timestamp: 5, content: [{ type: "thinking", thinking: longThought }] }]),
+	[{ at: 5, text: longThought }],
+);
+
+// --- extractThinkingLog: the block-count and byte caps keep the most recent blocks ---
+
+const block = (index) => ({
+	role: "assistant",
+	timestamp: index,
+	content: [{ type: "thinking", thinking: `thought ${index}` }],
+});
+const floodedThoughts = extractThinkingLog(Array.from({ length: THINKING_LOG_MAX_BLOCKS + 5 }, (_, i) => block(i)));
+assert.equal(floodedThoughts.length, THINKING_LOG_MAX_BLOCKS, "the thinking log is capped at the block count");
+assert.equal(floodedThoughts[0].text, `thought ${5}`, "the cap keeps the most recent blocks");
+assert.equal(floodedThoughts[THINKING_LOG_MAX_BLOCKS - 1].text, `thought ${THINKING_LOG_MAX_BLOCKS + 4}`);
+
+const tenKb = "a".repeat(10_000);
+const sized = (index) => ({
+	role: "assistant",
+	timestamp: index,
+	content: [{ type: "thinking", thinking: tenKb }],
+});
+const byteCapped = extractThinkingLog(Array.from({ length: 8 }, (_, i) => sized(i)));
+assert.equal(byteCapped.length, 6, "the byte cap drops the oldest whole blocks: 7 blocks would reach 70 KB over the 64 KB cap");
+assert.deepEqual(byteCapped[0], { at: 2, text: tenKb });
+assert.equal(byteCapped[5].at, 7);
+
+const exactFit = extractThinkingLog(Array.from({ length: 4 }, (_, i) => ({
+	role: "assistant",
+	timestamp: i,
+	content: [{ type: "thinking", thinking: "b".repeat(THINKING_LOG_MAX_BYTES / 4) }],
+})));
+assert.equal(exactFit.length, 4, "blocks summing to exactly the byte cap all survive");
+
+const overFit = extractThinkingLog([
+	{ role: "assistant", timestamp: 0, content: [{ type: "thinking", thinking: "c".repeat(THINKING_LOG_MAX_BYTES) }] },
+	{ role: "assistant", timestamp: 1, content: [{ type: "thinking", thinking: "d".repeat(THINKING_LOG_MAX_BYTES) }] },
+]);
+assert.equal(overFit.length, 1, "a block that would cross the byte cap is excluded whole");
+assert.equal(overFit[0].at, 1, "the newest of the oversized pair survives");
+
+const singleOversized = extractThinkingLog([
+	{ role: "assistant", timestamp: 3, content: [{ type: "thinking", thinking: "e".repeat(THINKING_LOG_MAX_BYTES * 2) }] },
+]);
+assert.equal(singleOversized.length, 1, "the newest block is retained even when it alone exceeds the byte cap");
+
+const uncapped = extractThinkingEntries(Array.from({ length: 30 }, (_, i) => block(i)), Infinity, Infinity);
+assert.equal(uncapped.length, 30, "infinite caps disable both bounds for the transcript reader");
+assert.equal(uncapped[0].text, "thought 0");
+
 // --- mergeAgentUpdate: the defined-field merge both publishers share ---
 
 const mergedNode = { agent: "worker", status: "running", startedAt: NOW };
@@ -335,6 +432,24 @@ mergeAgentUpdate(mergedNode, { status: "done", finishedAt: NOW + 5_000, lastActi
 assert.equal(mergedNode.status, "done");
 assert.equal(mergedNode.finishedAt, NOW + 5_000);
 assert.equal(mergedNode.lastActivity, "$ rg pattern", "undefined update fields never clobber node fields");
+
+mergeAgentUpdate(mergedNode, { thinkingLog: [{ at: NOW, text: "weighed the options" }] });
+assert.deepEqual(mergedNode.thinkingLog, [{ at: NOW, text: "weighed the options" }], "the thinking log merges like every other defined field");
+mergeAgentUpdate(mergedNode, { thinkingLog: [{ at: NOW + 1, text: "revised thought" }] });
+assert.deepEqual(mergedNode.thinkingLog, [{ at: NOW + 1, text: "revised thought" }], "a fresh thinking log replaces the stale one");
+
+// registry.updateAgent merges through the same helper: a thinking-log
+// update lands on the registry node like every other defined field.
+const thinkingRegistry = createDispatchRegistry();
+const thinkingTask = thinkingRegistry.startTask({ mode: "single", prompt: "p", now: NOW });
+thinkingRegistry.startRound(thinkingTask.id, [{ agent: "dreamer" }], NOW);
+thinkingRegistry.updateAgent(thinkingTask.id, 1, 0, {
+	thinkingLog: [{ at: NOW, text: "live thought" }],
+});
+assert.deepEqual(
+	thinkingRegistry.getTask(thinkingTask.id)?.rounds[0]?.agents[0]?.thinkingLog,
+	[{ at: NOW, text: "live thought" }],
+);
 
 // registry.updateAgent merges through the same helper: an activity-array
 // update lands on the registry node like every other defined field.

@@ -38,6 +38,7 @@ import { releasePromptDir, writePromptToTempFile } from "./prompt-temp.ts";
 import {
 	extractActivityLog,
 	extractLastActivity,
+	extractThinkingLog,
 	formatDuration,
 	formatUsageSummary,
 	getSharedDispatchState,
@@ -232,6 +233,7 @@ function agentUpdateFromResult(result: SingleResult, cwd: string | undefined, no
 		status: !finished ? "running" : isFailedResult(result) ? "failed" : "done",
 		lastActivity: extractLastActivity(result.messages),
 		activity: extractActivityLog(result.messages),
+		thinkingLog: extractThinkingLog(result.messages),
 		model: result.model,
 		cwd,
 		usage: { ...result.usage },

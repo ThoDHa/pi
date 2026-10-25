@@ -20,16 +20,20 @@
  *
  * A left tree pane of rows produced by the pure flatten function in
  * navigator.ts, a right detail pane streaming the selected agent's
- * activity, a header line carrying the tool-noise filter state, and
- * a hints line at the bottom; there is no box border because while
+ * activity plus its full-text thinking (a live section fed by the
+ * dispatch registry's bounded thinkingLog), a header line carrying
+ * the tool-noise filter state, and a hints line at the bottom; there is
+ * no box border because while
  * open the view is the whole screen, not a floating card. Reads the
  * shared dispatch state on a poll interval (doom-overlay pattern:
  * interval plus requestRender, cleared in dispose) and renders
  * through the theme with the fleet glyph conventions. Strictly
- * read-only: the fixed v1 keys move the cursor, collapse or expand,
- * page the detail pane, and toggle tool-noise visibility, and in
- * fullscreen mode the mouse wheel scrolls the detail pane through the
- * same scroll model; nothing steers a dispatch.
+ * read-only over dispatches: the fixed v1 keys move the cursor,
+ * collapse or expand, page the detail pane, toggle tool-noise
+ * visibility, and open the selected finished agent's full thinking
+ * from the session transcript (t), and in fullscreen mode the mouse
+ * wheel scrolls the detail pane through the same scroll model; nothing
+ * steers a dispatch.
  *
  * In fullscreen mode pi's alt-screen dispatcher offers normalized
  * wheel events to the overlay, coordinates localized to the view's
@@ -57,10 +61,11 @@
  */
 
 import type { KeybindingsManager, Theme, TUI } from "@earendil-works/pi-coding-agent";
+import { readFileSync } from "node:fs";
 import { CURSOR_MARKER, type Focusable, type KeyId, type Keybinding, type TuiMouseEvent, type TuiMouseEventResult, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { HStack, Text, VStack } from "@earendil-works/pi-tui";
 import { filterActivityEntries } from "./activity-filter.ts";
-import { statusGlyph, type DetachedJobSnapshot, type DispatchRegistry } from "../subagent/registry.ts";
+import { statusGlyph, type DetachedJobSnapshot, type DispatchRegistry, type DispatchThinkingEntry } from "../subagent/registry.ts";
 import {
 	BLANK_LINE_KEY,
 	HEADER_LINE_KEY,
@@ -84,6 +89,7 @@ import {
 import {
 	buildNavigatorTasks,
 	createExpansionState,
+	extractTranscriptThinking,
 	flattenNavigatorTree,
 	moveCursor,
 	nextTaskRow,
@@ -101,13 +107,20 @@ export const NAVIGATOR_POLL_INTERVAL_MS = 300;
 export interface NavigatorSources {
 	registry: DispatchRegistry;
 	detachedJobs: DetachedJobSnapshot[];
+	/**
+	 * Resolves the current session's .jsonl path for the t keybinding's
+	 * transcript read; absent or undefined-yielding means no transcript
+	 * is trackable and t renders a note instead. Wired from the
+	 * shortcut handler's ctx.sessionManager.getSessionFile().
+	 */
+	sessionFile?: () => string | undefined;
 }
 
 const TREE_PANE_MIN_WIDTH = 26;
 const DETAIL_PANE_MIN_WIDTH = 30;
 const PANE_GAP = 3;
 
-const HINTS_LINE = "↑/↓ move · ←/→ collapse/expand · tab next task · pgup/pgdn scroll · ctrl+t tools · esc close";
+const HINTS_LINE = "↑/↓ move · ←/→ collapse/expand · tab next task · pgup/pgdn scroll · ctrl+t tools · t thinking · esc close";
 
 /**
  * Per-event wheel ceiling in detail lines: above the stack's largest
@@ -125,12 +138,59 @@ export const WHEEL_MAX_DELTA_LINES = 30;
 /** Marker prefixing a thinking line, so thought reads as thought and not as streamed output. */
 const THINKING_MARKER = "…";
 
+/** Label heading the live thinking section below the activity log. */
+const THINKING_SECTION_LABEL = "thinking · live";
+
+/** Label heading the transcript reading view the t keybinding opens. */
+const TRANSCRIPT_SECTION_LABEL = "full thinking · transcript · t to return";
+
+/** Note rendered when the transcript cannot be read (no tracking, no file). */
+const TRANSCRIPT_UNAVAILABLE_NOTE = "session transcript unavailable";
+
+/** Note when the transcript holds no record for the agent: the record is absent, not the thinking. */
+const TRANSCRIPT_NO_RECORD_NOTE = "no transcript record for this agent";
+
+/** The no-record note when the agent's live buffer holds thinking: the buffer stands in for the missing record. */
+const TRANSCRIPT_NO_RECORD_LIVE_NOTE = `${TRANSCRIPT_NO_RECORD_NOTE}; showing live buffer`;
+
+/** Note when the agent's transcript record exists but holds no thinking: the record's emptiness, named without denying the record. */
+const TRANSCRIPT_RECORD_NO_THINKING_NOTE = "this agent's transcript record holds no thinking";
+
+/** The found-but-thinkingless note when the agent's live buffer holds thinking: the buffer stands in for the thinkingless record. */
+const TRANSCRIPT_RECORD_NO_THINKING_LIVE_NOTE = `${TRANSCRIPT_RECORD_NO_THINKING_NOTE}; showing live buffer`;
+
+/** Identity key of the live section's label as retained by either transcript empty state, distinct from the transcript label's key so scroll stabilization never anchors one as the other. */
+const TRANSCRIPT_EMPTY_STATE_LIVE_LABEL_KEY = "thinking-empty-live-label";
+
+/** Identity key of the thinking section's label line: a structural slot like the pane's other static lines. */
+const THINKING_LABEL_LINE_KEY = "thinking-label";
+
 const BLANK_DETAIL_LINE: DetailLine = { text: "", key: BLANK_LINE_KEY };
 
 function formatClock(at: number): string {
 	const date = new Date(at);
 	const pad = (value: number) => String(value).padStart(2, "0");
 	return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+/**
+ * The t keybinding's transcript reading state: the agent it was opened
+ * for, its full uncapped thinking loaded once from the parent session
+ * .jsonl, and whether the read succeeded. The snapshot is taken at
+ * open time and kept across polls (the transcript is append-only, so
+ * a completed result is stable); moving the cursor or pressing t
+ * again leaves it. Both empty states are honest about which side
+ * holds nothing: no transcript record for the agent (the finished
+ * detached case, whose empty subagent toolResult carries no per-agent
+ * results) or a matching record with no thinking parts (an agent that
+ * finished without reasoning); either keeps the live buffer's
+ * thinking section visible beneath its note when the buffer is
+ * non-empty.
+ */
+interface TranscriptThinkingState {
+	agent: string;
+	state: "loaded" | "found-empty" | "empty" | "unavailable";
+	entries: DispatchThinkingEntry[];
 }
 
 export class NavigatorView implements Focusable {
@@ -144,6 +204,7 @@ export class NavigatorView implements Focusable {
 	private selectedIndex = 0;
 	private scroll: DetailScrollState = createDetailScrollState();
 	private showToolNoise = false;
+	private transcript: TranscriptThinkingState | null = null;
 	private interval: ReturnType<typeof setInterval> | null = null;
 	private readonly tui: TUI;
 	private readonly theme: Theme;
@@ -201,13 +262,62 @@ export class NavigatorView implements Focusable {
 
 	/** Re-anchor the detail window when the selection identity changes: a different row is different content, so a held window cannot carry over. */
 	private adoptSelection(id: string | null): void {
-		if (id !== this.selectedId) this.scroll = createDetailScrollState();
+		if (id !== this.selectedId) {
+			this.scroll = createDetailScrollState();
+			this.transcript = null;
+		}
 		this.selectedId = id;
 	}
 
 	/** Toggle tool-noise visibility and re-anchor: filtering reshapes the line list, so a held window could point past the new tail. */
 	private toggleToolNoise(): void {
 		this.showToolNoise = !this.showToolNoise;
+		this.scroll = createDetailScrollState();
+		this.tui.requestRender();
+	}
+
+	/**
+	 * Toggle the t keybinding's transcript reading view for the selected
+	 * agent. A finished agent (done or failed) loads its full thinking
+	 * from the current session .jsonl via the injected sessionFile
+	 * source: read once at open time, uncapped, the latest matching
+	 * subagent toolResult winning. A running agent, a task or round row,
+	 * or an already-open view is a no-op or toggles off; a missing
+	 * source, undefined path, or unreadable file renders the
+	 * unavailable note instead of throwing. An empty read renders a note
+	 * naming which side holds nothing (no record for the agent, the
+	 * finished-detached case, or a matching record with no thinking
+	 * parts) and keeps the live buffer's thinking section visible beneath
+	 * it when the buffer is non-empty. Opening or closing
+	 * re-anchors the detail window: both swap the whole pane body.
+	 */
+	private toggleTranscriptThinking(): void {
+		if (this.transcript) {
+			this.transcript = null;
+			this.scroll = createDetailScrollState();
+			this.tui.requestRender();
+			return;
+		}
+		const selected = this.rows.find((row) => row.id === this.selectedId) ?? null;
+		const model = resolveDetailModel(selected, this.tasks);
+		if (model.kind !== "agent" || model.statusText === "running") return;
+		const agent = model.title;
+		let state: TranscriptThinkingState["state"];
+		let entries: DispatchThinkingEntry[] = [];
+		const sessionFile = this.sources.sessionFile?.();
+		if (!sessionFile) {
+			state = "unavailable";
+		} else {
+			try {
+				const lookup = extractTranscriptThinking(readFileSync(sessionFile, "utf8"), agent);
+				entries = lookup.entries;
+				if (!lookup.found) state = "empty";
+				else state = lookup.entries.length > 0 ? "loaded" : "found-empty";
+			} catch {
+				state = "unavailable";
+			}
+		}
+		this.transcript = { agent, state, entries };
 		this.scroll = createDetailScrollState();
 		this.tui.requestRender();
 	}
@@ -273,6 +383,10 @@ export class NavigatorView implements Focusable {
 		}
 		if (this.matchesAction(data, "app.tree.filter.cycleForward", "ctrl+o")) {
 			this.toggleToolNoise();
+			return;
+		}
+		if (matchesKey(data, "t")) {
+			this.toggleTranscriptThinking();
 			return;
 		}
 	}
@@ -350,6 +464,34 @@ export class NavigatorView implements Focusable {
 		return selected && this.focused ? line + CURSOR_MARKER : line;
 	}
 
+	/**
+	 * Full-text thinking blocks as pane lines: one line per source line
+	 * of each block (so the window stays reachable inside long blocks
+	 * and page steps stay small), styled thinkingText italic like the
+	 * main TUI's visible thinking. Blank source lines render a zero-width
+	 * space so paragraph breaks survive pi-tui's empty-text-is-zero-rows
+	 * rule. Line keys carry the block's timestamp, size, and head so an
+	 * evicted block's keys vanish with it (a held window rests instead
+	 * of drifting), and italic falls back to plain when the theme stub
+	 * lacks it, the suites' minimal themes being fg/bold only.
+	 */
+	private thinkingLines(entries: readonly DispatchThinkingEntry[]): DetailLine[] {
+		const theme = this.theme;
+		const lines: DetailLine[] = [];
+		for (const [entryIndex, entry] of entries.entries()) {
+			const head = entry.text.slice(0, 32);
+			const sourceLines = entry.text.split("\n");
+			for (const [lineIndex, text] of sourceLines.entries()) {
+				const styled = text.trim() ? theme.italic?.(theme.fg("thinkingText", text)) ?? theme.fg("thinkingText", text) : "\u200b";
+				lines.push({
+					text: styled,
+					key: `thinking:${entry.at}:${entry.text.length}:${head}:${entryIndex}:${lineIndex}`,
+				});
+			}
+		}
+		return lines;
+	}
+
 	private renderDetailLines(): DetailLine[] {
 		const theme = this.theme;
 		const selected = this.rows.find((row) => row.id === this.selectedId) ?? null;
@@ -361,6 +503,27 @@ export class NavigatorView implements Focusable {
 			text: `${titleGlyph} ${theme.fg("toolTitle", theme.bold(model.title))} ${theme.fg("muted", model.statusText)}`,
 			key: HEADER_LINE_KEY,
 		});
+		if (this.transcript && this.transcript.agent === model.title && model.kind === "agent") {
+			lines.push({ text: theme.fg("muted", TRANSCRIPT_SECTION_LABEL), key: THINKING_LABEL_LINE_KEY });
+			if (this.transcript.state === "loaded") {
+				lines.push(...this.thinkingLines(this.transcript.entries));
+			} else if (this.transcript.state === "empty" || this.transcript.state === "found-empty") {
+				const notes =
+					this.transcript.state === "empty"
+						? { plain: TRANSCRIPT_NO_RECORD_NOTE, live: TRANSCRIPT_NO_RECORD_LIVE_NOTE }
+						: { plain: TRANSCRIPT_RECORD_NO_THINKING_NOTE, live: TRANSCRIPT_RECORD_NO_THINKING_LIVE_NOTE };
+				const hasLiveBuffer = model.thinking.length > 0;
+				lines.push({ text: theme.fg("muted", hasLiveBuffer ? notes.live : notes.plain), key: "thinking-empty" });
+				if (hasLiveBuffer) {
+					lines.push(BLANK_DETAIL_LINE);
+					lines.push({ text: theme.fg("muted", THINKING_SECTION_LABEL), key: TRANSCRIPT_EMPTY_STATE_LIVE_LABEL_KEY });
+					lines.push(...this.thinkingLines(model.thinking));
+				}
+			} else {
+				lines.push({ text: theme.fg("muted", TRANSCRIPT_UNAVAILABLE_NOTE), key: "thinking-unavailable" });
+			}
+			return lines;
+		}
 		for (const field of model.fields) {
 			lines.push({
 				text: `${theme.fg("muted", `${field.label}:`)} ${theme.fg("dim", field.value)}`,
@@ -390,6 +553,11 @@ export class NavigatorView implements Focusable {
 					});
 				}
 			}
+		}
+		if (model.thinking.length > 0) {
+			lines.push(BLANK_DETAIL_LINE);
+			lines.push({ text: theme.fg("muted", THINKING_SECTION_LABEL), key: THINKING_LABEL_LINE_KEY });
+			lines.push(...this.thinkingLines(model.thinking));
 		}
 		if (model.usageText) {
 			lines.push(BLANK_DETAIL_LINE, { text: theme.fg("muted", model.usageText), key: USAGE_LINE_KEY });

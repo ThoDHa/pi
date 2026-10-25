@@ -56,6 +56,8 @@ export interface DispatchAgentNode {
 	lastActivity?: string;
 	/** Recent streamed activity, oldest first, capped at ACTIVITY_LOG_MAX entries. */
 	activity?: DispatchActivityEntry[];
+	/** Recent full-text thinking blocks, oldest first, capped at THINKING_LOG_MAX_BLOCKS / THINKING_LOG_MAX_BYTES. */
+	thinkingLog?: DispatchThinkingEntry[];
 	/** Model id the agent runs with, when known. */
 	model?: string;
 	/** Effective working directory of the agent process, when known. */
@@ -83,6 +85,7 @@ export interface DispatchAgentUpdate {
 	status?: DispatchAgentStatus;
 	lastActivity?: string;
 	activity?: DispatchActivityEntry[];
+	thinkingLog?: DispatchThinkingEntry[];
 	model?: string;
 	cwd?: string;
 	usage?: DispatchUsageSnapshot;
@@ -108,6 +111,24 @@ export interface DispatchActivityEntry {
 
 /** Upper bound on per-agent activity entries kept in the shared state. */
 export const ACTIVITY_LOG_MAX = 50;
+
+/**
+ * One full-text thinking block retained for the navigator's thinking
+ * view: the complete, untruncated thinking text of one content part,
+ * stamped with the source message's timestamp (0 when it carries
+ * none). Unlike the activity log's one-line snippets, `text` is
+ * bounded only by the THINKING_LOG caps.
+ */
+export interface DispatchThinkingEntry {
+	at: number;
+	text: string;
+}
+
+/** Upper bound on per-agent thinking blocks kept in the shared state. */
+export const THINKING_LOG_MAX_BLOCKS = 20;
+
+/** Upper bound on the UTF-8 byte total of an agent's retained thinking blocks. */
+export const THINKING_LOG_MAX_BYTES = 64 * 1024;
 
 export interface DispatchRegistry {
 	startTask(input: { mode: DispatchMode; prompt: string; now?: number }): DispatchTaskNode;
@@ -214,6 +235,7 @@ export function mergeAgentUpdate(node: DispatchAgentNode, update: DispatchAgentU
 	if (update.status !== undefined) node.status = update.status;
 	if (update.lastActivity !== undefined) node.lastActivity = update.lastActivity;
 	if (update.activity !== undefined) node.activity = update.activity;
+	if (update.thinkingLog !== undefined) node.thinkingLog = update.thinkingLog;
 	if (update.model !== undefined) node.model = update.model;
 	if (update.cwd !== undefined) node.cwd = update.cwd;
 	if (update.usage !== undefined) node.usage = update.usage;
@@ -453,4 +475,50 @@ export function extractActivityLog(messages: ActivityMessage[]): DispatchActivit
 		}
 	}
 	return collected.reverse();
+}
+
+/**
+ * Full-text thinking blocks across a result's messages, oldest first,
+ * one entry per non-blank thinking content part, each stamped with its
+ * message timestamp (0 when the source carries none) and kept whole:
+ * no truncation, no whitespace collapsing. Capped at the most recent
+ * `maxBlocks` blocks and `maxBytes` UTF-8 bytes of text. The byte cap
+ * drops whole older blocks, never slices a block, and the newest
+ * block is always retained even when it alone exceeds the cap, so a
+ * run of one giant block cannot blank the view. The cap walk proceeds
+ * newest-first and stops once a bound is full, so the scan cost
+ * tracks the caps rather than the run length. `Infinity` disables a
+ * bound; the transcript reader uses that to load a finished agent's
+ * full thinking uncapped.
+ */
+export function extractThinkingEntries(messages: ActivityMessage[], maxBlocks: number, maxBytes: number): DispatchThinkingEntry[] {
+	const collected: DispatchThinkingEntry[] = [];
+	let bytes = 0;
+	for (let i = messages.length - 1; i >= 0 && collected.length < maxBlocks; i--) {
+		const message = messages[i];
+		if (message.role !== "assistant") continue;
+		const at = message.timestamp ?? 0;
+		for (let j = message.content.length - 1; j >= 0 && collected.length < maxBlocks; j--) {
+			const part = message.content[j];
+			if (part.type !== "thinking" || !part.thinking?.trim()) continue;
+			const partBytes = Buffer.byteLength(part.thinking, "utf8");
+			if (collected.length > 0 && bytes + partBytes > maxBytes) return collected.reverse();
+			collected.push({ at, text: part.thinking });
+			bytes += partBytes;
+		}
+	}
+	return collected.reverse();
+}
+
+/**
+ * The shared state's per-agent thinking buffer: the most recent
+ * THINKING_LOG_MAX_BLOCKS full-text thinking blocks within
+ * THINKING_LOG_MAX_BYTES, fed from the same streaming message lists
+ * the activity log reads. Full bodies would be unbounded memory in
+ * the shared state, so the live view renders these and the finished
+ * agent's complete thinking comes from the session transcript
+ * instead.
+ */
+export function extractThinkingLog(messages: ActivityMessage[]): DispatchThinkingEntry[] {
+	return extractThinkingEntries(messages, THINKING_LOG_MAX_BLOCKS, THINKING_LOG_MAX_BYTES);
 }

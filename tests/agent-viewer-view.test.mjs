@@ -11,7 +11,10 @@
  * the real escape sequences pi-tui's key matchers bind (pageUp,
  * pageDown, home, end, arrows, \x14 ctrl+t, \x0f ctrl+o). Pins: the
  * entry's open key drives ctx.ui.custom with the top-anchored
- * full-width overlay options and the double-open guard; the frame
+ * full-width overlay options and the double-open guard; the entry
+ * wires the navigator's sessionFile source to
+ * ctx.sessionManager.getSessionFile(), so t on a seeded finished agent
+ * reads the transcript through the real shortcut handler; the frame
  * fills the full terminal height (the viewBodyRows body budget plus
  * the view's own header and hints lines) and stays fixed across short
  * content and agent switches; the scroll keys
@@ -24,7 +27,21 @@
  * in both directions (through the manager's action ids and through the
  * raw-key fallback when a manager lacks those ids), and the toggle
  * re-anchors the scroll window;
- * thinking entries render dim with a marker prefix; live tasks render
+ * thinking entries render dim with a marker prefix; the full-text
+ * thinking section renders below the activity log in thinkingText
+ * italic with a live label; the t keybinding on a finished agent loads
+ * that agent's full, uncapped thinking from the current session
+ * transcript via the injected sessionFile source (latest matching
+ * subagent toolResult wins), toggles back off, survives polls, and is
+ * cleared by moving the cursor, while a running agent ignores t and a
+ * missing or unreadable transcript renders a note instead of
+ * throwing; a transcript lookup miss keeps the live thinking section
+ * beneath a record-absence note when the agent's live buffer holds
+ * thinking (the finished detached case) and renders the plain note
+ * when it does not, never rendering another agent's record; a
+ * matching record holding no thinking renders the found-but-empty
+ * note instead of denying the record, with the same live-buffer
+ * retention; live tasks render
  * their rows above settled ones; tree overflow budgets the window one
  * row short so the newest line and the indicator survive the +N more
  * clip; a taller resize while held suppresses the marker once the
@@ -46,8 +63,11 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { importPiTui } from "./provision-pi-tui.mjs";
-import { createDispatchRegistry } from "../extensions/subagent/registry.ts";
+import { createDispatchRegistry, getSharedDispatchState } from "../extensions/subagent/registry.ts";
 import { SCROLL_NEW_INDICATOR, viewBodyRows } from "../extensions/agent-viewer/detail-scroll.ts";
 import { buildNavigatorTasks, createExpansionState, flattenNavigatorTree } from "../extensions/agent-viewer/navigator.ts";
 
@@ -80,6 +100,15 @@ const themeStub = {
 // thinking line renders dim with its marker, distinct from plain text.
 const dimTaggingTheme = {
 	fg: (color, text) => (color === "dim" ? `<dim:${text}>` : text),
+	bold: (text) => text,
+};
+
+// Tags thinking styling so the thinking-section scenario can pin the
+// thinkingText italic rendering, distinct from plain text and from the
+// dim activity one-liners.
+const thinkingTheme = {
+	fg: (color, text) => (color === "thinkingText" ? `<think:${text}>` : color === "muted" ? `<muted:${text}>` : text),
+	italic: (text) => `<i:${text}>`,
 	bold: (text) => text,
 };
 
@@ -171,10 +200,52 @@ async function withView(sources, run, tui = stubTui(), theme = themeStub) {
 	await sessionStart();
 	assert.equal(shortcuts["alt+n"].description, "Open the subagent navigator view");
 
+	// Seed the shared registry and a session transcript before the open
+	// handler runs: the view snapshots the shared state at construction,
+	// and the t drive below pins that the entry feeds
+	// ctx.sessionManager.getSessionFile() into the view's sources.
+	const wireDir = mkdtempSync(join(tmpdir(), "pi-navigator-wire-"));
+	const wireSessionFile = join(wireDir, "session.jsonl");
+	writeFileSync(
+		wireSessionFile,
+		[
+			JSON.stringify({ type: "session", version: 3, id: "s1" }),
+			JSON.stringify({
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolName: "subagent",
+					toolCallId: "call_1",
+					content: [],
+					details: {
+						mode: "single",
+						results: [
+							{
+								agent: "scout",
+								agentSource: "user",
+								task: "probe",
+								exitCode: 0,
+								messages: [{ role: "assistant", timestamp: 5_000, content: [{ type: "thinking", thinking: "wired transcript thought" }] }],
+								stderr: "",
+								stopReason: "end",
+								usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+							},
+						],
+					},
+				},
+			}),
+		].join("\n"),
+	);
+	const sharedState = getSharedDispatchState();
+	const wireTask = sharedState.registry.startTask({ mode: "single", prompt: "Task: entry wire probe", now: 1_000 });
+	sharedState.registry.startRound(wireTask.id, [{ agent: "scout" }], 1_000);
+	sharedState.registry.updateAgent(wireTask.id, 1, 0, { status: "done", finishedAt: 9_000 });
+
 	let capturedOptions = null;
 	let capturedFactory = null;
 	let resolveCustom;
 	const ctx = {
+		sessionManager: { getSessionFile: () => wireSessionFile },
 		ui: {
 			custom: (factory, options) => {
 				capturedFactory = factory;
@@ -205,9 +276,19 @@ async function withView(sources, run, tui = stubTui(), theme = themeStub) {
 
 	const view = capturedFactory(stubTui(), themeStub, keybindings, () => {});
 	assert.ok(view instanceof NavigatorView, "the custom factory builds the navigator view");
+	view.handleInput(DOWN);
+	view.handleInput(RIGHT);
+	view.handleInput(DOWN);
+	assert.ok(view.selectedId.endsWith(":a0"), "the seeded finished agent row is selectable in the entry-built view");
+	view.handleInput("t");
+	assert.ok(
+		view.render(120).join("\n").includes("wired transcript thought"),
+		"t reads the transcript through the sessionFile source the entry wires from ctx.sessionManager.getSessionFile()",
+	);
 	view.dispose();
 	resolveCustom(undefined);
 	await opening;
+	rmSync(wireDir, { recursive: true, force: true });
 }
 
 // --- frame budget, full width, tail anchor, indicator, re-anchor on selection change ---
@@ -701,10 +782,312 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 	});
 }
 
+// --- live thinking section: full-text blocks below the activity log, thinkingText italic ---
+
+{
+	const registry = createDispatchRegistry();
+	const task = registry.startTask({ mode: "single", prompt: "Task: EXT-8-1 thinking probe", now: 1_000 });
+	registry.startRound(task.id, [{ agent: "dreamer" }], 1_000);
+	registry.updateAgent(task.id, 1, 0, {
+		activity: [
+			{ at: 1_100, kind: "text", text: "plain note" },
+			{ at: 1_200, kind: "thinking", text: "snippet thought" },
+		],
+		thinkingLog: [
+			{ at: 1_050, text: "first full thought\n\nsecond line of it" },
+			{ at: 1_900, text: "revised full thought" },
+		],
+	});
+	await withView({ registry, detachedJobs: [] }, async (view) => {
+		view.handleInput(DOWN);
+		view.handleInput(DOWN);
+		assert.equal(view.selectedId, "t:task-1:r1:a0");
+
+		const frame = view.render(120).join("\n");
+		assert.ok(frame.includes("thinking · live"), "the live thinking section carries its label below the activity log");
+		assert.ok(frame.indexOf("plain note") !== -1 && frame.indexOf("plain note") < frame.indexOf("thinking · live"), "the section sits below the activity log");
+		assert.ok(frame.includes("<i:<think:first full thought>>"), "a full block renders thinkingText italic, not the dim one-liner styling");
+		assert.ok(frame.includes("<i:<think:second line of it>>"), "block source lines render as separate pane lines");
+		assert.ok(frame.includes("\u200b"), "a blank source line renders a zero-width space so the paragraph break survives pi-tui's empty-text-is-zero-rows rule");
+		assert.ok(frame.includes("<i:<think:revised full thought>>"));
+		assert.ok(!frame.includes("… first full thought"), "full blocks carry no truncation marker");
+		assert.ok(frame.includes("> … snippet thought"), "the activity log's one-liner keeps its own dim one-liner shape");
+	}, stubTui(), thinkingTheme);
+}
+
+// --- t keybinding: full thinking from the session transcript on a finished agent ---
+
+{
+	const dir = mkdtempSync(join(tmpdir(), "pi-navigator-thinking-"));
+	try {
+		const sessionFile = join(dir, "session.jsonl");
+		const entry = (object) => JSON.stringify(object);
+		const scoutResult = (thoughts) => ({
+			agent: "scout",
+			agentSource: "user",
+			task: "probe",
+			exitCode: 0,
+			messages: thoughts.map((text, index) => ({ role: "assistant", timestamp: 5_000 + index, content: [{ type: "thinking", thinking: text }] })),
+			stderr: "",
+			stopReason: "end",
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+		});
+		const toolResult = (results) =>
+			entry({
+				type: "message",
+				message: { role: "toolResult", toolName: "subagent", toolCallId: "call_1", content: [], details: { mode: "single", results } },
+			});
+		const blocks = Array.from({ length: 25 }, (_, i) => `block ${i} thought`);
+		writeFileSync(
+			sessionFile,
+			[
+				entry({ type: "session", version: 3, id: "s1" }),
+				toolResult([scoutResult(["old run thought"])]),
+				toolResult([scoutResult(blocks)]),
+				'{"type":"message","message":{"role":"toolRes',
+			].join("\n"),
+		);
+
+		const registry = createDispatchRegistry();
+		const task = registry.startTask({ mode: "single", prompt: "Task: EXT-8-2 transcript probe", now: 1_000 });
+		registry.startRound(task.id, [{ agent: "scout" }], 1_000);
+		registry.updateAgent(task.id, 1, 0, { status: "done", finishedAt: 9_000, activity: [{ at: 1_100, kind: "text", text: "live note" }], thinkingLog: [{ at: 1_050, text: "live buffer thought" }] });
+		const sources = { registry, detachedJobs: [], sessionFile: () => sessionFile };
+	await withView(sources, async (view) => {
+		const poll = () => view.refresh();
+		view.handleInput(DOWN);
+		view.handleInput(RIGHT);
+		view.handleInput(DOWN);
+		assert.equal(view.selectedId, "t:task-1:r1:a0");
+
+				view.handleInput("t");
+				const transcriptFrame = view.render(120).join("\n");
+				assert.ok(transcriptFrame.includes("block 24 thought"), "t opens the transcript reading view, tail-following its newest block");
+				view.handleInput("\x1b[H");
+				const transcriptHead = view.render(120).join("\n");
+				assert.ok(transcriptHead.includes("full thinking"), "the transcript view carries its label at the pane head");
+				assert.ok(transcriptFrame.includes("block 24 thought"), "the transcript view loads thinking beyond the live buffer's caps");
+				assert.ok(!transcriptFrame.includes("block 0 thought"), "the latest matching subagent result wins over earlier runs");
+				assert.ok(!transcriptFrame.includes("old run thought"), "earlier dispatches of the same agent are discarded");
+				assert.ok(!transcriptFrame.includes("live buffer thought"), "the transcript view replaces the live pane body");
+				assert.ok(!transcriptFrame.includes("duration:"), "the transcript view replaces the header fields");
+				assert.ok(!transcriptFrame.includes("live note"), "the transcript view replaces the activity log");
+				view.handleInput("\x1b[F");
+
+				poll();
+				assert.ok(view.render(120).join("\n").includes("block 24 thought"), "the transcript view survives polls");
+
+				view.handleInput("t");
+				const liveFrame = view.render(120).join("\n");
+				assert.ok(liveFrame.includes("duration:"), "a second t returns to the live pane");
+				assert.ok(liveFrame.includes("live buffer thought"), "the live thinking section is back");
+				assert.ok(!liveFrame.includes("block 24 thought"));
+
+				view.handleInput("t");
+				assert.ok(view.render(120).join("\n").includes("block 24 thought"));
+				view.handleInput("\x1b[H");
+				assert.ok(view.render(120).join("\n").includes("full thinking"), "t reopens the transcript view");
+				view.handleInput("\x1b[F");
+				view.handleInput(UP);
+				view.handleInput(UP);
+				assert.equal(view.selectedId, "t:task-1");
+				assert.ok(!view.render(120).join("\n").includes("full thinking"), "moving the cursor clears the transcript view");
+				view.handleInput(DOWN);
+				assert.ok(view.render(120).join("\n").includes("duration:"), "the live pane is restored after the transcript view clears");
+		}, stubTui(), thinkingTheme);
+
+		// A failed agent qualifies as finished for t.
+		const chain = registry.startTask({ mode: "chain", prompt: "Task: EXT-8-3 failed probe", now: 20_000 });
+		registry.startRound(chain.id, [{ agent: "scout", step: 1 }], 20_000);
+		registry.updateAgent(chain.id, 1, 0, { status: "failed", finishedAt: 21_000, result: { exitCode: 1, stopReason: "error" } });
+		await withView(sources, async (view) => {
+			// Both settled rounds start collapsed: expand r1, walk past scout
+			// and the task-2 header, then expand r2 to reach the failed agent.
+			view.handleInput(DOWN);
+			assert.equal(view.selectedId, "t:task-1:r1");
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
+			assert.equal(view.selectedId, "t:task-1:r1:a0");
+			view.handleInput(DOWN);
+			assert.equal(view.selectedId, "t:task-2");
+			view.handleInput(DOWN);
+			assert.equal(view.selectedId, "t:task-2:r1");
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
+			assert.equal(view.selectedId, "t:task-2:r1:a0");
+			view.handleInput("t");
+			view.handleInput("\x1b[H");
+			assert.ok(view.render(120).join("\n").includes("full thinking"), "t works on a failed agent");
+		}, stubTui(), thinkingTheme);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+// --- t guard rails: running agents, task rows, and missing transcripts ---
+
+{
+	const registry = createDispatchRegistry();
+	const task = registry.startTask({ mode: "single", prompt: "Task: EXT-8-4 guard probe", now: 1_000 });
+	registry.startRound(task.id, [{ agent: "busy" }, { agent: "done kid" }], 1_000);
+	registry.updateAgent(task.id, 1, 0, { status: "running", thinkingLog: [{ at: 1_050, text: "running thought" }] });
+	registry.updateAgent(task.id, 1, 1, { status: "done", finishedAt: 2_000 });
+
+	// Running agent: t is a no-op.
+	await withView({ registry, detachedJobs: [] }, async (view) => {
+		view.handleInput(DOWN);
+		view.handleInput(DOWN);
+		assert.equal(view.selectedId, "t:task-1:r1:a0");
+		const before = view.render(120).join("\n");
+		view.handleInput("t");
+		assert.equal(view.render(120).join("\n"), before, "t on a running agent is a no-op");
+	});
+
+	// Task row: t is a no-op.
+	await withView({ registry, detachedJobs: [] }, async (view) => {
+		assert.equal(view.selectedId, "t:task-1");
+		const before = view.render(120).join("\n");
+		view.handleInput("t");
+		assert.equal(view.render(120).join("\n"), before, "t on a task row is a no-op");
+	});
+
+	// Finished agent without a sessionFile source: a note, not a crash; t toggles back.
+	await withView({ registry, detachedJobs: [] }, async (view) => {
+		view.handleInput(DOWN);
+		view.handleInput(DOWN);
+		view.handleInput(DOWN);
+		view.handleInput(DOWN);
+		assert.equal(view.selectedId, "t:task-1:r1:a1");
+		view.handleInput("t");
+		const noted = view.render(120).join("\n");
+		assert.ok(noted.includes("transcript unavailable"), "a missing sessionFile source renders a note");
+		view.handleInput("t");
+		assert.ok(view.render(120).join("\n").includes("duration:"), "t toggles back off the note");
+	});
+
+	// A source yielding undefined and an unreadable path land on the same note.
+	await withView({ registry, detachedJobs: [], sessionFile: () => undefined }, async (view) => {
+		view.handleInput(DOWN);
+		view.handleInput(DOWN);
+		view.handleInput(DOWN);
+		view.handleInput(DOWN);
+		view.handleInput("t");
+		assert.ok(view.render(120).join("\n").includes("transcript unavailable"), "an undefined session file renders the note");
+	});
+	await withView({ registry, detachedJobs: [], sessionFile: () => join(tmpdir(), "pi-navigator-missing", "no.jsonl") }, async (view) => {
+		view.handleInput(DOWN);
+		view.handleInput(DOWN);
+		view.handleInput(DOWN);
+		view.handleInput(DOWN);
+		view.handleInput("t");
+		assert.ok(view.render(120).join("\n").includes("transcript unavailable"), "an unreadable session file renders the note without throwing");
+	});
+}
+
+// --- t empty states: lookup miss and thinkingless-record notes, each keeping a live buffer's section ---
+
+{
+	const dir = mkdtempSync(join(tmpdir(), "pi-navigator-thinking-empty-"));
+	try {
+		// A transcript holding a subagent record for a different agent only:
+		// t on scout lands in the empty state, the finished-detached case
+		// whose note must not claim the thinking is gone. The records for
+		// quiet and echo hold no thinking parts: t on them lands in the
+		// found-but-empty state, where the note must not deny a record the
+		// file demonstrably contains.
+		const transcriptLine = (toolCallId, agentName, messages) =>
+			JSON.stringify({
+				type: "message",
+				message: { role: "toolResult", toolName: "subagent", toolCallId, content: [], details: { mode: "single", results: [{ agent: agentName, agentSource: "user", task: "probe", exitCode: 0, messages, stderr: "", stopReason: "end", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 } }] } },
+			});
+		const sessionFile = join(dir, "session.jsonl");
+		writeFileSync(
+			sessionFile,
+			[
+				transcriptLine("call_1", "other", [{ role: "assistant", timestamp: 1, content: [{ type: "thinking", thinking: "other agent thought" }] }]),
+				transcriptLine("call_2", "quiet", [{ role: "assistant", timestamp: 2, content: [{ type: "text", text: "quiet words" }] }]),
+				transcriptLine("call_3", "echo", [{ role: "assistant", timestamp: 3, content: [{ type: "text", text: "echo words" }] }]),
+			].join("\n"),
+		);
+
+		const registry = createDispatchRegistry();
+		const task = registry.startTask({ mode: "single", prompt: "Task: EXT-8-6 empty-state probe", now: 1_000 });
+		registry.startRound(task.id, [{ agent: "scout" }, { agent: "plain" }, { agent: "quiet" }, { agent: "echo" }], 1_000);
+		registry.updateAgent(task.id, 1, 0, { status: "done", finishedAt: 9_000, thinkingLog: [{ at: 1_050, text: "detached buffer thought" }] });
+		registry.updateAgent(task.id, 1, 1, { status: "done", finishedAt: 9_000 });
+		registry.updateAgent(task.id, 1, 2, { status: "done", finishedAt: 9_000 });
+		registry.updateAgent(task.id, 1, 3, { status: "done", finishedAt: 9_000, thinkingLog: [{ at: 1_060, text: "echo buffer thought" }] });
+
+		// Lookup miss with a live buffer: the note names the record's absence and the live section stays visible.
+		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
+			view.handleInput(DOWN);
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
+			assert.equal(view.selectedId, "t:task-1:r1:a0");
+			view.handleInput("t");
+			const frame = view.render(120).join("\n");
+			assert.ok(frame.includes("no transcript record for this agent; showing live buffer"), "the empty note names the record's absence and says the live buffer stands in");
+			assert.ok(frame.includes("detached buffer thought"), "the live thinking section survives the transcript lookup miss");
+			assert.ok(!frame.includes("other agent thought"), "the miss renders no other agent's record");
+		}, stubTui(), thinkingTheme);
+
+		// Lookup miss with an empty buffer: the plain absent-record note.
+		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
+			view.handleInput(DOWN);
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
+			view.handleInput(DOWN);
+			assert.equal(view.selectedId, "t:task-1:r1:a1");
+			view.handleInput("t");
+			const frame = view.render(120).join("\n");
+			assert.ok(frame.includes("no transcript record for this agent"), "the plain empty note names the record's absence");
+			assert.ok(!frame.includes("showing live buffer"), "an empty live buffer gets no stand-in note");
+			assert.ok(!frame.includes("detached buffer thought"), "another agent's live buffer never leaks into the empty state");
+		}, stubTui(), thinkingTheme);
+
+		// A record that exists but holds no thinking: the found-but-empty note
+		// names the record's emptiness instead of denying the record exists.
+		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
+			view.handleInput(DOWN);
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
+			view.handleInput(DOWN);
+			view.handleInput(DOWN);
+			assert.equal(view.selectedId, "t:task-1:r1:a2");
+			view.handleInput("t");
+			const frame = view.render(120).join("\n");
+			assert.ok(frame.includes("this agent's transcript record holds no thinking"), "a found thinkingless record gets the found-but-empty note");
+			assert.ok(!frame.includes("no transcript record for this agent"), "the found-but-empty note never denies the record's existence");
+			assert.ok(!frame.includes("showing live buffer"), "an empty live buffer gets no stand-in note in the found-but-empty state");
+			assert.ok(!frame.includes("quiet words") && !frame.includes("other agent thought"), "no record content or other agent's data leaks into the found-but-empty state");
+		}, stubTui(), thinkingTheme);
+
+		// Found-but-empty with a live buffer: the stand-in note plus the retained live section.
+		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
+			view.handleInput(DOWN);
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
+			view.handleInput(DOWN);
+			view.handleInput(DOWN);
+			view.handleInput(DOWN);
+			assert.equal(view.selectedId, "t:task-1:r1:a3");
+			view.handleInput("t");
+			// render(200): the stand-in note exceeds the detail pane at 120 and would wrap mid-copy, splitting the pinned substring.
+			const frame = view.render(200).join("\n");
+			assert.ok(frame.includes("this agent's transcript record holds no thinking; showing live buffer"), "a found thinkingless record with a live buffer gets the stand-in note");
+			assert.ok(frame.includes("echo buffer thought"), "the live thinking section survives the found-but-empty state");
+			assert.ok(!frame.includes("no transcript record for this agent"), "the found-but-empty note never denies the record's existence");
+			assert.ok(!frame.includes("echo words"), "the thinkingless record's content never leaks into the pane");
+		}, stubTui(), thinkingTheme);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
 // --- hints line: the longer hints line truncates inside a narrow width ---
 
 await withView({ registry: createDispatchRegistry(), detachedJobs: [] }, async (view) => {
-	const HINTS = "↑/↓ move · ←/→ collapse/expand · tab next task · pgup/pgdn scroll · ctrl+t tools · esc close";
+	const HINTS = "↑/↓ move · ←/→ collapse/expand · tab next task · pgup/pgdn scroll · ctrl+t tools · t thinking · esc close";
 	const lines = view.render(30);
 	assert.ok(visibleWidth(HINTS) > 30, "the hints line actually exceeds the narrow width");
 	assert.equal(lines[lines.length - 1], truncateToWidth(HINTS, 30), "the hints line truncates, not overflows");

@@ -15,14 +15,17 @@
 
 import { resolveTaskLabel } from "./labels.ts";
 import {
+	type ActivityMessage,
 	type DetachedJobSnapshot,
 	type DispatchActivityEntry,
 	type DispatchAgentNode,
 	type DispatchMode,
 	type DispatchRegistry,
 	type DispatchResultSnapshot,
+	type DispatchThinkingEntry,
 	type DispatchUsageSnapshot,
 	type StatusGlyphName,
+	extractThinkingEntries,
 	formatDuration,
 	formatTokenCount,
 	formatUsageSummary,
@@ -47,6 +50,8 @@ export interface NavigatorAgentView {
 	activity?: string;
 	/** Recent streamed activity for the detail pane, oldest first. */
 	activityLog: DispatchActivityEntry[];
+	/** Recent full-text thinking blocks for the detail pane, oldest first, capped like the activity log. */
+	thinkingLog: DispatchThinkingEntry[];
 	model?: string;
 	cwd?: string;
 	usage?: DispatchUsageSnapshot;
@@ -99,6 +104,7 @@ function agentView(node: DispatchAgentNode, ref: NavigatorAgentRef, fallbackEnd:
 		finishedAt: node.finishedAt,
 		activity: node.lastActivity,
 		activityLog: node.activity ?? [],
+		thinkingLog: node.thinkingLog ?? [],
 		model: node.model,
 		cwd: node.cwd,
 		usage: node.usage,
@@ -345,12 +351,13 @@ export interface NavigatorDetailModel {
 	fields: NavigatorDetailField[];
 	members: NavigatorDetailMember[];
 	activity: DispatchActivityEntry[];
+	thinking: DispatchThinkingEntry[];
 	usageText: string | undefined;
 	resultText: string | undefined;
 }
 
 function emptyDetailModel(): NavigatorDetailModel {
-	return { kind: "empty", title: "", statusText: "", fields: [], members: [], activity: [], usageText: undefined, resultText: undefined };
+	return { kind: "empty", title: "", statusText: "", fields: [], members: [], activity: [], thinking: [], usageText: undefined, resultText: undefined };
 }
 
 function agentResultText(agent: NavigatorAgentView): string | undefined {
@@ -401,6 +408,7 @@ export function resolveDetailModel(row: NavigatorRow | null | undefined, tasks: 
 			fields,
 			members: [],
 			activity: agent.activityLog,
+			thinking: agent.thinkingLog,
 			usageText: agent.usage ? formatUsageSummary(agent.usage) || undefined : undefined,
 			resultText: agentResultText(agent),
 		};
@@ -424,6 +432,7 @@ export function resolveDetailModel(row: NavigatorRow | null | undefined, tasks: 
 				detail: agent.activity ? `${agent.activity} · ${agent.durationText}` : agent.durationText,
 			})),
 			activity: [],
+			thinking: [],
 			usageText: undefined,
 			resultText: undefined,
 		};
@@ -453,7 +462,68 @@ export function resolveDetailModel(row: NavigatorRow | null | undefined, tasks: 
 						detail: agent.activity ? `${agent.activity} · ${agent.durationText}` : agent.durationText,
 					})),
 		activity: [],
+		thinking: [],
 		usageText: undefined,
 		resultText: undefined,
 	};
+}
+
+/**
+ * A finished agent's full thinking, read out of the parent session
+ * transcript for the t keybinding: the .jsonl is scanned in order and
+ * the latest subagent toolResult whose details.results[] carries a
+ * result for `agentName` wins (the file is append-only, so completed
+ * results are stable, and one agent dispatched twice resolves to its
+ * newest run). That result's messages yield one uncapped full-text
+ * entry per thinking part, oldest first, mirroring the live buffer's
+ * entry shape. Lines that fail to parse are skipped: the file is
+ * being appended live, so a torn trailing line is normal and must
+ * never block the completed results before it. Only subagent
+ * toolResults are considered; other tools' results and results
+ * without thinking parts contribute nothing. Before parsing, lines
+ * without the serialized tool name's substring "subagent" are
+ * skipped: every subagent toolResult's line carries it (JSON.stringify
+ * never escapes those ASCII letters), so the scan's parse cost tracks
+ * subagent lines instead of the whole session, and the filter can only
+ * skip, never match (a false positive merely falls through to the
+ * parse and shape checks below).
+ * Returns whether a matching record exists at all plus that record's
+ * thinking: found=false when nothing matches (unknown agent, no
+ * subagent results, empty file), found=true with empty entries when
+ * the latest matching record holds no thinking parts (an agent that
+ * finished without reasoning), so the viewer can name the record's
+ * emptiness instead of denying the record exists.
+ */
+export interface TranscriptThinkingLookup {
+	/** Whether the latest matching subagent toolResult carries a result slot for `agentName` at all. */
+	found: boolean;
+	/** The matching record's full-text thinking entries, oldest first; empty when not found or found-but-thinkingless. */
+	entries: DispatchThinkingEntry[];
+}
+
+export function extractTranscriptThinking(jsonl: string, agentName: string): TranscriptThinkingLookup {
+	let best: DispatchThinkingEntry[] | undefined;
+	for (const line of jsonl.split("\n")) {
+		if (!line.includes("subagent")) continue;
+		let entry: {
+			type?: unknown;
+			message?: { role?: unknown; details?: { results?: unknown } };
+		};
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (entry?.type !== "message" || entry.message?.role !== "toolResult") continue;
+		if ((entry.message as { toolName?: unknown }).toolName !== "subagent") continue;
+		const results = entry.message.details?.results;
+		if (!Array.isArray(results)) continue;
+		for (let i = results.length - 1; i >= 0; i--) {
+			const candidate = results[i] as { agent?: unknown; messages?: unknown } | undefined;
+			if (candidate?.agent !== agentName || !Array.isArray(candidate.messages)) continue;
+			best = extractThinkingEntries(candidate.messages as ActivityMessage[], Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
+			break;
+		}
+	}
+	return { found: best !== undefined, entries: best ?? [] };
 }

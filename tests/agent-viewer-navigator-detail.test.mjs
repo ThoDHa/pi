@@ -34,6 +34,10 @@ registry.updateAgent(single.id, 1, 0, {
 		{ at: 2_000, kind: "text", text: "starting the sweep" },
 		{ at: 3_000, kind: "toolCall", name: "bash", args: { command: "rg alpha" }, text: "$ rg alpha" },
 	],
+	thinkingLog: [
+		{ at: 1_500, text: "first thought\nsecond line" },
+		{ at: 2_500, text: "revised thought" },
+	],
 });
 registry.updateAgent(single.id, 1, 0, { status: "done", finishedAt: 26_000, result: { exitCode: 0 } });
 
@@ -91,6 +95,9 @@ assert.equal(scoutFields.duration, "25s");
 assert.equal(scoutModel.usageText, "3 turns ↑12k ↓800 R340k $0.0123 ctx:45k");
 assert.equal(scoutModel.resultText, "completed");
 assert.equal(scoutModel.members.length, 0, "agent targets have no member lines");
+assert.equal(scoutModel.thinking?.length, 2, "the agent's thinking log streams through to the detail model");
+assert.deepEqual(scoutModel.thinking?.[0], { at: 1_500, text: "first thought\nsecond line" });
+assert.deepEqual(scoutModel.thinking?.[1], { at: 2_500, text: "revised thought" });
 
 // --- agent target: failed agent reports the stop reason and error ---
 
@@ -125,6 +132,7 @@ assert.equal(taskModel.kind, "task");
 assert.equal(taskModel.title, "EXT-9-8");
 assert.equal(taskModel.statusText, "done");
 assert.deepEqual(taskModel.activity, [], "task targets stream no activity of their own");
+assert.deepEqual(taskModel.thinking, [], "task targets stream no thinking of their own");
 assert.equal(taskModel.members.length, 1);
 assert.equal(taskModel.members[0].label, "round 1");
 assert.equal(taskModel.members[0].glyph, "done");
@@ -151,6 +159,7 @@ assert.equal(detachedModel.title, "watch the probe");
 assert.equal(detachedModel.members.length, 1);
 assert.equal(detachedModel.members[0].label, "observer");
 assert.equal(detachedModel.members[0].glyph, "running");
+assert.deepEqual(detachedModel.thinking, [], "task targets carry an empty thinking log like their activity");
 
 // --- missing and absent selections resolve to the empty model ---
 
@@ -158,6 +167,7 @@ const emptyModel = resolveDetailModel(null, tasks);
 assert.equal(emptyModel.kind, "empty");
 assert.deepEqual(emptyModel.fields, []);
 assert.deepEqual(emptyModel.members, []);
+assert.deepEqual(emptyModel.thinking, [], "the empty model carries an empty thinking log");
 const orphanRow = { ...taskRow, taskId: "task-999" };
 assert.equal(resolveDetailModel(orphanRow, tasks).kind, "empty", "a row whose task vanished resolves empty");
 

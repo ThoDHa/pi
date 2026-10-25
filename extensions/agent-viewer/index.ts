@@ -171,6 +171,7 @@ export default function (pi: ExtensionAPI) {
 							new NavigatorView(tui, theme, keybindings, {
 								registry: shared.registry,
 								detachedJobs: shared.detachedJobs,
+								sessionFile: () => ctx.sessionManager.getSessionFile(),
 							}, done),
 						{
 							overlay: true,
