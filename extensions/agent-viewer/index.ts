@@ -161,16 +161,25 @@ export default function (pi: ExtensionAPI) {
 				navigatorOpen = true;
 				try {
 					const shared = getSharedDispatchState();
-					// No overlay option: the non-overlay custom installs the
-					// view in the editor slot (full width, focus-owned, inside
-					// the root layout), the /tree idiom, replacing the editor
-					// until escape resolves done.
+					// Full-width top-anchored overlay: the view renders the
+					// whole terminal height itself, so it is effectively full
+					// screen while open; the editor's buffer stays untouched
+					// beneath, and done() hides the overlay and hands focus
+					// back to the editor.
 					await ctx.ui.custom(
 						(tui, theme, keybindings, done) =>
 							new NavigatorView(tui, theme, keybindings, {
 								registry: shared.registry,
 								detachedJobs: shared.detachedJobs,
 							}, done),
+						{
+							overlay: true,
+							overlayOptions: {
+								anchor: "top-center",
+								width: "100%",
+								maxHeight: "100%",
+							},
+						},
 					);
 				} finally {
 					navigatorOpen = false;

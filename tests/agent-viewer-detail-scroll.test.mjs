@@ -30,8 +30,6 @@ import {
 	SCROLL_NEW_INDICATOR,
 	USAGE_LINE_KEY,
 	VIEW_CHROME_ROWS,
-	VIEW_DOCK_ROWS,
-	VIEW_RESERVED_ROWS,
 	activityLineKey,
 	createDetailScrollState,
 	detailWindow,
@@ -305,13 +303,12 @@ function heldState(keys, viewport) {
 // --- viewport discovery: the body budget shared with the view frame ---
 
 {
-	assert.equal(VIEW_DOCK_ROWS, 4, "the dock claims the transcript minimum, status plus footer, and one slack row");
-	assert.equal(VIEW_CHROME_ROWS, 2, "the view renders a header line and a hints line around the body");
-	assert.equal(VIEW_RESERVED_ROWS, VIEW_DOCK_ROWS + VIEW_CHROME_ROWS, "the total reserve sums the dock and the chrome");
-	assert.equal(viewBodyRows(40), 40 - VIEW_RESERVED_ROWS, "the body budget is the terminal minus the reserved rows");
+	assert.equal(VIEW_CHROME_ROWS, 2, "the view renders a header line and a hints line around its body");
+	assert.equal(viewBodyRows(40), 40 - VIEW_CHROME_ROWS, "the body budget is the terminal minus the view's own frame lines");
+	assert.equal(viewBodyRows(40) + VIEW_CHROME_ROWS, 40, "budget plus frame lines fills the overlay's full terminal height");
 	assert.equal(viewBodyRows(2), 1, "a tiny terminal floors at one body row");
-	assert.equal(viewBodyRows(VIEW_RESERVED_ROWS), 1, "a terminal exactly the size of the reserve still shows one body row");
-	assert.equal(viewBodyRows(VIEW_RESERVED_ROWS - 1), 1, "a terminal smaller than the reserve clamps to one body row");
+	assert.equal(viewBodyRows(VIEW_CHROME_ROWS), 1, "a terminal exactly the size of the frame still shows one body row");
+	assert.equal(viewBodyRows(VIEW_CHROME_ROWS - 1), 1, "a terminal smaller than the frame clamps to one body row");
 }
 
 console.log("agent-viewer-detail-scroll: all assertions passed");

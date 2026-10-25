@@ -10,8 +10,8 @@
  * rather than a bare index, because the activity log evicts from its
  * head once it reaches its cap and an index-pinned window would
  * silently drift forward through the log. A real ScrollView is
- * deliberately not adopted even though the editor-slot hosting would
- * run its layout: the pure model is already pinned headlessly and
+ * deliberately not adopted even though the overlay hosting would run
+ * its layout: the pure model is already pinned headlessly and
  * keeps the suites framework-free.
  *
  * Dependency-free by design (no pi imports) so plain-node suites can
@@ -20,19 +20,8 @@
 
 import type { DispatchActivityEntry } from "../subagent/registry.ts";
 
-/**
- * Rows the dock claims besides the view slot, against pi's
- * createChatViewport layout: the transcript's one-line minimum, the
- * status and footer rows (one to two lines), and one row of shrink
- * slack. The slot's own share of the terminal is whatever remains.
- */
-export const VIEW_DOCK_ROWS = 4;
-
 /** Chrome rows the view renders around its body: the header line above, the hints line below. */
 export const VIEW_CHROME_ROWS = 2;
-
-/** Rows reserved before the body budget: the dock's claims plus the view's own chrome. */
-export const VIEW_RESERVED_ROWS = VIEW_DOCK_ROWS + VIEW_CHROME_ROWS;
 
 /** Context lines of overlap a pageUp/pageDown step keeps, so paging never loses the reading thread. */
 export const PAGE_SCROLL_OVERLAP_LINES = 1;
@@ -57,13 +46,18 @@ export function createDetailScrollState(): DetailScrollState {
 
 /**
  * Body rows the view's tree and detail panes share: the terminal
- * minus the reserved rows, floored at one. Best-effort by nature (the
- * dock's exact share of the terminal is pi's to allot), so when the
- * strip widget is toggled on above the slot the dock may shrink the
- * view and clip the tail; the budget keeps the ordinary frame exact.
+ * minus the view's own frame lines, floored at one. The view is
+ * hosted as a full-width top overlay while open and, on terminals of
+ * three rows and up, renders exactly this budget plus the frame
+ * lines every render, so its content-derived height meets the
+ * overlay's maxHeight with no silent truncation: the frame is pinned
+ * at row 0 and fills the terminal. The one-row floor is a safety
+ * clamp below that: on a one- or two-row terminal the budget plus
+ * the frame lines exceeds the terminal and the overlay's maxHeight
+ * truncates the frame.
  */
 export function viewBodyRows(terminalRows: number): number {
-	return Math.max(1, terminalRows - VIEW_RESERVED_ROWS);
+	return Math.max(1, terminalRows - VIEW_CHROME_ROWS);
 }
 
 /** Rows one pageUp/pageDown moves: the viewport minus the overlap, never below one so a page always moves. */

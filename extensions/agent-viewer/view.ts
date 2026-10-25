@@ -1,22 +1,35 @@
 /**
  * Navigator view component
  *
- * The keyboard-driven view over every live dispatch, hosted in the
- * editor slot: ctx.ui.custom without the overlay option installs the
- * component in place of the editor via pi's dialog stack (the /tree
- * idiom), giving it the slot's full width, layout-engine hosting, and
- * keyboard focus. A left tree pane of rows produced by the pure
- * flatten function in navigator.ts, a right detail pane streaming the
- * selected agent's activity, a header line carrying the tool-noise
- * filter state, and a hints line at the bottom; there is no box
- * border because the view is the pane, not a floating card. Reads the
+ * The keyboard-driven view over every live dispatch, hosted as a
+ * full-width, top-anchored overlay: ctx.ui.custom with the overlay
+ * option floats the component over the transcript and editor, pinned
+ * to row 0 at the terminal's full width, and on terminals of three
+ * rows and up the view renders exactly the terminal's height every
+ * frame (its header and hints lines around the pane body, padded to
+ * the body budget), so it is effectively full screen while open and
+ * its content-derived height always meets the overlay's maxHeight
+ * with no silent truncation. Below three rows the one-row floor
+ * keeps the frame at three lines and the overlay's maxHeight is the
+ * safety clamp that truncates it. Being an overlay is also what
+ * routes the fullscreen viewport scroll keys here: pi's alt-screen
+ * handler defers pageUp/pageDown/home/end to a focused overlay, so
+ * the scroll keys work in both terminal modes. The editor keeps its
+ * buffer untouched beneath the overlay; done() hides the overlay and
+ * returns focus to the editor.
+ *
+ * A left tree pane of rows produced by the pure flatten function in
+ * navigator.ts, a right detail pane streaming the selected agent's
+ * activity, a header line carrying the tool-noise filter state, and
+ * a hints line at the bottom; there is no box border because while
+ * open the view is the whole screen, not a floating card. Reads the
  * shared dispatch state on a poll interval (doom-overlay pattern:
  * interval plus requestRender, cleared in dispose) and renders
  * through the theme with the fleet glyph conventions. Strictly
  * read-only: the fixed v1 keys move the cursor, collapse or expand,
  * page the detail pane, and toggle tool-noise visibility; nothing
- * steers a dispatch. Escape resolves done(undefined), which pi turns
- * into closing the view and restoring the editor.
+ * steers a dispatch. Escape resolves done(undefined), which closes
+ * the overlay and restores the editor.
  *
  * The tool-noise toggle hides the file-reading tool calls (read,
  * grep, find, ls) so the default detail pane leads with thinking and
@@ -348,15 +361,15 @@ export class NavigatorView implements Focusable {
 
 		const bodyRows = viewBodyRows(this.tui.terminal.rows);
 		const treeRows = this.rows.map((row) => this.renderTreeRow(row));
+		const omitted = Math.max(0, treeRows.length - bodyRows);
+		const viewport = this.detailViewportRows(bodyRows);
 		const detailLines = this.renderDetailLines();
 		const keys = detailLines.map((line) => line.key);
-		const viewport = this.detailViewportRows(bodyRows);
 		stabilizeDetailScroll(this.scroll, keys, viewport);
 		const visible = detailWindow(this.scroll, keys, viewport);
 		const detailTexts = detailLines.slice(visible.start, visible.end).map((line) => line.text);
 		if (visible.newOutput) detailTexts.push(theme.fg("muted", SCROLL_NEW_INDICATOR));
 
-		const omitted = Math.max(0, treeRows.length - bodyRows);
 		const body = new HStack(
 			[
 				{ component: new VStack(treeRows.map((line) => new Text(line, 0, 0))), basis: treeW },
@@ -364,7 +377,12 @@ export class NavigatorView implements Focusable {
 			],
 			{ gap: PANE_GAP, align: "start" },
 		).render(bodyWidth);
-		const clipped = omitted > 0 ? body.slice(0, bodyRows - 1) : body.slice(0, bodyRows);
+		// Fixed full-height frame: the body region pads to the viewport
+		// every render, and the pad lives here rather than on the pane
+		// line lists because pi-tui's Text renders empty text as zero
+		// lines, so blank list entries would not pad a VStack.
+		const clipped = body.slice(0, viewport);
+		while (clipped.length < viewport) clipped.push("");
 		if (omitted > 0) clipped.push(theme.fg("muted", `… +${omitted} more`));
 
 		const filterState = this.showToolNoise ? "tools shown" : "tools hidden";

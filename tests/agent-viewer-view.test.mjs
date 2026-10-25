@@ -10,7 +10,11 @@
  * KeybindingsManager bound to pi's app.tree.filter action ids, feeding
  * the real escape sequences pi-tui's key matchers bind (pageUp,
  * pageDown, home, end, arrows, \x14 ctrl+t, \x0f ctrl+o). Pins: the
- * frame fills the viewBodyRows budget at full width; the scroll keys
+ * entry's open key drives ctx.ui.custom with the top-anchored
+ * full-width overlay options and the double-open guard; the frame
+ * fills the full terminal height (the viewBodyRows body budget plus
+ * the view's own header and hints lines) and stays fixed across short
+ * content and agent switches; the scroll keys
  * move only the detail window while selectedId/selectedIndex stay
  * fixed; the pane shows the newest output by default and re-anchors
  * on selection changes; the indicator appears for output arriving
@@ -25,7 +29,9 @@
  * row short so the newest line and the indicator survive the +N more
  * clip; a taller resize while held suppresses the marker once the
  * tail is actually visible and the following pageDown re-acquires the
- * follow; tree toggling is unchanged; short content
+ * follow; a shrink resize keeps the frame at exactly the shrunk
+ * terminal's height while following and while held; tree toggling is
+ * unchanged; short content
  * keeps the scroll keys as no-ops; escape resolves the done callback;
  * and the hints line truncates instead of overflowing a narrow width.
  */
@@ -118,6 +124,64 @@ async function withView(sources, run, tui = stubTui(), theme = themeStub) {
 	}
 }
 
+// --- hosting: the entry's open key drives ctx.ui.custom as a top-anchored full-width overlay ---
+
+{
+	const shortcuts = {};
+	let sessionStart = null;
+	const piStub = {
+		getSettings: () => ({}),
+		registerShortcut: (key, binding) => {
+			shortcuts[key] = binding;
+		},
+		on: (event, handler) => {
+			if (event === "session_start") sessionStart = handler;
+		},
+	};
+	const { default: extensionMain } = await import("../extensions/agent-viewer/index.ts");
+	await extensionMain(piStub);
+	await sessionStart();
+	assert.equal(shortcuts["alt+n"].description, "Open the subagent navigator view");
+
+	let capturedOptions = null;
+	let capturedFactory = null;
+	let resolveCustom;
+	const ctx = {
+		ui: {
+			custom: (factory, options) => {
+				capturedFactory = factory;
+				capturedOptions = options;
+				return new Promise((resolve) => {
+					resolveCustom = resolve;
+				});
+			},
+			setWidget() {},
+		},
+	};
+	const opening = shortcuts["alt+n"].handler(ctx);
+	assert.ok(capturedOptions, "the open handler calls ctx.ui.custom");
+	assert.deepEqual(
+		capturedOptions,
+		{ overlay: true, overlayOptions: { anchor: "top-center", width: "100%", maxHeight: "100%" } },
+		"the view hosts as a top-anchored full-width overlay clamped to the full terminal height",
+	);
+
+	await shortcuts["alt+n"].handler({
+		ui: {
+			custom: () => {
+				throw new Error("a second open while the view shows must not reach ctx.ui.custom");
+			},
+			setWidget() {},
+		},
+	});
+
+	const view = capturedFactory(stubTui(), themeStub, keybindings, () => {});
+	assert.ok(view instanceof NavigatorView, "the custom factory builds the navigator view");
+	view.dispose();
+	resolveCustom(undefined);
+	await opening;
+}
+
 // --- frame budget, full width, tail anchor, indicator, re-anchor on selection change ---
 
 {
@@ -138,6 +202,7 @@ async function withView(sources, run, tui = stubTui(), theme = themeStub) {
 
 		const frame = view.render(120);
 		assert.equal(frame.length, BODY_ROWS + 2, "the frame fills exactly the body budget plus the header and hints lines");
+		assert.equal(frame.length, ROWS, "the frame is the full terminal height: the overlay hosts the view full screen");
 		for (const line of frame) {
 			assert.ok(visibleWidth(line) <= 120, "every rendered line fits the full width");
 		}
@@ -190,6 +255,30 @@ async function withView(sources, run, tui = stubTui(), theme = themeStub) {
 		assert.ok(endRender.includes("log line 30"), "end returns to the tail");
 		assert.ok(!endRender.includes("log line 0"));
 		assert.ok(!endRender.includes(SCROLL_NEW_INDICATOR), "end clears the indicator");
+	});
+}
+
+// --- the frame is full height for short content and stays fixed across agent switches ---
+
+{
+	const registry = createDispatchRegistry();
+	const task = registry.startTask({ mode: "single", prompt: "Task: EXT-9-2 frame probe", now: 1_000 });
+	registry.startRound(task.id, [{ agent: "scout" }, { agent: "mapper" }], 1_000);
+	registry.updateAgent(task.id, 1, 0, { activity: [{ at: 1_100, kind: "text", text: "scout note 0" }] });
+	registry.updateAgent(task.id, 1, 1, { activity: mapperLog(30) });
+	await withView({ registry, detachedJobs: [] }, async (view) => {
+		view.handleInput(DOWN);
+		view.handleInput(DOWN);
+		assert.equal(view.selectedId, "t:task-1:r1:a0");
+
+		const scoutFrame = view.render(120);
+		assert.equal(scoutFrame.length, ROWS, "a short agent's frame still fills the terminal");
+		assert.equal(scoutFrame[scoutFrame.length - 2], "", "the body's last row is padding while the detail content is short");
+
+		view.handleInput(DOWN);
+		assert.equal(view.selectedId, "t:task-1:r1:a1");
+		const mapperFrame = view.render(120);
+		assert.equal(mapperFrame.length, ROWS, "switching to a taller agent keeps the frame height fixed");
 	});
 }
 
@@ -326,7 +415,10 @@ async function withView(sources, run, tui = stubTui(), theme = themeStub) {
 		model: "probe-model-9",
 		cwd: "/probe/cwd-9",
 		usage: usage(900),
-		activity: mapperLog(28),
+		// 36 lines put one pageUp's landing (scrollTop = lines - 35 at the
+		// 22-row body budget) on the field block, below the pane header,
+		// which is the scenario this block pins.
+		activity: mapperLog(36),
 	});
 	await withView({ registry, detachedJobs: [] }, async (view) => {
 		const poll = () => view.refresh();
@@ -446,6 +538,33 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		view.handleInput(PAGE_DOWN);
 		assert.equal(view.scroll.following, true, "pageDown at the clamped tail reacquires the follow by intent");
 		assert.equal(view.scroll.heldTopKey, null, "the reacquire clears the hold");
+	}, tui);
+}
+
+// --- a shrink resize: the frame tracks the terminal down while following and while held ---
+
+{
+	const tui = stubTui();
+	const { registry } = scrollFixture();
+	await withView({ registry, detachedJobs: [] }, async (view) => {
+		const poll = () => view.refresh();
+		view.handleInput(DOWN);
+		view.handleInput(DOWN);
+		view.handleInput(DOWN);
+		assert.equal(view.selectedId, "t:task-1:r1:a1", "the block selects the long-activity agent as its premise");
+
+		tui.terminal.rows = 60;
+		poll();
+		assert.equal(view.render(120).length, 60, "the frame fills the taller terminal before the shrink");
+
+		tui.terminal.rows = 12;
+		poll();
+		assert.equal(view.render(120).length, 12, "the frame tracks a shrink resize exactly while following");
+
+		view.handleInput(PAGE_UP);
+		poll();
+		assert.equal(view.scroll.following, false, "the block's pageUp holds the window as its premise");
+		assert.equal(view.render(120).length, 12, "the frame tracks a shrink resize exactly while held");
 	}, tui);
 }
 
