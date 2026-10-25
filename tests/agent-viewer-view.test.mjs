@@ -30,7 +30,16 @@
  * clip; a taller resize while held suppresses the marker once the
  * tail is actually visible and the following pageDown re-acquires the
  * follow; a shrink resize keeps the frame at exactly the shrunk
- * terminal's height while following and while held; tree toggling is
+ * terminal's height while following and while held; the wheel (stub
+ * pi-tui TuiMouseEvent wheel events) claims every wheel with
+ * { handled: true } and scrolls the detail pane by the signed
+ * accelerated wheelDelta, clamped to the per-event ceiling, fractional
+ * deltas truncing to whole lines and non-finite ones moving nothing,
+ * wheel up
+ * releasing the follow and arming the indicator for output arriving
+ * during the hold, wheel down reacquiring the follow at the bottom,
+ * short content staying a no-op, presses and clicks passing through
+ * unclaimed, and the selection never moving; tree toggling is
  * unchanged; short content
  * keeps the scroll keys as no-ops; escape resolves the done callback;
  * and the hints line truncates instead of overflowing a narrow width.
@@ -46,7 +55,7 @@ import { buildNavigatorTasks, createExpansionState, flattenNavigatorTree } from 
 // and the suite's own specifier bindings must wait for the shim provisioning
 // that importPiTui performs.
 const { KeybindingsManager, truncateToWidth, visibleWidth } = await importPiTui();
-const { NavigatorView } = await import("../extensions/agent-viewer/view.ts");
+const { NavigatorView, WHEEL_MAX_DELTA_LINES } = await import("../extensions/agent-viewer/view.ts");
 
 const ROWS = 24;
 const BODY_ROWS = viewBodyRows(ROWS);
@@ -88,6 +97,25 @@ const activityEntry = (index, from = 0) => ({
 });
 
 const mapperLog = (count) => Array.from({ length: count }, (_, index) => activityEntry(index, 2_000));
+
+// Stub pi-tui TuiMouseEvent for the wheel: the shape the fullscreen
+// overlay dispatch hands a component (signed accelerated wheelDelta
+// in lines, negative up), overridable for press/click/move variants.
+const wheelEvent = (wheelDelta, overrides = {}) => ({
+	type: "wheel",
+	button: "none",
+	x: 40,
+	y: 5,
+	screenX: 40,
+	screenY: 5,
+	width: 120,
+	height: ROWS,
+	shift: false,
+	alt: false,
+	ctrl: false,
+	wheelDelta,
+	...overrides,
+});
 
 // Tool-call log with named calls: even indices are noisy reads, odd
 // indices are writes that stay visible under the default filter.
@@ -568,6 +596,64 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 	}, tui);
 }
 
+// --- wheel: the signed wheelDelta scrolls the detail pane like the keyboard path, every wheel is claimed, the selection never moves ---
+
+{
+	const registry = createDispatchRegistry();
+	const task = registry.startTask({ mode: "single", prompt: "Task: EXT-7-6 wheel probe", now: 1_000 });
+	registry.startRound(task.id, [{ agent: "mapper" }], 1_000);
+	registry.updateAgent(task.id, 1, 0, { activity: mapperLog(120) });
+	await withView({ registry, detachedJobs: [] }, async (view) => {
+		const poll = () => view.refresh();
+		const MAPPER_ID = "t:task-1:r1:a0";
+
+		view.handleInput(DOWN);
+		view.handleInput(DOWN);
+		assert.equal(view.selectedId, MAPPER_ID);
+		view.render(120);
+		const tailTop = view.scroll.scrollTop;
+		assert.ok(tailTop > WHEEL_MAX_DELTA_LINES, "the fixture is tall enough to tell the per-event clamp from the content clamp");
+
+		assert.deepEqual(view.handleMouse(wheelEvent(-3)), { handled: true }, "wheel up is claimed with handled");
+		assert.equal(view.selectedId, MAPPER_ID, "wheel up leaves the selection fixed");
+		assert.equal(view.scroll.scrollTop, tailTop - 3, "wheel up moves the window by the signed delta");
+		assert.equal(view.scroll.following, false, "wheel up releases the follow like pageUp");
+
+		registry.updateAgent(task.id, 1, 0, { activity: [...mapperLog(120), activityEntry(120)] });
+		poll();
+		const indicatorRender = view.render(120).join("\n");
+		assert.ok(indicatorRender.includes(SCROLL_NEW_INDICATOR), "output arriving during a wheel hold shows the indicator");
+		assert.ok(!indicatorRender.includes("log line 120"), "the unseen tail stays below the held window");
+
+		assert.deepEqual(view.handleMouse(wheelEvent(-200, { alt: true })), { handled: true }, "an accelerated alt wheel is claimed");
+		assert.equal(view.scroll.scrollTop, tailTop - 3 - WHEEL_MAX_DELTA_LINES, "a pathological delta clamps to the per-event ceiling");
+		assert.equal(view.selectedId, MAPPER_ID, "the clamped wheel leaves the selection fixed");
+		assert.ok(view.render(120).join("\n").includes(SCROLL_NEW_INDICATOR), "the clamped wheel keeps the hold and its indicator");
+
+		assert.deepEqual(view.handleMouse(wheelEvent(2.9)), { handled: true }, "a fractional wheel is claimed");
+		assert.equal(view.scroll.scrollTop, tailTop - 3 - WHEEL_MAX_DELTA_LINES + 2, "a fractional wheel truncs to whole lines");
+		assert.notEqual(view.scroll.heldTopKey, null, "the truncated wheel keeps the hold anchored on a real line");
+
+		const heldTopBefore = view.scroll.heldTopKey;
+		assert.deepEqual(view.handleMouse(wheelEvent(NaN)), { handled: true }, "a non-finite wheel is claimed");
+		assert.equal(view.scroll.scrollTop, tailTop - 3 - WHEEL_MAX_DELTA_LINES + 2, "a non-finite wheel moves nothing");
+		assert.equal(view.scroll.heldTopKey, heldTopBefore, "a non-finite wheel leaves the hold anchor untouched");
+
+		assert.equal(view.handleMouse(wheelEvent(-3, { type: "press", button: "left", wheelDelta: undefined })), undefined, "a press passes through unclaimed");
+		assert.equal(view.handleMouse(wheelEvent(0, { type: "click", button: "left", wheelDelta: undefined })), undefined, "a click passes through unclaimed");
+		assert.equal(view.handleMouse(wheelEvent(0, { type: "move", wheelDelta: undefined })), undefined, "a move passes through unclaimed");
+		assert.equal(view.scroll.following, false, "unclaimed events leave the hold untouched");
+
+		assert.deepEqual(view.handleMouse(wheelEvent(WHEEL_MAX_DELTA_LINES)), { handled: true }, "wheel down is claimed");
+		assert.equal(view.scroll.following, false, "wheel down short of the tail keeps the hold");
+		assert.deepEqual(view.handleMouse(wheelEvent(WHEEL_MAX_DELTA_LINES)), { handled: true }, "a second wheel down is claimed");
+		assert.equal(view.scroll.following, true, "wheel down that reaches the tail reacquires the follow");
+		assert.equal(view.scroll.heldTopKey, null, "the reacquire clears the hold");
+		assert.ok(!view.render(120).join("\n").includes(SCROLL_NEW_INDICATOR), "the reacquire clears the indicator");
+		assert.equal(view.selectedId, MAPPER_ID, "wheel down leaves the selection fixed");
+	});
+}
+
 // --- short content: scroll keys are no-ops and the pane renders as before ---
 
 {
@@ -590,6 +676,28 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		view.handleInput(HOME);
 		view.handleInput(END);
 		assert.equal(view.render(120).join("\n"), before, "short content keeps every scroll key a no-op");
+	});
+}
+
+// --- wheel on short content: claimed like every wheel, but the pane render is a no-op ---
+
+{
+	const detached = {
+		id: "job-wheel",
+		mode: "single",
+		status: "running",
+		agentNames: ["observer"],
+		taskPreview: "watch the wheel probe",
+		startedAt: 1_000,
+	};
+	await withView({ registry: createDispatchRegistry(), detachedJobs: [detached] }, async (view) => {
+		view.handleInput(DOWN);
+		assert.equal(view.selectedId, "t:job-wheel:a0");
+		const before = view.render(120).join("\n");
+		assert.deepEqual(view.handleMouse(wheelEvent(-3)), { handled: true }, "wheel up on short content is still claimed");
+		assert.deepEqual(view.handleMouse(wheelEvent(3)), { handled: true }, "wheel down on short content is still claimed");
+		assert.equal(view.scroll.following, true, "short content keeps the follow");
+		assert.equal(view.render(120).join("\n"), before, "short content keeps wheel a no-op");
 	});
 }
 

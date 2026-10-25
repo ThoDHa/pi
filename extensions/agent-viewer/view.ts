@@ -27,8 +27,25 @@
  * interval plus requestRender, cleared in dispose) and renders
  * through the theme with the fleet glyph conventions. Strictly
  * read-only: the fixed v1 keys move the cursor, collapse or expand,
- * page the detail pane, and toggle tool-noise visibility; nothing
- * steers a dispatch. Escape resolves done(undefined), which closes
+ * page the detail pane, and toggle tool-noise visibility, and in
+ * fullscreen mode the mouse wheel scrolls the detail pane through the
+ * same scroll model; nothing steers a dispatch.
+ *
+ * In fullscreen mode pi's alt-screen dispatcher offers normalized
+ * wheel events to the overlay, coordinates localized to the view's
+ * box, carrying a signed wheelDelta already scaled by the stack's
+ * scroll acceleration (negative up, positive down, multiplied by five
+ * under alt), so the wheel consumes the delta natively instead of
+ * counting discrete notches and stays consistent with how the
+ * transcript's own ScrollView accelerates. handleMouse clamps the
+ * delta to a per-event ceiling and feeds it through the same
+ * scrollDetailBy as the paging keys, claiming every wheel with
+ * { handled: true }: wheel the overlay leaves unhandled falls through
+ * to the transcript ScrollView beneath, which while the view is open
+ * is fully covered and must not scroll invisibly. Clicks and every
+ * non-wheel event pass through unclaimed, and regular mode never
+ * parses mouse at all, so the scroll keys remain the only scroll path
+ * there. Escape resolves done(undefined), which closes
  * the overlay and restores the editor.
  *
  * The tool-noise toggle hides the file-reading tool calls (read,
@@ -40,7 +57,7 @@
  */
 
 import type { KeybindingsManager, Theme, TUI } from "@earendil-works/pi-coding-agent";
-import { CURSOR_MARKER, type Focusable, type KeyId, type Keybinding, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, type Focusable, type KeyId, type Keybinding, type TuiMouseEvent, type TuiMouseEventResult, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { HStack, Text, VStack } from "@earendil-works/pi-tui";
 import { filterActivityEntries } from "./activity-filter.ts";
 import { statusGlyph, type DetachedJobSnapshot, type DispatchRegistry } from "../subagent/registry.ts";
@@ -91,6 +108,19 @@ const DETAIL_PANE_MIN_WIDTH = 30;
 const PANE_GAP = 3;
 
 const HINTS_LINE = "↑/↓ move · ←/→ collapse/expand · tab next task · pgup/pgdn scroll · ctrl+t tools · esc close";
+
+/**
+ * Per-event wheel ceiling in detail lines: above the stack's largest
+ * accelerated delta (its six-line velocity peak times the alt
+ * fivefold multiplier), so real events pass unclamped while a
+ * pathological one cannot move the window further than one maximum
+ * wheel. Accepted limit: the ceiling assumes the default "auto"
+ * setting, so with a numeric fullscreenWheelScrollLines above 6 (the
+ * alt multiplier is five) one wheel scrolls the transcript beyond 30
+ * lines while the navigator still clamps here; the "auto" peak
+ * (6 * 5 = 30) equals the ceiling and is unaffected.
+ */
+export const WHEEL_MAX_DELTA_LINES = 30;
 
 /** Marker prefixing a thinking line, so thought reads as thought and not as streamed output. */
 const THINKING_MARKER = "…";
@@ -247,6 +277,22 @@ export class NavigatorView implements Focusable {
 		}
 	}
 
+	/**
+	 * Wheel input from pi's fullscreen overlay dispatch: claim every
+	 * wheel ({ handled: true }), scrolling the detail pane by the signed
+	 * wheelDelta clamped to WHEEL_MAX_DELTA_LINES, with the keyboard
+	 * path's semantics via scrollDetailBy; non-wheel events return
+	 * undefined so clicks and drags pass through unclaimed.
+	 */
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (event.type !== "wheel") return undefined;
+		const rawDelta = typeof event.wheelDelta === "number" && Number.isFinite(event.wheelDelta) ? event.wheelDelta : 0;
+		const delta = Math.max(-WHEEL_MAX_DELTA_LINES, Math.min(WHEEL_MAX_DELTA_LINES, Math.trunc(rawDelta)));
+		const viewport = this.detailViewport();
+		scrollDetailBy(this.scroll, delta, this.detailKeys(), viewport);
+		return { handled: true };
+	}
+
 	/** left collapses, right expands; the row semantics live in the pure toggleNavigatorRow (suite-pinned), the component only dispatches keys and re-reads. */
 	private toggleRow(expand: boolean): void {
 		const row = this.rows[this.selectedIndex];
@@ -257,13 +303,13 @@ export class NavigatorView implements Focusable {
 
 	/** Page the detail pane one viewport (minus its overlap line) up or down; the tail-following state lives in the pure DetailScrollState. */
 	private pageDetail(direction: -1 | 1): void {
-		const viewport = this.detailViewportRows(viewBodyRows(this.tui.terminal.rows));
+		const viewport = this.detailViewport();
 		scrollDetailBy(this.scroll, direction * pageStepRows(viewport), this.detailKeys(), viewport);
 	}
 
 	/** Jump the detail pane to a line index (clamped; Infinity lands on the tail). */
 	private jumpDetail(target: number): void {
-		const viewport = this.detailViewportRows(viewBodyRows(this.tui.terminal.rows));
+		const viewport = this.detailViewport();
 		scrollDetailTo(this.scroll, target, this.detailKeys(), viewport);
 	}
 
@@ -277,6 +323,11 @@ export class NavigatorView implements Focusable {
 	 */
 	private detailViewportRows(bodyRows: number): number {
 		return this.rows.length > bodyRows ? bodyRows - 1 : bodyRows;
+	}
+
+	/** Detail-pane viewport rows for the current terminal frame. */
+	private detailViewport(): number {
+		return this.detailViewportRows(viewBodyRows(this.tui.terminal.rows));
 	}
 
 	private detailKeys(): string[] {
@@ -362,7 +413,7 @@ export class NavigatorView implements Focusable {
 		const bodyRows = viewBodyRows(this.tui.terminal.rows);
 		const treeRows = this.rows.map((row) => this.renderTreeRow(row));
 		const omitted = Math.max(0, treeRows.length - bodyRows);
-		const viewport = this.detailViewportRows(bodyRows);
+		const viewport = this.detailViewport();
 		const detailLines = this.renderDetailLines();
 		const keys = detailLines.map((line) => line.key);
 		stabilizeDetailScroll(this.scroll, keys, viewport);
