@@ -31,9 +31,10 @@
  * read-only over dispatches: the fixed v1 keys move the cursor,
  * collapse or expand, page the detail pane, toggle tool-noise
  * visibility, and open the selected finished agent's full thinking
- * from the session transcript (t), and in fullscreen mode the mouse
- * wheel scrolls the detail pane through the same scroll model; nothing
- * steers a dispatch.
+ * from the session transcript (t, streamed line by line behind a
+ * loading note so no press ever blocks on disk), and in fullscreen
+ * mode the mouse wheel scrolls the detail pane through the same scroll
+ * model; nothing steers a dispatch.
  *
  * In fullscreen mode pi's alt-screen dispatcher offers normalized
  * wheel events to the overlay, coordinates localized to the view's
@@ -61,7 +62,8 @@
  */
 
 import type { KeybindingsManager, Theme, TUI } from "@earendil-works/pi-coding-agent";
-import { readFileSync } from "node:fs";
+import { createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
 import { CURSOR_MARKER, type Focusable, type KeyId, type Keybinding, type TuiMouseEvent, type TuiMouseEventResult, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { HStack, Text, VStack } from "@earendil-works/pi-tui";
 import { filterActivityEntries } from "./activity-filter.ts";
@@ -89,7 +91,7 @@ import {
 import {
 	buildNavigatorTasks,
 	createExpansionState,
-	extractTranscriptThinking,
+	createTranscriptThinkingScanner,
 	flattenNavigatorTree,
 	moveCursor,
 	nextTaskRow,
@@ -98,6 +100,7 @@ import {
 	type NavigatorExpansionState,
 	type NavigatorRow,
 	type NavigatorTaskView,
+	type TranscriptThinkingLookup,
 } from "./navigator.ts";
 import { GLYPH_COLORS } from "./strip.ts";
 
@@ -114,6 +117,16 @@ export interface NavigatorSources {
 	 * shortcut handler's ctx.sessionManager.getSessionFile().
 	 */
 	sessionFile?: () => string | undefined;
+	/**
+	 * Streams the transcript file line by line for the t keybinding:
+	 * called with the session file path, a per-line callback, and an
+	 * abort signal, resolving when the read completed and rejecting when
+	 * it failed; the view feeds the lines into its scanner and lands
+	 * only if the read was not aborted meanwhile. Absent means the
+	 * default readline-over-createReadStream reader runs; the navigator
+	 * suites inject a deterministic reader instead.
+	 */
+	readTranscriptLines?: (file: string, onLine: (line: string) => void, signal: AbortSignal) => Promise<void>;
 }
 
 const TREE_PANE_MIN_WIDTH = 26;
@@ -147,6 +160,9 @@ const TRANSCRIPT_SECTION_LABEL = "full thinking · transcript · t to return";
 /** Note rendered when the transcript cannot be read (no tracking, no file). */
 const TRANSCRIPT_UNAVAILABLE_NOTE = "session transcript unavailable";
 
+/** Note rendered under the transcript label while the streamed read is in flight. */
+const TRANSCRIPT_LOADING_NOTE = "reading transcript…";
+
 /** Note when the transcript holds no record for the agent: the record is absent, not the thinking. */
 const TRANSCRIPT_NO_RECORD_NOTE = "no transcript record for this agent";
 
@@ -165,6 +181,9 @@ const TRANSCRIPT_EMPTY_STATE_LIVE_LABEL_KEY = "thinking-empty-live-label";
 /** Identity key of the thinking section's label line: a structural slot like the pane's other static lines. */
 const THINKING_LABEL_LINE_KEY = "thinking-label";
 
+/** Identity key of the transcript view's loading note, stable across polls so scroll stabilization never reacts to it. */
+const TRANSCRIPT_LOADING_LINE_KEY = "thinking-loading";
+
 const BLANK_DETAIL_LINE: DetailLine = { text: "", key: BLANK_LINE_KEY };
 
 function formatClock(at: number): string {
@@ -174,22 +193,77 @@ function formatClock(at: number): string {
 }
 
 /**
+ * The default transcript reader behind the t keybinding: readline over
+ * a read stream yields the file line by line (and a torn trailing line
+ * still yields, failing the scanner's parse guard exactly as the
+ * whole-string split did), so no press ever allocates the file as one
+ * string or blocks the UI thread for the whole read. The abort signal
+ * closes the stream mid-read; an aborted read resolves (the view drops
+ * its result by the abort handle) and a failed open or read rejects,
+ * which the view lands on its unavailable note.
+ */
+function streamTranscriptLines(file: string, onLine: (line: string) => void, signal: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (signal.aborted) {
+			resolve();
+			return;
+		}
+		const input = createReadStream(file, { encoding: "utf8" });
+		const reader = createInterface({ input, crlfDelay: Infinity });
+		let settled = false;
+		let failure: unknown;
+		const close = () => {
+			reader.close();
+			input.destroy();
+		};
+		const settle = (outcome?: unknown) => {
+			if (settled) return;
+			settled = true;
+			signal.removeEventListener("abort", onAbort);
+			if (outcome === undefined) resolve();
+			else reject(outcome);
+		};
+		function onAbort() {
+			close();
+		}
+		signal.addEventListener("abort", onAbort, { once: true });
+		reader.on("line", onLine);
+		// reader.close() inside an error handler emits close synchronously,
+		// so the close handler settles with the recorded failure; the
+		// error handlers' own settle calls are then idempotent backstops.
+		reader.on("close", () => settle(failure));
+		reader.on("error", (error) => {
+			failure = error;
+			close();
+			settle(error);
+		});
+		input.on("error", (error) => {
+			failure = error;
+			close();
+			settle(error);
+		});
+	});
+}
+
+/**
  * The t keybinding's transcript reading state: the agent it was opened
- * for, its full uncapped thinking loaded once from the parent session
- * .jsonl, and whether the read succeeded. The snapshot is taken at
- * open time and kept across polls (the transcript is append-only, so
- * a completed result is stable); moving the cursor or pressing t
- * again leaves it. Both empty states are honest about which side
- * holds nothing: no transcript record for the agent (the finished
- * detached case, whose empty subagent toolResult carries no per-agent
- * results) or a matching record with no thinking parts (an agent that
- * finished without reasoning); either keeps the live buffer's
- * thinking section visible beneath its note when the buffer is
- * non-empty.
+ * for, its full uncapped thinking streamed from the parent session
+ * .jsonl behind a loading state, and which phase the read is in. The
+ * press starts the streamed read and renders the loading note until
+ * the read lands (or is aborted: re-press toggles off, a cursor move
+ * or dispose aborts, and an abandoned read never lands). The landed
+ * snapshot is kept across polls (the transcript is append-only, so a
+ * completed result is stable); moving the cursor or pressing t again
+ * leaves it. Both empty states are honest about which side holds
+ * nothing: no transcript record for the agent (the finished detached
+ * case, whose empty subagent toolResult carries no per-agent results)
+ * or a matching record with no thinking parts (an agent that finished
+ * without reasoning); either keeps the live buffer's thinking section
+ * visible beneath its note when the buffer is non-empty.
  */
 interface TranscriptThinkingState {
 	agent: string;
-	state: "loaded" | "found-empty" | "empty" | "unavailable";
+	state: "loading" | "loaded" | "found-empty" | "empty" | "unavailable";
 	entries: DispatchThinkingEntry[];
 }
 
@@ -205,6 +279,8 @@ export class NavigatorView implements Focusable {
 	private scroll: DetailScrollState = createDetailScrollState();
 	private showToolNoise = false;
 	private transcript: TranscriptThinkingState | null = null;
+	/** Abort handle of the active transcript read; null while no read is in flight. The single active-read slot. */
+	private transcriptRead: AbortController | null = null;
 	private interval: ReturnType<typeof setInterval> | null = null;
 	private readonly tui: TUI;
 	private readonly theme: Theme;
@@ -230,6 +306,7 @@ export class NavigatorView implements Focusable {
 			clearInterval(this.interval);
 			this.interval = null;
 		}
+		this.abortTranscriptRead();
 	}
 
 	/** TUI invalidation hook: no cached render state, every render rebuilds rows from the shared state. */
@@ -260,13 +337,20 @@ export class NavigatorView implements Focusable {
 		this.adoptSelection(row.id);
 	}
 
-	/** Re-anchor the detail window when the selection identity changes: a different row is different content, so a held window cannot carry over. */
+	/** Re-anchor the detail window when the selection identity changes: a different row is different content, so a held window cannot carry over. The change also aborts any in-flight transcript read, so it can never land for the row left behind. */
 	private adoptSelection(id: string | null): void {
 		if (id !== this.selectedId) {
+			this.abortTranscriptRead();
 			this.scroll = createDetailScrollState();
 			this.transcript = null;
 		}
 		this.selectedId = id;
+	}
+
+	/** Abort the active transcript read and free its slot, so its landing is dropped by the abort-handle guard. */
+	private abortTranscriptRead(): void {
+		this.transcriptRead?.abort();
+		this.transcriptRead = null;
 	}
 
 	/** Toggle tool-noise visibility and re-anchor: filtering reshapes the line list, so a held window could point past the new tail. */
@@ -278,23 +362,28 @@ export class NavigatorView implements Focusable {
 
 	/**
 	 * Toggle the t keybinding's transcript reading view for the selected
-	 * agent. A finished agent (done or failed) loads its full thinking
-	 * from the current session .jsonl via the injected sessionFile
-	 * source: read once at open time, uncapped, the selected run's window
+	 * agent. A finished agent (done or failed) streams its full thinking
+	 * from the current session .jsonl via the injected sessionFile and
+	 * readTranscriptLines sources: uncapped, the selected run's window
 	 * matching first and the session-latest matching subagent toolResult
-	 * winning when no record falls inside the window. A running agent, a
-	 * task or round row,
-	 * or an already-open view is a no-op or toggles off; a missing
-	 * source, undefined path, or unreadable file renders the
-	 * unavailable note instead of throwing. An empty read renders a note
-	 * naming which side holds nothing (no record for the agent, the
+	 * winning when no record falls inside the window. The press never
+	 * touches disk synchronously: it renders the loading note and
+	 * returns, the read's lines feed the shared scanner, and the landed
+	 * result swaps the note for the terminal state. Re-press toggles off
+	 * and aborts; a cursor move (adoptSelection) and dispose abort too,
+	 * and an aborted read never lands. A running agent, a task or round
+	 * row, or an already-open view is a no-op or toggles off; a missing
+	 * source, undefined path, or failed read renders the unavailable
+	 * note instead of throwing. An empty read renders a note naming
+	 * which side holds nothing (no record for the agent, the
 	 * finished-detached case, or a matching record with no thinking
-	 * parts) and keeps the live buffer's thinking section visible beneath
-	 * it when the buffer is non-empty. Opening or closing
+	 * parts) and keeps the live buffer's thinking section visible
+	 * beneath it when the buffer is non-empty. Opening or closing
 	 * re-anchors the detail window: both swap the whole pane body.
 	 */
 	private toggleTranscriptThinking(): void {
 		if (this.transcript) {
+			this.abortTranscriptRead();
 			this.transcript = null;
 			this.scroll = createDetailScrollState();
 			this.tui.requestRender();
@@ -304,23 +393,45 @@ export class NavigatorView implements Focusable {
 		const model = resolveDetailModel(selected, this.tasks);
 		if (model.kind !== "agent" || model.statusText === "running") return;
 		const agent = model.title;
-		let state: TranscriptThinkingState["state"];
-		let entries: DispatchThinkingEntry[] = [];
 		const sessionFile = this.sources.sessionFile?.();
-		if (!sessionFile) {
-			state = "unavailable";
-		} else {
-			try {
-				const lookup = extractTranscriptThinking(readFileSync(sessionFile, "utf8"), agent, model.runWindow);
-				entries = lookup.entries;
-				if (!lookup.found) state = "empty";
-				else state = lookup.entries.length > 0 ? "loaded" : "found-empty";
-			} catch {
-				state = "unavailable";
-			}
-		}
-		this.transcript = { agent, state, entries };
 		this.scroll = createDetailScrollState();
+		if (!sessionFile) {
+			this.transcript = { agent, state: "unavailable", entries: [] };
+			this.tui.requestRender();
+			return;
+		}
+		const read = new AbortController();
+		this.transcriptRead = read;
+		this.transcript = { agent, state: "loading", entries: [] };
+		this.tui.requestRender();
+		const scanner = createTranscriptThinkingScanner(agent, model.runWindow);
+		(this.sources.readTranscriptLines ?? streamTranscriptLines)(sessionFile, (line) => scanner.feed(line), read.signal).then(
+			() => this.landTranscriptRead(read, scanner.finish()),
+			() => this.landTranscriptRead(read, undefined),
+		);
+	}
+
+	/**
+	 * Land a finished transcript read, dropping it unless it is still the
+	 * active read: the single slot is keyed by the read's abort handle,
+	 * and every discard path (re-press, selection change, dispose,
+	 * supersession) aborts and clears the slot before the landing can
+	 * run. A failed read lands on the unavailable note, parity with the
+	 * synchronous catch it replaces.
+	 */
+	private landTranscriptRead(read: AbortController, lookup?: TranscriptThinkingLookup): void {
+		if (this.transcriptRead !== read) return;
+		this.transcriptRead = null;
+		if (this.transcript?.state !== "loading") return;
+		if (lookup === undefined) {
+			this.transcript = { agent: this.transcript.agent, state: "unavailable", entries: [] };
+		} else {
+			this.transcript = {
+				agent: this.transcript.agent,
+				state: !lookup.found ? "empty" : lookup.entries.length > 0 ? "loaded" : "found-empty",
+				entries: lookup.entries,
+			};
+		}
 		this.tui.requestRender();
 	}
 
@@ -507,7 +618,9 @@ export class NavigatorView implements Focusable {
 		});
 		if (this.transcript && this.transcript.agent === model.title && model.kind === "agent") {
 			lines.push({ text: theme.fg("muted", TRANSCRIPT_SECTION_LABEL), key: THINKING_LABEL_LINE_KEY });
-			if (this.transcript.state === "loaded") {
+			if (this.transcript.state === "loading") {
+				lines.push({ text: theme.fg("muted", TRANSCRIPT_LOADING_NOTE), key: TRANSCRIPT_LOADING_LINE_KEY });
+			} else if (this.transcript.state === "loaded") {
 				lines.push(...this.thinkingLines(this.transcript.entries));
 			} else if (this.transcript.state === "empty" || this.transcript.state === "found-empty") {
 				const notes =

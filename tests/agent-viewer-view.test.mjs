@@ -29,10 +29,14 @@
  * re-anchors the scroll window;
  * thinking entries render dim with a marker prefix; the full-text
  * thinking section renders below the activity log in thinkingText
- * italic with a live label; the t keybinding on a finished agent loads
- * that agent's full, uncapped thinking from the current session
- * transcript via the injected sessionFile source (latest matching
- * subagent toolResult wins), toggles back off, survives polls, and is
+ * italic with a live label; the t keybinding on a finished agent
+ * streams that agent's full, uncapped thinking from the current
+ * session transcript through the injected sessionFile source and
+ * reader (latest matching subagent toolResult wins), rendering a
+ * `reading transcript…` loading note between press and resolution,
+ * toggles back off, aborts the in-flight read on re-press, on cursor
+ * moves, and on dispose without ever landing an abandoned read, lands
+ * a failed read on the unavailable note, survives polls, and is
  * cleared by moving the cursor, while a running agent ignores t and a
  * missing or unreadable transcript renders a note instead of
  * throwing; a transcript lookup miss keeps the live thinking section
@@ -63,7 +67,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { importPiTui } from "./provision-pi-tui.mjs";
@@ -181,6 +185,58 @@ async function withView(sources, run, tui = stubTui(), theme = themeStub) {
 	}
 }
 
+// Yields one event-loop turn: after an injected reader resolves or
+// rejects, the view's landing callback has run once this resolves.
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+// Waits for the default streamed reader to land on a bounded budget:
+// real temp .jsonl files complete within a few event-loop turns.
+async function waitForFrame(view, probe) {
+	for (let attempt = 0; attempt < 200; attempt++) {
+		if (probe(view.render(120).join("\n"))) return;
+		await new Promise((resolve) => setTimeout(resolve, 1));
+	}
+	assert.ok(probe(view.render(120).join("\n")), "the streamed transcript read did not land within the wait budget");
+}
+
+// Counts this process's open file descriptors resolving inside `dir`
+// via /proc/self/fd. This is the only observable of the default
+// reader's close-on-abort path: the view drops an aborted read's
+// landing by its abort-handle guard either way, so a reader that
+// ignores the signal differs in no rendered frame, only in the fd it
+// keeps reading through to EOF.
+function openTranscriptDescriptors(dir) {
+	return readdirSync("/proc/self/fd").filter((fd) => {
+		try {
+			return readlinkSync(join("/proc/self/fd", fd)).startsWith(dir);
+		} catch {
+			return false;
+		}
+	}).length;
+}
+
+// Waits until the streamed read's descriptor is open, proving the read
+// is genuinely in flight, on the same bounded budget as waitForFrame.
+async function waitForOpenDescriptor(dir) {
+	for (let attempt = 0; attempt < 200; attempt++) {
+		if (openTranscriptDescriptors(dir) > 0) return;
+		await new Promise((resolve) => setTimeout(resolve, 1));
+	}
+	assert.ok(openTranscriptDescriptors(dir) > 0, "the streamed transcript read never opened the session file");
+}
+
+// Waits until the aborted read's descriptor is closed on a budget the
+// pin's fixture cannot read to EOF within (a full read of ~65 MB takes
+// ~175 ms here), so a reader that ignores the abort fails here instead
+// of leaking the fd to EOF.
+async function waitForClosedDescriptor(dir) {
+	for (let attempt = 0; attempt < 50; attempt++) {
+		if (openTranscriptDescriptors(dir) === 0) return;
+		await new Promise((resolve) => setTimeout(resolve, 1));
+	}
+	assert.ok(openTranscriptDescriptors(dir) === 0, "the aborted transcript read left the session file open");
+}
+
 // --- hosting: the entry's open key drives ctx.ui.custom as a top-anchored full-width overlay ---
 
 {
@@ -281,9 +337,10 @@ async function withView(sources, run, tui = stubTui(), theme = themeStub) {
 	view.handleInput(DOWN);
 	assert.ok(view.selectedId.endsWith(":a0"), "the seeded finished agent row is selectable in the entry-built view");
 	view.handleInput("t");
+	await waitForFrame(view, (frame) => frame.includes("wired transcript thought"));
 	assert.ok(
 		view.render(120).join("\n").includes("wired transcript thought"),
-		"t reads the transcript through the sessionFile source the entry wires from ctx.sessionManager.getSessionFile()",
+		"t streams the transcript through the sessionFile source the entry wires from ctx.sessionManager.getSessionFile()",
 	);
 	view.dispose();
 	resolveCustom(undefined);
@@ -861,6 +918,7 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		assert.equal(view.selectedId, "t:task-1:r1:a0");
 
 				view.handleInput("t");
+				await waitForFrame(view, (frame) => frame.includes("block 24 thought"));
 				const transcriptFrame = view.render(120).join("\n");
 				assert.ok(transcriptFrame.includes("block 24 thought"), "t opens the transcript reading view, tail-following its newest block");
 				view.handleInput("\x1b[H");
@@ -884,6 +942,7 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 				assert.ok(!liveFrame.includes("block 24 thought"));
 
 				view.handleInput("t");
+				await waitForFrame(view, (frame) => frame.includes("block 24 thought"));
 				assert.ok(view.render(120).join("\n").includes("block 24 thought"));
 				view.handleInput("\x1b[H");
 				assert.ok(view.render(120).join("\n").includes("full thinking"), "t reopens the transcript view");
@@ -916,6 +975,7 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 			view.handleInput(DOWN);
 			assert.equal(view.selectedId, "t:task-2:r1:a0");
 			view.handleInput("t");
+			await waitForFrame(view, (frame) => frame.includes("block 24 thought"));
 			view.handleInput("\x1b[H");
 			assert.ok(view.render(120).join("\n").includes("full thinking"), "t works on a failed agent");
 		}, stubTui(), thinkingTheme);
@@ -965,6 +1025,7 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 			view.handleInput(DOWN);
 			assert.equal(view.selectedId, "t:task-1:r1:a0");
 			view.handleInput("t");
+			await waitForFrame(view, (frame) => frame.includes("run one thought"));
 			const runOneFrame = view.render(120).join("\n");
 			assert.ok(runOneFrame.includes("run one thought"), "t on the older run shows that run's thinking");
 			assert.ok(!runOneFrame.includes("run two thought"), "t on the older run never shows the newer run's thinking");
@@ -976,6 +1037,7 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 			view.handleInput(DOWN);
 			assert.equal(view.selectedId, "t:task-1:r2:a0");
 			view.handleInput("t");
+			await waitForFrame(view, (frame) => frame.includes("run two thought"));
 			const runTwoFrame = view.render(120).join("\n");
 			assert.ok(runTwoFrame.includes("run two thought"), "t on the newer run shows the newer run's thinking");
 			assert.ok(!runTwoFrame.includes("run one thought"), "t on the newer run never shows the older run's thinking");
@@ -1041,6 +1103,7 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		view.handleInput(DOWN);
 		view.handleInput(DOWN);
 		view.handleInput("t");
+		await waitForFrame(view, (frame) => frame.includes("transcript unavailable"));
 		assert.ok(view.render(120).join("\n").includes("transcript unavailable"), "an unreadable session file renders the note without throwing");
 	});
 }
@@ -1086,6 +1149,7 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 			view.handleInput(DOWN);
 			assert.equal(view.selectedId, "t:task-1:r1:a0");
 			view.handleInput("t");
+			await waitForFrame(view, (frame) => frame.includes("no transcript record for this agent"));
 			const frame = view.render(120).join("\n");
 			assert.ok(frame.includes("no transcript record for this agent; showing live buffer"), "the empty note names the record's absence and says the live buffer stands in");
 			assert.ok(frame.includes("detached buffer thought"), "the live thinking section survives the transcript lookup miss");
@@ -1100,6 +1164,7 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 			view.handleInput(DOWN);
 			assert.equal(view.selectedId, "t:task-1:r1:a1");
 			view.handleInput("t");
+			await waitForFrame(view, (frame) => frame.includes("no transcript record for this agent"));
 			const frame = view.render(120).join("\n");
 			assert.ok(frame.includes("no transcript record for this agent"), "the plain empty note names the record's absence");
 			assert.ok(!frame.includes("showing live buffer"), "an empty live buffer gets no stand-in note");
@@ -1116,6 +1181,7 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 			view.handleInput(DOWN);
 			assert.equal(view.selectedId, "t:task-1:r1:a2");
 			view.handleInput("t");
+			await waitForFrame(view, (frame) => frame.includes("this agent's transcript record holds no thinking"));
 			const frame = view.render(120).join("\n");
 			assert.ok(frame.includes("this agent's transcript record holds no thinking"), "a found thinkingless record gets the found-but-empty note");
 			assert.ok(!frame.includes("no transcript record for this agent"), "the found-but-empty note never denies the record's existence");
@@ -1133,6 +1199,7 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 			view.handleInput(DOWN);
 			assert.equal(view.selectedId, "t:task-1:r1:a3");
 			view.handleInput("t");
+			await waitForFrame(view, (frame) => frame.includes("this agent's transcript record holds no thinking"));
 			// render(200): the stand-in note exceeds the detail pane at 120 and would wrap mid-copy, splitting the pinned substring.
 			const frame = view.render(200).join("\n");
 			assert.ok(frame.includes("this agent's transcript record holds no thinking; showing live buffer"), "a found thinkingless record with a live buffer gets the stand-in note");
@@ -1140,6 +1207,260 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 			assert.ok(!frame.includes("no transcript record for this agent"), "the found-but-empty note never denies the record's existence");
 			assert.ok(!frame.includes("echo words"), "the thinkingless record's content never leaks into the pane");
 		}, stubTui(), thinkingTheme);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+// --- t streamed read: the loading state and the abort rules ---
+
+// A deferred injected reader: the press must return before the read
+// resolves (no synchronous file I/O on the press path), so the pins
+// start the read, drive lines into it, and resolve or reject on
+// demand. The session file path is never opened by the injected
+// reader; the default streamed reader is pinned end-to-end by the
+// real-file scenarios above.
+function deferredTranscriptReader() {
+	const calls = [];
+	let resolveRead;
+	let rejectRead;
+	const reader = (file, onLine, signal) => {
+		calls.push({ file, onLine, signal });
+		return new Promise((resolve, reject) => {
+			resolveRead = resolve;
+			rejectRead = reject;
+		});
+	};
+	return { reader, calls, resolve: () => resolveRead(), reject: (error) => rejectRead(error) };
+}
+
+{
+	const transcriptLine = (agentName, messages) =>
+		JSON.stringify({
+			type: "message",
+			message: {
+				role: "toolResult",
+				toolName: "subagent",
+				toolCallId: "call_1",
+				content: [],
+				details: {
+					mode: "single",
+					results: [
+						{
+							agent: agentName,
+							agentSource: "user",
+							task: "probe",
+							exitCode: 0,
+							messages,
+							stderr: "",
+							stopReason: "end",
+							usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+						},
+					],
+				},
+			},
+		});
+	const thinkingRecord = (thought) => [{ role: "assistant", timestamp: 5_000, content: [{ type: "thinking", thinking: thought }] }];
+	const wordsRecord = (words) => [{ role: "assistant", timestamp: 5_000, content: [{ type: "text", text: words }] }];
+
+	const registry = createDispatchRegistry();
+	const task = registry.startTask({ mode: "single", prompt: "Task: EXT-10-1 stream probe", now: 1_000 });
+	registry.startRound(task.id, [{ agent: "scout" }], 1_000);
+	registry.updateAgent(task.id, 1, 0, { status: "done", finishedAt: 9_000, thinkingLog: [{ at: 1_050, text: "live buffer thought" }] });
+	// The injected reader never opens this path; no temp file or cleanup needed.
+	const sessionFile = join(tmpdir(), "pi-navigator-stream", "session.jsonl");
+	const streamSources = (reader) => ({ registry, detachedJobs: [], sessionFile: () => sessionFile, readTranscriptLines: reader });
+	const selectScout = (view) => {
+		view.handleInput(DOWN);
+		view.handleInput(RIGHT);
+		view.handleInput(DOWN);
+		assert.equal(view.selectedId, "t:task-1:r1:a0");
+	};
+
+	// Press path: the handler returns with the read still in flight, the
+	// loading note renders and survives polls, and the resolved read
+	// lands the loaded view.
+	{
+		const deferred = deferredTranscriptReader();
+		await withView(streamSources(deferred.reader), async (view) => {
+			selectScout(view);
+			view.handleInput("t");
+			assert.equal(deferred.calls.length, 1, "the press starts exactly one read");
+			assert.equal(deferred.calls[0].file, sessionFile, "the read targets the sessionFile source's path");
+			assert.equal(deferred.calls[0].signal.aborted, false, "the read starts with a live abort signal");
+			const loadingFrame = view.render(120).join("\n");
+			assert.ok(loadingFrame.includes("reading transcript…"), "the press renders the loading note while the read is in flight");
+			assert.ok(!loadingFrame.includes("landed thought"), "no transcript content renders before the read resolves");
+			view.refresh();
+			assert.ok(view.render(120).join("\n").includes("reading transcript…"), "the loading note survives polls");
+			deferred.calls[0].onLine(transcriptLine("scout", thinkingRecord("landed thought")));
+			deferred.resolve();
+			await settle();
+			const landedFrame = view.render(120).join("\n");
+			assert.ok(landedFrame.includes("landed thought"), "the resolved read lands the loaded transcript view");
+			assert.ok(!landedFrame.includes("reading transcript…"), "the loading note clears when the read lands");
+		});
+	}
+
+	// Re-press mid-read: toggles off, aborts the read, and the abandoned
+	// read never lands.
+	{
+		const deferred = deferredTranscriptReader();
+		await withView(streamSources(deferred.reader), async (view) => {
+			selectScout(view);
+			view.handleInput("t");
+			view.handleInput("t");
+			const frame = view.render(120).join("\n");
+			assert.ok(frame.includes("duration:"), "a second t mid-read toggles back to the live pane");
+			assert.ok(!frame.includes("reading transcript…"), "the loading note clears on the re-press");
+			assert.equal(deferred.calls[0].signal.aborted, true, "the re-press aborts the in-flight read");
+			deferred.resolve();
+			await settle();
+			assert.ok(!view.render(120).join("\n").includes("landed thought"), "a read aborted by the re-press never lands");
+		});
+	}
+
+	// Selection change mid-read: aborts and never lands a stale result
+	// for a different row.
+	{
+		const deferred = deferredTranscriptReader();
+		await withView(streamSources(deferred.reader), async (view) => {
+			selectScout(view);
+			view.handleInput("t");
+			view.handleInput(UP);
+			assert.equal(view.selectedId, "t:task-1:r1");
+			assert.equal(deferred.calls[0].signal.aborted, true, "moving the cursor aborts the in-flight read");
+			assert.ok(!view.render(120).join("\n").includes("reading transcript…"), "the loading note clears with the cleared selection");
+			deferred.calls[0].onLine(transcriptLine("scout", thinkingRecord("landed thought")));
+			deferred.resolve();
+			await settle();
+			const frame = view.render(120).join("\n");
+			assert.ok(!frame.includes("landed thought"), "a read aborted by a selection change never lands a stale result");
+			assert.ok(!frame.includes("reading transcript…"), "the aborted read's loading note stays gone");
+		});
+	}
+
+	// Dispose mid-read: aborts; the abandoned read then resolves
+	// harmlessly without touching the disposed view.
+	{
+		const deferred = deferredTranscriptReader();
+		const view = new NavigatorView(stubTui(), themeStub, keybindings, streamSources(deferred.reader), () => {});
+		selectScout(view);
+		view.handleInput("t");
+		view.dispose();
+		assert.equal(deferred.calls[0].signal.aborted, true, "disposing the view aborts the in-flight read");
+		deferred.calls[0].onLine(transcriptLine("scout", thinkingRecord("landed thought")));
+		deferred.resolve();
+		await settle();
+	}
+
+	// A failed read lands on the unavailable note (parity with the
+	// synchronous catch it replaces), and t toggles back off it.
+	{
+		const deferred = deferredTranscriptReader();
+		await withView(streamSources(deferred.reader), async (view) => {
+			selectScout(view);
+			view.handleInput("t");
+			deferred.reject(new Error("read boom"));
+			await settle();
+			const frame = view.render(120).join("\n");
+			assert.ok(frame.includes("session transcript unavailable"), "a failed read renders the unavailable note");
+			assert.ok(!frame.includes("reading transcript…"), "the loading note clears when the read fails");
+			view.handleInput("t");
+			assert.ok(view.render(120).join("\n").includes("duration:"), "t toggles back off the unavailable note");
+		});
+	}
+
+	// Terminal-state parity through the injected reader: a record with no
+	// thinking parts lands on the found-but-empty note; a miss (only
+	// another agent's record) lands on the record-absence note.
+	{
+		const deferred = deferredTranscriptReader();
+		await withView(streamSources(deferred.reader), async (view) => {
+			selectScout(view);
+			view.handleInput("t");
+			deferred.calls[0].onLine(transcriptLine("scout", wordsRecord("scout finished wordlessly")));
+			deferred.resolve();
+			await settle();
+			const frame = view.render(120).join("\n");
+			assert.ok(frame.includes("this agent's transcript record holds no thinking"), "a landed thinkingless record gets the found-but-empty note");
+			assert.ok(!frame.includes("scout finished wordlessly"), "the thinkingless record's content never leaks into the pane");
+		});
+	}
+	{
+		const deferred = deferredTranscriptReader();
+		await withView(streamSources(deferred.reader), async (view) => {
+			selectScout(view);
+			view.handleInput("t");
+			deferred.calls[0].onLine(transcriptLine("other", thinkingRecord("other agent thought")));
+			deferred.resolve();
+			await settle();
+			const frame = view.render(120).join("\n");
+			assert.ok(frame.includes("no transcript record for this agent"), "a landed miss gets the record-absence note");
+			assert.ok(!frame.includes("other agent thought"), "the miss never renders another agent's record");
+		});
+	}
+}
+
+// --- t abort through the default reader: the real stream closes mid-read ---
+
+{
+	const dir = mkdtempSync(join(tmpdir(), "pi-navigator-thinking-abort-"));
+	try {
+		const sessionFile = join(dir, "session.jsonl");
+		const entry = (object) => JSON.stringify(object);
+		const scoutResult = (thoughts) => ({
+			agent: "scout",
+			agentSource: "user",
+			task: "probe",
+			exitCode: 0,
+			messages: thoughts.map((text, index) => ({ role: "assistant", timestamp: 5_000 + index, content: [{ type: "thinking", thinking: text }] })),
+			stderr: "",
+			stopReason: "end",
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+		});
+		const toolResult = (results) =>
+			entry({
+				type: "message",
+				message: { role: "toolResult", toolName: "subagent", toolCallId: "call_1", content: [], details: { mode: "single", results } },
+			});
+		// Filler lines without the subagent substring keep the scan cheap
+		// while sizing the file (~65 MB, ~175 ms to read here) well past
+		// waitForClosedDescriptor's 50 ms budget: the streamed read must
+		// still be in flight when the pin re-presses, and an un-aborted read
+		// cannot reach EOF within the budget.
+		const fillerLine = entry({ type: "message", message: { role: "assistant", timestamp: 9_500, content: [{ type: "text", text: "f".repeat(65_536) }] } });
+		const blocks = Array.from({ length: 25 }, (_, i) => `block ${i} thought`);
+		writeFileSync(
+			sessionFile,
+			[entry({ type: "session", version: 3, id: "s1" }), toolResult([scoutResult(blocks)]), ...Array.from({ length: 1_000 }, () => fillerLine)].join("\n"),
+		);
+
+		const registry = createDispatchRegistry();
+		const task = registry.startTask({ mode: "single", prompt: "Task: EXT-10-1 abort probe", now: 1_000 });
+		registry.startRound(task.id, [{ agent: "scout" }], 1_000);
+		registry.updateAgent(task.id, 1, 0, { status: "done", finishedAt: 9_000, thinkingLog: [{ at: 1_050, text: "live buffer thought" }] });
+		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
+			view.handleInput(DOWN);
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
+			assert.equal(view.selectedId, "t:task-1:r1:a0");
+			view.handleInput("t");
+			assert.ok(view.render(120).join("\n").includes("reading transcript…"), "the press renders the loading note through the default reader");
+			await waitForOpenDescriptor(dir);
+			view.handleInput("t");
+			const liveFrame = view.render(120).join("\n");
+			assert.ok(liveFrame.includes("duration:"), "a second t mid-read toggles back to the live pane through the default reader");
+			assert.ok(!liveFrame.includes("reading transcript…"), "the loading note clears on the re-press");
+			assert.ok(!liveFrame.includes("block 24 thought"), "no transcript content renders after the re-press");
+			await waitForClosedDescriptor(dir);
+			for (let attempt = 0; attempt < 25; attempt++) {
+				await new Promise((resolve) => setTimeout(resolve, 2));
+				const lateFrame = view.render(120).join("\n");
+				assert.ok(!lateFrame.includes("reading transcript…"), "no second read starts on the re-press");
+				assert.ok(!lateFrame.includes("block 24 thought"), "the aborted read never lands late");
+			}
+		});
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

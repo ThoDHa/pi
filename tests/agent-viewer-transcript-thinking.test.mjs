@@ -458,17 +458,21 @@ assert.deepEqual(
 // --- the incremental scanner: feed/finish parity with the whole-string lookup ---
 
 // The whole-string lookup is a thin wrapper over an incremental
-// feed/finish scanner (the wrapper splits and feeds the same lines),
-// so the streamed t read can feed readline's lines into the scanner
-// and resolve byte-identically to the whole-string lookup on the same
-// input. The corpus below reuses every fixture shape pinned above and
-// drives both entry points with identical strings across a matrix of
-// agent/window arguments, asserting identical lookups: tri-state,
+// feed/finish scanner, so the streamed t read can feed readline's
+// lines into the scanner and resolve byte-identically to the
+// whole-string lookup on the same input. The corpus below reuses every
+// fixture shape pinned above and drives both entry points across a
+// matrix of agent/window arguments: the whole-string side keeps the
+// wrapper's split("\n") shape while the line side splits the way
+// node:readline yields for \r\n and \n endings (crlfDelay: Infinity;
+// lone-\r and torn-tail fidelity still lives in the real-file view
+// pins), so the loop compares the streamed feed's line semantics
+// against the wrapper instead of the wrapper against itself. Tri-state,
 // window spans with the session-latest fallback, per-slot matching,
 // and torn-line tolerance must survive the incremental path exactly.
 const lookupByLines = (jsonl, agentName, window) => {
 	const scanner = createTranscriptThinkingScanner(agentName, window);
-	for (const line of jsonl.split("\n")) scanner.feed(line);
+	for (const line of jsonl.split(/\r\n|\n/)) scanner.feed(line);
 	return scanner.finish();
 };
 
@@ -535,9 +539,11 @@ assert.deepEqual(
 // the wrapper's split exactly at file edges and separators, so parity
 // is pinned where those differences live. A trailing newline and blank
 // lines add empty lines the scanner skips unparsed either way; CRLF
-// endings leave a trailing \r on split-fed lines that JSON.parse
-// accepts as whitespace, and readline (crlfDelay) would strip it, so
-// both feeds must resolve identically to the canonical fixture.
+// endings are where the two feeds actually diverge: the whole-string
+// side keeps a trailing \r on its lines (JSON.parse accepts it as
+// whitespace) while the readline-shaped side strips it, so the pair
+// pins that a \r-stripped feed resolves identically to the canonical
+// fixture.
 const variantRecord = JSON.stringify(subagentToolResult([result("scout", [thinkingMessage(1_000, ["boundary variant thought"])])]));
 const boundaryVariants = [
 	["no trailing newline", variantRecord],
@@ -554,7 +560,7 @@ for (const [variantName, variant] of boundaryVariants) {
 	assert.deepEqual(
 		lookupByLines(variant, "scout"),
 		{ found: true, entries: [{ at: 1_000, text: "boundary variant thought" }] },
-		`the line-fed scanner resolves the ${variantName} fixture to the canonical record`,
+		`the readline-fed scanner resolves the ${variantName} fixture to the canonical record`,
 	);
 }
 
