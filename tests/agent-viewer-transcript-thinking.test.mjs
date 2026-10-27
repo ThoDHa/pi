@@ -15,12 +15,13 @@
  * lookup: found=false when no record matches, found=true with empty
  * entries when the matching record holds no thinking parts. Pins:
  * agent matching across a toolResult's result slots, latest-match-wins
- * when one agent was dispatched more than once, no cross-match against
- * other agents or other tools' results, full untruncated text with
- * message timestamps, tolerance of a torn (partial) trailing line
- * from the live-appending file, and the tri-state: not-found for
- * absent agents or sessionless input, found-but-empty for a record
- * holding no thinking parts. Fixture shapes mirror the real transcript:
+ * when one agent was dispatched more than once, windowed slot-span
+ * matching with its byte-identical session-latest fallback, no
+ * cross-match against other agents or other tools' results, full
+ * untruncated text with message timestamps, tolerance of a torn
+ * (partial) trailing line from the live-appending file, and the
+ * tri-state: not-found for absent agents or sessionless input,
+ * found-but-empty for a record holding no thinking parts. Fixture shapes mirror the real transcript:
  * session entries of type "message" whose toolResult message carries
  * details.results[], and results[].messages holding bare assistant
  * messages with thinking parts.
@@ -129,7 +130,7 @@ assert.deepEqual(
 	"the mirrored pair resolves to the later record's thinking the same way",
 );
 
-// --- the run window: with one, the latest record inside the window wins; without a qualifier, session-latest fallback ---
+// --- the run window: a slot competes by its own message-timestamp span inside the window; without a qualifier or a competing slot, session-latest fallback ---
 
 const windowedJsonl = [
 	JSON.stringify(subagentToolResult([result("scout", [thinkingMessage(2_000, ["early run thought"])])], 2_000)),
@@ -139,13 +140,13 @@ const windowedJsonl = [
 assert.deepEqual(
 	extractTranscriptThinking(windowedJsonl, "scout", { startedAt: 1_000, finishedAt: 5_000 }),
 	{ found: true, entries: [{ at: 2_000, text: "early run thought" }] },
-	"a window selects the record inside it over the session-latest one",
+	"a window selects the record whose slot's span sits inside it over the session-latest one",
 );
 
 assert.deepEqual(
 	extractTranscriptThinking(windowedJsonl, "scout", { startedAt: 10_000, finishedAt: 12_000 }),
 	{ found: true, entries: [{ at: 8_000, text: "late run thought" }] },
-	"a window past both records still resolves to the session-latest one",
+	"a window past both records' spans still resolves to the session-latest one",
 );
 
 const boundaryWindow = { startedAt: 1_000, finishedAt: 5_000 };
@@ -159,12 +160,13 @@ const boundaryJsonl = [
 assert.deepEqual(
 	extractTranscriptThinking(boundaryJsonl, "scout", boundaryWindow),
 	{ found: true, entries: [{ at: endEdge, text: "boundary end thought" }] },
-	"records exactly at the tolerance edges are windowed in and the record past the edge stays out",
+	"spans exactly at the tolerance edges are windowed in and the span past the edge stays out",
 );
 
-// Two same-name records inside one window, the later thinkingless: the
-// windowed assignment follows the same later-record-wins rule as the
-// no-window pair above, so the viewer names the newer run's emptiness
+// Two same-name records inside one window, the later thinkingless: both
+// records' slots' spans sit inside the window, so the last record in file
+// order holds the winning slot, the same later-record-wins outcome as the
+// no-window pair above, and the viewer names the newer run's emptiness
 // instead of showing the older run's text.
 const windowedOverwrite = [
 	JSON.stringify(subagentToolResult([result("scout", [thinkingMessage(2_000, ["run one thought"])])], 2_000)),
@@ -179,7 +181,7 @@ assert.deepEqual(
 assert.deepEqual(
 	extractTranscriptThinking(windowedJsonl, "scout", { startedAt: 20_000, finishedAt: 22_000 }),
 	{ found: true, entries: [{ at: 8_000, text: "late run thought" }] },
-	"a window strictly clear of both records and the tolerance edges falls back to the session-latest one",
+	"a window strictly clear of both spans and the tolerance edges falls back to the session-latest one",
 );
 
 const timestamplessRecord = JSON.parse(JSON.stringify(subagentToolResult([result("scout", [thinkingMessage(4_000, ["timestampless thought"])])])));
@@ -187,7 +189,7 @@ delete timestamplessRecord.message.timestamp;
 assert.deepEqual(
 	extractTranscriptThinking(JSON.stringify(timestamplessRecord), "scout", { startedAt: 3_000, finishedAt: 5_000 }),
 	{ found: true, entries: [{ at: 4_000, text: "timestampless thought" }] },
-	"a matching record without message.timestamp falls back to a win even with a window passed",
+	"a record whose own timestamp is missing still wins through its slot's span inside the window",
 );
 
 assert.deepEqual(
@@ -313,6 +315,46 @@ assert.deepEqual(
 		],
 	},
 	"the late finisher's row resolves its own slot: within one record the latest span end wins even though the late slot is listed first",
+);
+
+// --- span-less degradation: a window miss resolves exactly as the no-window lookup ---
+
+// Two matching records, neither holding a competing slot: the earlier
+// carries two same-name slots with no message timestamps anywhere (no
+// usable span), the later carries a span clear of the window. No slot
+// competes, so the lookup takes the fallback exactly: the session-latest
+// matching record's last matching slot in file order. Pins the hard
+// degradation bound: a slot without a usable span never competes, so the
+// timestampless record cannot steal the resolution from the
+// session-latest record.
+const spanlessRecord = subagentToolResult([
+	result("scout", [{ role: "assistant", content: [{ type: "thinking", thinking: "spanless slot one thought" }] }]),
+	result("scout", [{ role: "assistant", content: [{ type: "thinking", thinking: "spanless slot two thought" }] }]),
+]);
+const degradationJsonl = [
+	JSON.stringify(spanlessRecord),
+	JSON.stringify(subagentToolResult([result("scout", [thinkingMessage(50_000, ["window miss thought"]), thinkingMessage(60_000, ["window miss second block"])])], 70_000)),
+].join("\n");
+
+assert.deepEqual(
+	extractTranscriptThinking(degradationJsonl, "scout", { startedAt: 1_000, finishedAt: 5_000 }),
+	{
+		found: true,
+		entries: [
+			{ at: 50_000, text: "window miss thought" },
+			{ at: 60_000, text: "window miss second block" },
+		],
+	},
+	"when no slot's span competes, a window miss resolves exactly as the no-window lookup: session-latest record, last matching slot in file order",
+);
+
+// The span-less record alone resolves through the same fallback: found
+// stays true and the record's last matching slot in file order wins, its
+// entries stamped at: 0 for the timestamp-less messages.
+assert.deepEqual(
+	extractTranscriptThinking(JSON.stringify(spanlessRecord), "scout", { startedAt: 1_000, finishedAt: 5_000 }),
+	{ found: true, entries: [{ at: 0, text: "spanless slot two thought" }] },
+	"a window over a record whose slots carry no usable timestamps degrades to the last matching slot in file order, entries stamped at 0",
 );
 
 // --- full text: no truncation, no collapsing, no caps ---

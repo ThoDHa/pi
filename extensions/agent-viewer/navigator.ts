@@ -490,12 +490,14 @@ export function resolveDetailModel(row: NavigatorRow | null | undefined, tasks: 
 
 /**
  * Inclusive slack in milliseconds around a run's startedAt–finishedAt
- * interval when matching transcript records to it: the registry stamps and
- * the transcript's message timestamps are same-machine unix-ms clocks, but
- * subagent toolResults carry millisecond-scale jitter and the completion
- * update and the transcript write land milliseconds apart, so a run's own
- * record can sit just outside the bare interval. Far below real dispatch
- * durations, so a fast rerun still mostly lands in its own window.
+ * interval when matching a result slot's message-timestamp span to
+ * it: the registry stamps and the transcript's message timestamps are
+ * same-machine unix-ms clocks, but a slot's first and last messages
+ * land within milliseconds of the registry's pickup and completion
+ * stamps rather than inside them exactly, so a run's own span can sit
+ * just outside the bare interval. Far below real dispatch durations,
+ * so sibling slots finishing within the slack are the only residual
+ * ambiguity.
  */
 export const TRANSCRIPT_WINDOW_TOLERANCE_MS = 2_000;
 
@@ -518,16 +520,25 @@ export interface TranscriptThinkingLookup {
  * the latest subagent toolResult whose details.results[] carries a
  * result for `agentName` wins (the file is append-only, so completed
  * results are stable, and one agent dispatched twice resolves to its
- * newest run). With a `window`, a record must additionally carry a
- * finite numeric message.timestamp inside the inclusive range
- * [startedAt - TRANSCRIPT_WINDOW_TOLERANCE_MS, finishedAt +
- * TRANSCRIPT_WINDOW_TOLERANCE_MS] to compete, and the latest
- * qualifying record wins; when no record qualifies, or no window is
- * passed, every matching record competes under the session-latest
- * rule, so a window miss resolves exactly as the two-argument lookup
- * does. "Latest" means last in file order across both the windowed
- * and fallback paths, not highest message.timestamp: the timestamp
- * only gates window eligibility.
+ * newest run). With a `window`, every matching result slot carries
+ * its own span, its messages' first and last finite numeric
+ * timestamps, and a slot competes when that span lies inside the
+ * inclusive range [startedAt - TRANSCRIPT_WINDOW_TOLERANCE_MS,
+ * finishedAt + TRANSCRIPT_WINDOW_TOLERANCE_MS] on both endpoints; the
+ * last record in file order holding a competing slot wins, and within
+ * it the competing slot with the highest span end (last in file order
+ * on ties), so same-name slots inside one parallel record and earlier
+ * steps of a chain round resolve their own runs even though their
+ * shared record timestamp is stamped at dispatch completion. When no
+ * slot competes, or no window is passed, every matching record
+ * competes under the session-latest rule and the winning record's
+ * last matching slot in file order is used, so a window miss resolves
+ * exactly as the two-argument lookup does. File order stays the
+ * record-level rule and timestamps never reorder records: they gate a
+ * slot's eligibility and break ties within one record, and a record
+ * whose message.timestamp is absent or whose slots carry no finite
+ * message timestamps simply contributes no competing slot and
+ * degrades to the fallback.
  * That result's messages yield one uncapped full-text
  * entry per thinking part, oldest first, mirroring the live buffer's
  * entry shape. Lines that fail to parse are skipped: the file is
@@ -548,14 +559,35 @@ export interface TranscriptThinkingLookup {
  * finished without reasoning), so the viewer can name the record's
  * emptiness instead of denying the record exists.
  */
+/**
+ * A result slot's message-timestamp span: the smallest and largest
+ * finite numeric timestamps across the slot's messages, or undefined
+ * when no message carries one, which disqualifies the slot from a
+ * windowed match. A slot whose messages all share one timestamp has
+ * first === last.
+ */
+function transcriptSlotSpan(messages: ActivityMessage[]): { first: number; last: number } | undefined {
+	let first: number | undefined;
+	let last: number | undefined;
+	for (const message of messages) {
+		const timestamp = message.timestamp;
+		if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) continue;
+		if (first === undefined || timestamp < first) first = timestamp;
+		if (last === undefined || timestamp > last) last = timestamp;
+	}
+	return first === undefined ? undefined : { first, last };
+}
+
 export function extractTranscriptThinking(jsonl: string, agentName: string, window?: TranscriptRunWindow): TranscriptThinkingLookup {
 	let best: DispatchThinkingEntry[] | undefined;
 	let windowed: DispatchThinkingEntry[] | undefined;
+	const windowStart = window !== undefined ? window.startedAt - TRANSCRIPT_WINDOW_TOLERANCE_MS : Number.NaN;
+	const windowEnd = window !== undefined ? window.finishedAt + TRANSCRIPT_WINDOW_TOLERANCE_MS : Number.NaN;
 	for (const line of jsonl.split("\n")) {
 		if (!line.includes("subagent")) continue;
 		let entry: {
 			type?: unknown;
-			message?: { role?: unknown; timestamp?: unknown; details?: { results?: unknown } };
+			message?: { role?: unknown; details?: { results?: unknown } };
 		};
 		try {
 			entry = JSON.parse(line);
@@ -566,21 +598,29 @@ export function extractTranscriptThinking(jsonl: string, agentName: string, wind
 		if ((entry.message as { toolName?: unknown }).toolName !== "subagent") continue;
 		const results = entry.message.details?.results;
 		if (!Array.isArray(results)) continue;
-		const timestamp = entry.message.timestamp;
-		const inWindow =
-			window !== undefined &&
-			typeof timestamp === "number" &&
-			Number.isFinite(timestamp) &&
-			timestamp >= window.startedAt - TRANSCRIPT_WINDOW_TOLERANCE_MS &&
-			timestamp <= window.finishedAt + TRANSCRIPT_WINDOW_TOLERANCE_MS;
 		for (let i = results.length - 1; i >= 0; i--) {
 			const candidate = results[i] as { agent?: unknown; messages?: unknown } | undefined;
 			if (candidate?.agent !== agentName || !Array.isArray(candidate.messages)) continue;
 			const next = extractThinkingEntries(candidate.messages as ActivityMessage[], Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
 			best = next;
-			if (inWindow) windowed = next;
 			break;
 		}
+		if (window === undefined) continue;
+		let recordBest: { entries: DispatchThinkingEntry[]; spanEnd: number } | undefined;
+		for (let i = results.length - 1; i >= 0; i--) {
+			const candidate = results[i] as { agent?: unknown; messages?: unknown } | undefined;
+			if (candidate?.agent !== agentName || !Array.isArray(candidate.messages)) continue;
+			const messages = candidate.messages as ActivityMessage[];
+			const span = transcriptSlotSpan(messages);
+			if (span === undefined || span.first < windowStart || span.last > windowEnd) continue;
+			if (recordBest === undefined || span.last > recordBest.spanEnd) {
+				recordBest = {
+					entries: extractThinkingEntries(messages, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY),
+					spanEnd: span.last,
+				};
+			}
+		}
+		if (recordBest !== undefined) windowed = recordBest.entries;
 	}
 	const winner = window !== undefined ? (windowed ?? best) : best;
 	return { found: winner !== undefined, entries: winner ?? [] };
