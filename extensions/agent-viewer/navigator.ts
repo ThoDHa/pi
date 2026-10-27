@@ -536,9 +536,8 @@ export interface TranscriptThinkingLookup {
  * exactly as the two-argument lookup does. File order stays the
  * record-level rule and timestamps never reorder records: they gate a
  * slot's eligibility and break ties within one record, and a record
- * whose message.timestamp is absent or whose slots carry no finite
- * message timestamps simply contributes no competing slot and
- * degrades to the fallback.
+ * whose slots carry no finite message timestamps simply contributes
+ * no competing slot and degrades to the fallback.
  * That result's messages yield one uncapped full-text
  * entry per thinking part, oldest first, mirroring the live buffer's
  * entry shape. Lines that fail to parse are skipped: the file is
