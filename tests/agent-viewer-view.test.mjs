@@ -930,24 +930,24 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 	const dir = mkdtempSync(join(tmpdir(), "pi-navigator-thinking-window-"));
 	try {
 		const sessionFile = join(dir, "session.jsonl");
-		const scoutResult = (thought) => ({
+		const scoutResult = (thought, slotTimestamp) => ({
 			agent: "scout",
 			agentSource: "user",
 			task: "probe",
 			exitCode: 0,
-			messages: [{ role: "assistant", timestamp: 1, content: [{ type: "thinking", thinking: thought }] }],
+			messages: [{ role: "assistant", timestamp: slotTimestamp, content: [{ type: "thinking", thinking: thought }] }],
 			stderr: "",
 			stopReason: "end",
 			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
 		});
-		const windowToolResult = (timestamp, thought) =>
+		const windowToolResult = (timestamp, thought, slotTimestamp) =>
 			JSON.stringify({
 				type: "message",
-				message: { role: "toolResult", toolName: "subagent", toolCallId: "call_1", timestamp, content: [], details: { mode: "single", results: [scoutResult(thought)] } },
+				message: { role: "toolResult", toolName: "subagent", toolCallId: "call_1", timestamp, content: [], details: { mode: "single", results: [scoutResult(thought, slotTimestamp)] } },
 			});
 		writeFileSync(
 			sessionFile,
-			[JSON.stringify({ type: "session", version: 3, id: "s1" }), windowToolResult(5_000, "run one thought"), windowToolResult(12_000, "run two thought")].join("\n"),
+			[JSON.stringify({ type: "session", version: 3, id: "s1" }), windowToolResult(5_000, "run one thought", 2_000), windowToolResult(12_000, "run two thought", 9_000)].join("\n"),
 		);
 
 		const registry = createDispatchRegistry();
