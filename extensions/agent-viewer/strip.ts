@@ -22,6 +22,7 @@ import {
 	type DispatchRegistry,
 	type DispatchRoundNode,
 	formatDuration,
+	isRoundLive,
 	statusGlyph,
 	type StatusGlyphName,
 } from "../subagent/registry.ts";
@@ -190,9 +191,9 @@ export function buildStripTasks(
 ): StripTaskView[] {
 	const views: StripTaskView[] = [];
 	for (const task of registry.tasks()) {
-		const live = task.rounds.some((round) => round.agents.some((agent) => agent.status === "running"));
-		const liveRounds = task.rounds.filter((round) => round.agents.some((agent) => agent.status === "running"));
-		const finishedRounds = task.rounds.filter((round) => !round.agents.some((agent) => agent.status === "running"));
+		const liveRounds = task.rounds.filter(isRoundLive);
+		const live = liveRounds.length > 0;
+		const finishedRounds = task.rounds.filter((round) => !isRoundLive(round));
 		const entries: StripEntry[] = [];
 		for (const round of liveRounds) {
 			for (const agent of round.agents) entries.push(agentEntry(agent, now));

@@ -10,7 +10,10 @@
  * assembling task -> dispatch round -> agent views from the dispatch
  * registry plus detached-job snapshots (detached jobs as task nodes
  * with their agents as children, labels from the EXT-1-2 heuristic,
- * glyphs keyed off job.status on detached tasks), and
+ * glyphs keyed off job.status on detached tasks, lazy parallel
+ * rounds rendering only picked-up agents, the zero-agent round
+ * staying live-empty, and liveness dominating settled task glyphs
+ * while the task has an unfinished round), and
  * flattenNavigatorTree turning views plus expansion state into
  * visible rows (completed rounds collapsed to single glyph lines, the
  * live round auto-expanded, user expand/collapse overrides sticky,
@@ -255,6 +258,78 @@ assert.equal(lateFirstView.durationText, "8s", "task duration ends at the latest
 		["job-live", "job-live", settledTask.id, settledTask.id, "job-settled", "job-settled"],
 		"the live task's rows render before the settled tasks' rows",
 	);
+}
+
+// --- buildNavigatorTasks: lazy parallel rounds (only picked-up agents render) ---
+
+{
+	const lazyRegistry = createDispatchRegistry();
+	const lazyTask = lazyRegistry.startTask({ mode: "parallel", prompt: "Task: EXT-7-1 lazy fan out", now: 100_000 });
+	lazyRegistry.startRound(lazyTask.id, [], 100_000);
+	lazyRegistry.startAgent(lazyTask.id, 1, 0, { agent: "scout" }, 101_000);
+	lazyRegistry.startAgent(lazyTask.id, 1, 1, { agent: "worker" }, 121_000);
+
+	const [lazyView] = buildNavigatorTasks(lazyRegistry, [], 122_000);
+	assert.equal(lazyView.live, true);
+	assert.equal(lazyView.glyph, "running");
+	assert.equal(lazyView.durationText, "22s", "task duration still runs from task start");
+	assert.equal(lazyView.rounds.length, 1);
+	const lazyRound = lazyView.rounds[0];
+	assert.equal(lazyRound.live, true);
+	assert.equal(lazyRound.glyph, "running");
+	assert.equal(lazyRound.agents.length, 2, "queued slots render no agent children");
+	assert.equal(lazyRound.agents[0].name, "scout");
+	assert.equal(lazyRound.agents[0].durationText, "21s", "agent duration runs from its own pickup, not round start");
+	assert.equal(lazyRound.agents[1].durationText, "1s");
+	assert.equal(lazyRound.durationText, "21s", "round duration spans first pickup to the latest unfinished agent");
+	assert.equal(lazyRound.summary, "0/2 done");
+}
+
+// --- buildNavigatorTasks: the zero-agent round renders live-empty, never done/NaN ---
+
+{
+	const emptyRegistry = createDispatchRegistry();
+	const emptyTask = emptyRegistry.startTask({ mode: "parallel", prompt: "Task: EXT-7-1 empty window", now: 100_000 });
+	emptyRegistry.startRound(emptyTask.id, [], 100_000);
+	const settledTask = emptyRegistry.startTask({ mode: "single", prompt: "Task: EXT-7-1 settled", now: 10_000 });
+	emptyRegistry.startRound(settledTask.id, [{ agent: "scout" }], 10_000);
+	emptyRegistry.updateAgent(settledTask.id, 1, 0, { status: "done", finishedAt: 20_000 });
+
+	const emptyViews = buildNavigatorTasks(emptyRegistry, [], 122_000);
+	assert.deepEqual(
+		emptyViews.map((view) => view.id),
+		[emptyTask.id, settledTask.id],
+		"the zero-agent task keeps its live-first placement above settled tasks",
+	);
+	const emptyView = emptyViews[0];
+	assert.equal(emptyView.live, true);
+	assert.equal(emptyView.glyph, "running", "a live task with no started agents never aggregates to done");
+	assert.equal(emptyView.durationText, "22s", "task duration stays non-NaN through the empty window");
+	const emptyRound = emptyView.rounds[0];
+	assert.equal(emptyRound.live, true);
+	assert.equal(emptyRound.glyph, "running", "a zero-agent round renders the running glyph, not done");
+	assert.equal(emptyRound.agents.length, 0);
+	assert.equal(emptyRound.durationText, "0s", "round duration stays non-NaN with no started agents");
+	assert.equal(emptyRound.summary, "0/0 done");
+}
+
+// --- buildNavigatorTasks: liveness dominates settled glyphs on a live task ---
+
+{
+	const mixedLiveRegistry = createDispatchRegistry();
+	const mixedLiveTask = mixedLiveRegistry.startTask({ mode: "parallel", prompt: "Task: EXT-7-1 failed plus empty window", now: 100_000 });
+	mixedLiveRegistry.startRound(mixedLiveTask.id, [{ agent: "scout" }], 100_000);
+	mixedLiveRegistry.updateAgent(mixedLiveTask.id, 1, 0, { status: "failed", finishedAt: 110_000 });
+	mixedLiveRegistry.startRound(mixedLiveTask.id, [], 111_000);
+
+	const [mixedLiveView] = buildNavigatorTasks(mixedLiveRegistry, [], 122_000);
+	assert.equal(mixedLiveView.live, true);
+	assert.equal(mixedLiveView.glyph, "running", "a live task never carries a settled glyph, failed included");
+	const failedRound = mixedLiveView.rounds[0];
+	assert.equal(failedRound.live, false);
+	assert.equal(failedRound.glyph, "failed", "a settled round keeps its own glyph");
+	assert.equal(mixedLiveView.rounds[1].live, true);
+	assert.equal(mixedLiveView.rounds[1].glyph, "running");
 }
 
 // --- flattenNavigatorTree: rows, depths, completed collapsed, live expanded ---

@@ -136,9 +136,25 @@ export interface DispatchRegistry {
 	 * Append a round with one running agent node per slot. Throws on an
 	 * unknown task id: rounds are only ever started on a task this
 	 * registry created, and a silent no-op would strand the dispatch
-	 * untracked.
+	 * untracked. An empty roster opens a lazy round that fills via
+	 * startAgent, and that roster MUST be followed by same-tick
+	 * pickups: isRoundLive counts a zero-agent round as live, so a
+	 * round left empty at rest renders live forever on both surfaces,
+	 * and no settle escape exists by design.
 	 */
 	startRound(taskId: string, agents: Array<{ agent: string; step?: number }>, now?: number): DispatchRoundNode;
+	/**
+	 * Append one running agent node to a round at the moment its slot is
+	 * picked up — the lazy publication pattern for dispatch paths that
+	 * open a round with an empty roster (startRound(taskId, [])), so
+	 * each node's startedAt is its own agent's start and never-picked-up
+	 * slots leave no nodes. The slot must equal the round's current node
+	 * count: pickups append in slot order, which keeps the
+	 * slot-indexed lookup in updateAgent valid. Throws on an unknown
+	 * task id or round (same rule as startRound: a silent no-op would
+	 * strand the dispatch untracked) and on an out-of-order slot.
+	 */
+	startAgent(taskId: string, roundIndex: number, slot: number, input: { agent: string; step?: number }, now?: number): DispatchAgentNode;
 	/** Merge the defined fields of the update into the targeted agent node; unknown ids are ignored. */
 	updateAgent(taskId: string, roundIndex: number, slot: number, update: DispatchAgentUpdate): void;
 	/** Mark every still-running agent of the task failed (abort/dispatch-error cleanup). */
@@ -189,6 +205,24 @@ export function createDispatchRegistry(): DispatchRegistry {
 			};
 			task.rounds.push(round);
 			return round;
+		},
+
+		startAgent(taskId, roundIndex, slot, input, now) {
+			const task = tasksById.get(taskId);
+			if (!task) throw new Error(`startAgent: unknown task id ${taskId}`);
+			const round = task.rounds.find((candidate) => candidate.index === roundIndex);
+			if (!round) throw new Error(`startAgent: unknown round ${roundIndex} on ${taskId}`);
+			if (slot !== round.agents.length) {
+				throw new Error(`startAgent: out-of-order slot ${slot} on ${taskId} round ${roundIndex} (expected ${round.agents.length})`);
+			}
+			const node: DispatchAgentNode = {
+				agent: input.agent,
+				step: input.step,
+				status: "running",
+				startedAt: now ?? Date.now(),
+			};
+			round.agents.push(node);
+			return node;
 		},
 
 		updateAgent(taskId, roundIndex, slot, update) {
@@ -296,6 +330,18 @@ export function upsertDetachedJobSnapshot(detachedJobs: DetachedJobSnapshot[], s
 	const existing = detachedJobs.findIndex((candidate) => candidate.id === snapshot.id);
 	if (existing >= 0) detachedJobs[existing] = snapshot;
 	else detachedJobs.push(snapshot);
+}
+
+/**
+ * Whether a round still has work in flight: any running agent, or a
+ * round whose agent nodes have not been published yet (the lazy
+ * pickup pattern startAgent implements, where a round opens empty and
+ * fills at worker pickup). Both render surfaces partition rounds with
+ * this predicate so a zero-agent round renders as a live round with
+ * no entries instead of collapsing to a finished summary.
+ */
+export function isRoundLive(round: DispatchRoundNode): boolean {
+	return round.agents.length === 0 || round.agents.some((agent) => agent.status === "running");
 }
 
 export type StatusGlyphName = "running" | "done" | "failed" | "mixed";

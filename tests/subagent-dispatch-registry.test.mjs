@@ -11,7 +11,10 @@
  * single/parallel, one per chain step), agent status transitions
  * running -> done/failed with usage/result snapshots, unknown-id
  * updates ignored, failRunningAgents marking only running agents
- * (the abort-cleanup path), reset for session replacement, the
+ * (the abort-cleanup path), the startAgent lazy publication path
+ * (empty-roster rounds filling at worker pickup, pickup-time
+ * startedAt, loud throws on unknown ids and out-of-order slots),
+ * reset for session replacement, the
  * extractLastActivity helper over streaming message lists (thinking
  * parts never become the last activity), the extractActivityLog and
  * mergeAgentUpdate helpers the per-agent activity wiring shares
@@ -132,6 +135,40 @@ assert.deepEqual(
 );
 assert.equal(parallelAgents[0]?.finishedAt, NOW + 9_000);
 assert.equal(parallelAgents[1]?.finishedAt, NOW + 1_000, "already-finished agents keep their finish time");
+
+// --- startAgent: lazy node publication at worker pickup (the blocking parallel path) ---
+
+const lazy = createDispatchRegistry();
+const lazyTask = lazy.startTask({ mode: "parallel", prompt: "fan out", now: NOW });
+const lazyRound = lazy.startRound(lazyTask.id, [], NOW);
+assert.equal(lazyRound.index, 1);
+assert.deepEqual(lazyRound.agents, [], "an empty-roster round starts with no nodes");
+
+const pickedFirst = lazy.startAgent(lazyTask.id, 1, 0, { agent: "scout" }, NOW + 1_000);
+assert.equal(pickedFirst.status, "running");
+assert.equal(pickedFirst.startedAt, NOW + 1_000, "a lazily started node stamps its own pickup time, not the round's");
+assert.equal(lazy.getTask(lazyTask.id)?.rounds[0]?.agents.length, 1);
+
+lazy.startAgent(lazyTask.id, 1, 1, { agent: "worker" }, NOW + 2_000);
+lazy.updateAgent(lazyTask.id, 1, 1, { status: "done", finishedAt: NOW + 3_000 });
+const pickedSecond = lazy.getTask(lazyTask.id)?.rounds[0]?.agents[1];
+assert.equal(pickedSecond?.status, "done", "updateAgent merges into lazily created nodes");
+assert.equal(pickedSecond?.finishedAt, NOW + 3_000);
+
+assert.throws(() => lazy.startAgent("task-999", 1, 2, { agent: "scout" }), /unknown task id/);
+assert.throws(() => lazy.startAgent(lazyTask.id, 99, 2, { agent: "scout" }), /unknown round/);
+assert.throws(() => lazy.startAgent(lazyTask.id, 1, 0, { agent: "late" }), /out-of-order slot/, "a slot below the node count would misattribute a started node");
+assert.equal(lazy.getTask(lazyTask.id)?.rounds[0]?.agents.length, 2, "a rejected append leaves the round untouched");
+
+lazy.updateAgent(lazyTask.id, 1, 2, { status: "done" });
+assert.equal(lazy.getTask(lazyTask.id)?.rounds[0]?.agents.length, 2, "updates for never-created slots stay no-ops");
+
+lazy.failRunningAgents(lazyTask.id, NOW + 4_000);
+const lazyNodes = lazy.getTask(lazyTask.id)?.rounds[0]?.agents ?? [];
+assert.equal(lazyNodes.length, 2, "the abort cleanup creates no nodes for never-picked-up slots");
+assert.equal(lazyNodes[0]?.status, "failed");
+assert.equal(lazyNodes[0]?.finishedAt, NOW + 4_000);
+assert.equal(lazyNodes[1]?.status, "done", "already-settled lazy nodes keep their status");
 
 // --- reset clears everything (session replacement) ---
 

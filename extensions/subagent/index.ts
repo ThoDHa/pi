@@ -1269,10 +1269,11 @@ export default function (pi: ExtensionAPI) {
 					mode: "parallel",
 					prompt: params.tasks[0].task,
 				});
-				const dispatchRound = dispatchRegistry.startRound(
-					taskNode.id,
-					params.tasks.map((task) => ({ agent: task.agent })),
-				);
+				// The round opens with an empty roster: agent nodes are
+				// published lazily at worker pickup (startAgent below), so
+				// queued agents tick no durations and never render as running
+				// rows — the same pattern detached's startSlot follows.
+				const dispatchRound = dispatchRegistry.startRound(taskNode.id, []);
 				try {
 					// Track all results for streaming updates
 					const allResults: SingleResult[] = new Array(params.tasks.length);
@@ -1304,6 +1305,7 @@ export default function (pi: ExtensionAPI) {
 					};
 
 					const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
+						dispatchRegistry.startAgent(taskNode.id, dispatchRound.index, index, { agent: t.agent });
 						const result = await runSingleAgent(
 							ctx.cwd,
 							dispatchDefaults,

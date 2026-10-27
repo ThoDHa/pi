@@ -20,7 +20,7 @@ placeholder.
 The extension registers a global hotkey (default `alt+s`) that toggles an ambient strip widget above the editor. The strip is hidden until the first toggle and hidden again on the next one. While visible it renders, refreshed twice a second:
 
 - One header line per dispatch, labeled with the dispatch's task label and mode
-- One line per live agent: status glyph (⏳ running, ✓ done, ✗ failed), agent name, most recent streamed activity (tool call or text snippet), and elapsed duration
+- One line per live agent: status glyph (⏳ running, ✓ done, ✗ failed), agent name, most recent streamed activity (tool call or text snippet), and elapsed duration. Blocking parallel agents get their line when the dispatch's concurrency slot picks them up, so agents queued beyond the cap add no line and each duration measures run time rather than queue time (the same lazy publication detached uses for its steps).
 - Finished rounds collapsed to a single summary line per round (`✓ round 1 · 3/3 done · 2m`)
 - Detached jobs appear alongside blocking dispatches, one line per started per-slot agent node carrying that node's status glyph, streamed activity, and duration (steps that have not started yet add no line); the one-line-per-agent-name rendering keyed off `job.status` remains only as a mixed-version defense for snapshots published before the per-agent wiring
 - A hint line naming the navigator key, always last

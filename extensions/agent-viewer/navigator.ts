@@ -29,6 +29,7 @@ import {
 	formatDuration,
 	formatTokenCount,
 	formatUsageSummary,
+	isRoundLive,
 } from "../subagent/registry.ts";
 
 /** Locates one agent in the shared dispatch state, so the detail pane can re-read it live on every poll. */
@@ -137,22 +138,30 @@ export function buildNavigatorTasks(registry: DispatchRegistry, jobs: Iterable<D
 			const ends = round.agents.map((agent) => agent.finishedAt ?? now);
 			return {
 				index: round.index,
-				glyph: aggregateGlyph(agents),
+				// A round with no published nodes yet (lazy pickup) is live:
+				// it takes the running glyph and a 0s duration instead of
+				// aggregating to done over an empty agent list.
+				glyph: round.agents.length === 0 ? "running" : aggregateGlyph(agents),
 				summary: roundSummary(agents),
-				live: agents.some((agent) => agent.status === "running"),
-				durationText: formatDuration(Math.max(...ends) - Math.min(...starts)),
+				live: isRoundLive(round),
+				durationText: formatDuration(round.agents.length > 0 ? Math.max(...ends) - Math.min(...starts) : 0),
 				agents,
 			};
 		});
 		const allAgents = rounds.flatMap((round) => round.agents);
 		const finishTimes = allAgents.map((agent) => agent.finishedAt ?? now);
+		const taskGlyph = aggregateGlyph(allAgents);
+		const taskLive = rounds.some((round) => round.live);
 		views.push({
 			id: task.id,
 			source: "registry",
 			label: resolveTaskLabel(task.prompt) || "(detached)",
 			mode: task.mode,
-			live: allAgents.some((agent) => agent.status === "running"),
-			glyph: aggregateGlyph(allAgents),
+			live: taskLive,
+			// A live task never carries a settled glyph (done, failed, or
+			// mixed) even while all its started agents have settled (the
+			// zero-agent pickup window): liveness dominates.
+			glyph: taskLive && taskGlyph !== "running" ? "running" : taskGlyph,
 			durationText: formatDuration((finishTimes.length > 0 ? Math.max(...finishTimes) : now) - task.startedAt),
 			rounds,
 			agents: [],

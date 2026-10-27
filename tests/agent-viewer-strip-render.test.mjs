@@ -13,7 +13,9 @@
  * with the blocking path, and render-time task-label derivation from
  * the prompt. Also covers buildStripTasks assembling
  * views from a live registry plus detached jobs: live rounds first,
- * collapsed finished rounds, detached labels resolving through the
+ * collapsed finished rounds, lazy parallel rounds rendering only
+ * picked-up agents and a zero-agent round staying live with no
+ * entries, detached labels resolving through the
  * same heuristic as blocking tasks (fleet reference wins, first-words
  * fallback, "(detached)" on an empty preview) and keying glyphs off
  * job.status, and detached per-agent nodes (the EXT-1-3 wiring)
@@ -325,5 +327,32 @@ assert.equal(mixedView.live, false, "task with no running agents is not live");
 assert.equal(mixedView.entries[0].kind, "round");
 assert.equal(mixedView.entries[0].glyph, "mixed", "partially failed round uses the mixed glyph");
 assert.equal(mixedView.entries[0].summary, "2/3 done, 1 failed");
+
+// --- buildStripTasks: lazy parallel rounds (only picked-up agents render) ---
+
+const lazy = createDispatchRegistry();
+const lazyTask = lazy.startTask({ mode: "parallel", prompt: "Task: EXT-7-1 lazy fan out", now: 100_000 });
+lazy.startRound(lazyTask.id, [], 100_000);
+lazy.startAgent(lazyTask.id, 1, 0, { agent: "scout" }, 101_000);
+lazy.startAgent(lazyTask.id, 1, 1, { agent: "worker" }, 121_000);
+lazy.updateAgent(lazyTask.id, 1, 0, { lastActivity: "$ rg pattern" });
+
+const lazyView = buildStripTasks(lazy, [], 122_000)[0];
+assert.equal(lazyView.live, true);
+assert.equal(lazyView.entries.length, 2, "only picked-up agents render; queued slots have no nodes");
+assert.equal(lazyView.entries[0].name, "scout");
+assert.equal(lazyView.entries[0].glyph, "running");
+assert.equal(lazyView.entries[0].durationText, "21s", "duration runs from the agent's own pickup, not round start");
+assert.equal(lazyView.entries[1].name, "worker");
+assert.equal(lazyView.entries[1].durationText, "1s", "a later pickup's duration starts at its own pickup");
+
+// --- buildStripTasks: a zero-agent round stays live with no entries ---
+
+const emptyWindow = createDispatchRegistry();
+const emptyTask = emptyWindow.startTask({ mode: "parallel", prompt: "Task: EXT-7-1 empty window", now: 100_000 });
+emptyWindow.startRound(emptyTask.id, [], 100_000);
+const emptyView = buildStripTasks(emptyWindow, [], 122_000)[0];
+assert.equal(emptyView.live, true, "a zero-agent round counts as live instead of collapsing to a finished round");
+assert.equal(emptyView.entries.length, 0);
 
 console.log("agent-viewer-strip-render: all assertions passed");
