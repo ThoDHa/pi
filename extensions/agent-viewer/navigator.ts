@@ -363,10 +363,12 @@ export interface NavigatorDetailModel {
 	thinking: DispatchThinkingEntry[];
 	usageText: string | undefined;
 	resultText: string | undefined;
+	/** Agent models only: the selected run's registration window, scoping the t keybinding's transcript lookup to that run. */
+	runWindow?: TranscriptRunWindow;
 }
 
 function emptyDetailModel(): NavigatorDetailModel {
-	return { kind: "empty", title: "", statusText: "", fields: [], members: [], activity: [], thinking: [], usageText: undefined, resultText: undefined };
+	return { kind: "empty", title: "", statusText: "", fields: [], members: [], activity: [], thinking: [], usageText: undefined, resultText: undefined, runWindow: undefined };
 }
 
 function agentResultText(agent: NavigatorAgentView): string | undefined {
@@ -389,10 +391,12 @@ function resolveAgentView(row: NavigatorRow, task: NavigatorTaskView): Navigator
  * Resolve the selected row into the model the detail pane renders.
  * Agent targets resolve through their tree ref and carry the status
  * header fields (step, model, cwd, tokens, error, duration), the
- * timestamped activity log, the shared usage summary, and the final
- * result text. Task and round targets carry summary fields plus one
- * member line per child round or agent. A missing row, unknown task,
- * or unresolvable ref yields the empty model.
+ * timestamped activity log, the shared usage summary, the final
+ * result text, and the run window (the agent's startedAt/finishedAt
+ * when both are finite) that scopes the t keybinding's transcript
+ * lookup to that run. Task and round targets carry summary fields
+ * plus one member line per child round or agent. A missing row,
+ * unknown task, or unresolvable ref yields the empty model.
  */
 export function resolveDetailModel(row: NavigatorRow | null | undefined, tasks: NavigatorTaskView[]): NavigatorDetailModel {
 	if (!row) return emptyDetailModel();
@@ -410,6 +414,10 @@ export function resolveDetailModel(row: NavigatorRow | null | undefined, tasks: 
 		const errorMessage = agent.result?.errorMessage;
 		if (errorMessage) fields.push({ label: "error", value: errorMessage });
 		fields.push({ label: "duration", value: agent.durationText });
+		const runWindow =
+			agent.finishedAt !== undefined && Number.isFinite(agent.startedAt) && Number.isFinite(agent.finishedAt)
+				? { startedAt: agent.startedAt, finishedAt: agent.finishedAt }
+				: undefined;
 		return {
 			kind: "agent",
 			title: agent.name,
@@ -420,6 +428,7 @@ export function resolveDetailModel(row: NavigatorRow | null | undefined, tasks: 
 			thinking: agent.thinkingLog,
 			usageText: agent.usage ? formatUsageSummary(agent.usage) || undefined : undefined,
 			resultText: agentResultText(agent),
+			runWindow,
 		};
 	}
 
@@ -444,6 +453,7 @@ export function resolveDetailModel(row: NavigatorRow | null | undefined, tasks: 
 			thinking: [],
 			usageText: undefined,
 			resultText: undefined,
+			runWindow: undefined,
 		};
 	}
 
@@ -474,7 +484,32 @@ export function resolveDetailModel(row: NavigatorRow | null | undefined, tasks: 
 		thinking: [],
 		usageText: undefined,
 		resultText: undefined,
+		runWindow: undefined,
 	};
+}
+
+/**
+ * Inclusive slack in milliseconds around a run's startedAt–finishedAt
+ * interval when matching transcript records to it: the registry stamps and
+ * the transcript's message timestamps are same-machine unix-ms clocks, but
+ * subagent toolResults carry millisecond-scale jitter and the completion
+ * update and the transcript write land milliseconds apart, so a run's own
+ * record can sit just outside the bare interval. Far below real dispatch
+ * durations, so a fast rerun still mostly lands in its own window.
+ */
+export const TRANSCRIPT_WINDOW_TOLERANCE_MS = 2_000;
+
+/** A finished agent run's registration interval in unix ms. */
+export interface TranscriptRunWindow {
+	startedAt: number;
+	finishedAt: number;
+}
+
+export interface TranscriptThinkingLookup {
+	/** Whether the latest matching subagent toolResult carries a result slot for `agentName` at all. */
+	found: boolean;
+	/** The matching record's full-text thinking entries, oldest first; empty when not found or found-but-thinkingless. */
+	entries: DispatchThinkingEntry[];
 }
 
 /**
@@ -483,7 +518,17 @@ export function resolveDetailModel(row: NavigatorRow | null | undefined, tasks: 
  * the latest subagent toolResult whose details.results[] carries a
  * result for `agentName` wins (the file is append-only, so completed
  * results are stable, and one agent dispatched twice resolves to its
- * newest run). That result's messages yield one uncapped full-text
+ * newest run). With a `window`, a record must additionally carry a
+ * finite numeric message.timestamp inside the inclusive range
+ * [startedAt - TRANSCRIPT_WINDOW_TOLERANCE_MS, finishedAt +
+ * TRANSCRIPT_WINDOW_TOLERANCE_MS] to compete, and the latest
+ * qualifying record wins; when no record qualifies, or no window is
+ * passed, every matching record competes under the session-latest
+ * rule, so a window miss resolves exactly as the two-argument lookup
+ * does. "Latest" means last in file order across both the windowed
+ * and fallback paths, not highest message.timestamp: the timestamp
+ * only gates window eligibility.
+ * That result's messages yield one uncapped full-text
  * entry per thinking part, oldest first, mirroring the live buffer's
  * entry shape. Lines that fail to parse are skipped: the file is
  * being appended live, so a torn trailing line is normal and must
@@ -503,20 +548,14 @@ export function resolveDetailModel(row: NavigatorRow | null | undefined, tasks: 
  * finished without reasoning), so the viewer can name the record's
  * emptiness instead of denying the record exists.
  */
-export interface TranscriptThinkingLookup {
-	/** Whether the latest matching subagent toolResult carries a result slot for `agentName` at all. */
-	found: boolean;
-	/** The matching record's full-text thinking entries, oldest first; empty when not found or found-but-thinkingless. */
-	entries: DispatchThinkingEntry[];
-}
-
-export function extractTranscriptThinking(jsonl: string, agentName: string): TranscriptThinkingLookup {
+export function extractTranscriptThinking(jsonl: string, agentName: string, window?: TranscriptRunWindow): TranscriptThinkingLookup {
 	let best: DispatchThinkingEntry[] | undefined;
+	let windowed: DispatchThinkingEntry[] | undefined;
 	for (const line of jsonl.split("\n")) {
 		if (!line.includes("subagent")) continue;
 		let entry: {
 			type?: unknown;
-			message?: { role?: unknown; details?: { results?: unknown } };
+			message?: { role?: unknown; timestamp?: unknown; details?: { results?: unknown } };
 		};
 		try {
 			entry = JSON.parse(line);
@@ -527,12 +566,22 @@ export function extractTranscriptThinking(jsonl: string, agentName: string): Tra
 		if ((entry.message as { toolName?: unknown }).toolName !== "subagent") continue;
 		const results = entry.message.details?.results;
 		if (!Array.isArray(results)) continue;
+		const timestamp = entry.message.timestamp;
+		const inWindow =
+			window !== undefined &&
+			typeof timestamp === "number" &&
+			Number.isFinite(timestamp) &&
+			timestamp >= window.startedAt - TRANSCRIPT_WINDOW_TOLERANCE_MS &&
+			timestamp <= window.finishedAt + TRANSCRIPT_WINDOW_TOLERANCE_MS;
 		for (let i = results.length - 1; i >= 0; i--) {
 			const candidate = results[i] as { agent?: unknown; messages?: unknown } | undefined;
 			if (candidate?.agent !== agentName || !Array.isArray(candidate.messages)) continue;
-			best = extractThinkingEntries(candidate.messages as ActivityMessage[], Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
+			const next = extractThinkingEntries(candidate.messages as ActivityMessage[], Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
+			best = next;
+			if (inWindow) windowed = next;
 			break;
 		}
 	}
-	return { found: best !== undefined, entries: best ?? [] };
+	const winner = window !== undefined ? (windowed ?? best) : best;
+	return { found: winner !== undefined, entries: winner ?? [] };
 }

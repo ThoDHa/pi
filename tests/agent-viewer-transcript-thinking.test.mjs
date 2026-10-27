@@ -27,7 +27,7 @@
  */
 
 import assert from "node:assert/strict";
-import { extractTranscriptThinking } from "../extensions/agent-viewer/navigator.ts";
+import { TRANSCRIPT_WINDOW_TOLERANCE_MS, extractTranscriptThinking } from "../extensions/agent-viewer/navigator.ts";
 
 const thinkingMessage = (timestamp, thoughts) => ({
 	role: "assistant",
@@ -35,13 +35,13 @@ const thinkingMessage = (timestamp, thoughts) => ({
 	content: thoughts.map((thinking) => ({ type: "thinking", thinking, thinkingSignature: "sig" })),
 });
 
-const subagentToolResult = (results) => ({
+const subagentToolResult = (results, timestamp = 9_000) => ({
 	type: "message",
 	message: {
 		role: "toolResult",
 		toolName: "subagent",
 		toolCallId: "call_test",
-		timestamp: 9_000,
+		timestamp,
 		isError: false,
 		content: [{ type: "text", text: "final output" }],
 		details: { mode: "parallel", agentScope: {}, projectAgentsDir: null, results },
@@ -102,6 +102,98 @@ assert.deepEqual(
 	extractTranscriptThinking(jsonl, "reviewer"),
 	{ found: false, entries: [] },
 	"an agent with no subagent result is not found, distinct from a found thinkingless record",
+);
+
+// --- the later matching record wins the assignment even when it holds no thinking ---
+
+// Record one carries thinking, record two (same agent, later) carries none:
+// the later record displaces the earlier one and `found` stays true, so the
+// viewer names the record's emptiness instead of showing a stale run's text.
+const overwrittenByThinkingless = [
+	JSON.stringify(subagentToolResult([result("scout", [thinkingMessage(2_000, ["run one thought"])])], 2_000)),
+	JSON.stringify(subagentToolResult([result("scout", [{ role: "assistant", timestamp: 3_000, content: [{ type: "text", text: "run two words" }] }])], 3_000)),
+].join("\n");
+assert.deepEqual(
+	extractTranscriptThinking(overwrittenByThinkingless, "scout"),
+	{ found: true, entries: [] },
+	"a later thinkingless record displaces an earlier thinking-bearing one and found stays true",
+);
+
+const overwriteMirror = [
+	JSON.stringify(subagentToolResult([result("scout", [{ role: "assistant", timestamp: 2_000, content: [{ type: "text", text: "run one words" }] }])], 2_000)),
+	JSON.stringify(subagentToolResult([result("scout", [thinkingMessage(3_000, ["run two thought"])])], 3_000)),
+].join("\n");
+assert.deepEqual(
+	extractTranscriptThinking(overwriteMirror, "scout"),
+	{ found: true, entries: [{ at: 3_000, text: "run two thought" }] },
+	"the mirrored pair resolves to the later record's thinking the same way",
+);
+
+// --- the run window: with one, the latest record inside the window wins; without a qualifier, session-latest fallback ---
+
+const windowedJsonl = [
+	JSON.stringify(subagentToolResult([result("scout", [thinkingMessage(2_000, ["early run thought"])])], 2_000)),
+	JSON.stringify(subagentToolResult([result("scout", [thinkingMessage(8_000, ["late run thought"])])], 8_000)),
+].join("\n");
+
+assert.deepEqual(
+	extractTranscriptThinking(windowedJsonl, "scout", { startedAt: 1_000, finishedAt: 5_000 }),
+	{ found: true, entries: [{ at: 2_000, text: "early run thought" }] },
+	"a window selects the record inside it over the session-latest one",
+);
+
+assert.deepEqual(
+	extractTranscriptThinking(windowedJsonl, "scout", { startedAt: 10_000, finishedAt: 12_000 }),
+	{ found: true, entries: [{ at: 8_000, text: "late run thought" }] },
+	"a window past both records still resolves to the session-latest one",
+);
+
+const boundaryWindow = { startedAt: 1_000, finishedAt: 5_000 };
+const startEdge = boundaryWindow.startedAt - TRANSCRIPT_WINDOW_TOLERANCE_MS;
+const endEdge = boundaryWindow.finishedAt + TRANSCRIPT_WINDOW_TOLERANCE_MS;
+const boundaryJsonl = [
+	JSON.stringify(subagentToolResult([result("scout", [thinkingMessage(startEdge, ["boundary start thought"])])], startEdge)),
+	JSON.stringify(subagentToolResult([result("scout", [thinkingMessage(endEdge, ["boundary end thought"])])], endEdge)),
+	JSON.stringify(subagentToolResult([result("scout", [thinkingMessage(endEdge + 1, ["outside thought"])])], endEdge + 1)),
+].join("\n");
+assert.deepEqual(
+	extractTranscriptThinking(boundaryJsonl, "scout", boundaryWindow),
+	{ found: true, entries: [{ at: endEdge, text: "boundary end thought" }] },
+	"records exactly at the tolerance edges are windowed in and the record past the edge stays out",
+);
+
+// Two same-name records inside one window, the later thinkingless: the
+// windowed assignment follows the same later-record-wins rule as the
+// no-window pair above, so the viewer names the newer run's emptiness
+// instead of showing the older run's text.
+const windowedOverwrite = [
+	JSON.stringify(subagentToolResult([result("scout", [thinkingMessage(2_000, ["run one thought"])])], 2_000)),
+	JSON.stringify(subagentToolResult([result("scout", [{ role: "assistant", timestamp: 3_000, content: [{ type: "text", text: "run two words" }] }])], 3_000)),
+].join("\n");
+assert.deepEqual(
+	extractTranscriptThinking(windowedOverwrite, "scout", { startedAt: 1_000, finishedAt: 4_000 }),
+	{ found: true, entries: [] },
+	"a later thinkingless record inside the window displaces an earlier thinking-bearing one and found stays true",
+);
+
+assert.deepEqual(
+	extractTranscriptThinking(windowedJsonl, "scout", { startedAt: 20_000, finishedAt: 22_000 }),
+	{ found: true, entries: [{ at: 8_000, text: "late run thought" }] },
+	"a window strictly clear of both records and the tolerance edges falls back to the session-latest one",
+);
+
+const timestamplessRecord = JSON.parse(JSON.stringify(subagentToolResult([result("scout", [thinkingMessage(4_000, ["timestampless thought"])])])));
+delete timestamplessRecord.message.timestamp;
+assert.deepEqual(
+	extractTranscriptThinking(JSON.stringify(timestamplessRecord), "scout", { startedAt: 3_000, finishedAt: 5_000 }),
+	{ found: true, entries: [{ at: 4_000, text: "timestampless thought" }] },
+	"a matching record without message.timestamp falls back to a win even with a window passed",
+);
+
+assert.deepEqual(
+	extractTranscriptThinking(JSON.stringify(subagentToolResult([result("other", [thinkingMessage(2_000, ["other thought"])])])), "scout", { startedAt: 1_000, finishedAt: 5_000 }),
+	{ found: false, entries: [] },
+	"a window over a transcript with no matching record still finds nothing",
 );
 
 // --- full text: no truncation, no collapsing, no caps ---

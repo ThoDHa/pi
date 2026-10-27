@@ -280,8 +280,10 @@ export class NavigatorView implements Focusable {
 	 * Toggle the t keybinding's transcript reading view for the selected
 	 * agent. A finished agent (done or failed) loads its full thinking
 	 * from the current session .jsonl via the injected sessionFile
-	 * source: read once at open time, uncapped, the latest matching
-	 * subagent toolResult winning. A running agent, a task or round row,
+	 * source: read once at open time, uncapped, the selected run's window
+	 * matching first and the session-latest matching subagent toolResult
+	 * winning when no record falls inside the window. A running agent, a
+	 * task or round row,
 	 * or an already-open view is a no-op or toggles off; a missing
 	 * source, undefined path, or unreadable file renders the
 	 * unavailable note instead of throwing. An empty read renders a note
@@ -309,7 +311,7 @@ export class NavigatorView implements Focusable {
 			state = "unavailable";
 		} else {
 			try {
-				const lookup = extractTranscriptThinking(readFileSync(sessionFile, "utf8"), agent);
+				const lookup = extractTranscriptThinking(readFileSync(sessionFile, "utf8"), agent, model.runWindow);
 				entries = lookup.entries;
 				if (!lookup.found) state = "empty";
 				else state = lookup.entries.length > 0 ? "loaded" : "found-empty";

@@ -924,6 +924,67 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 	}
 }
 
+// --- t scope: the selected round's run window picks that run's record, not the session-latest one ---
+
+{
+	const dir = mkdtempSync(join(tmpdir(), "pi-navigator-thinking-window-"));
+	try {
+		const sessionFile = join(dir, "session.jsonl");
+		const scoutResult = (thought) => ({
+			agent: "scout",
+			agentSource: "user",
+			task: "probe",
+			exitCode: 0,
+			messages: [{ role: "assistant", timestamp: 1, content: [{ type: "thinking", thinking: thought }] }],
+			stderr: "",
+			stopReason: "end",
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+		});
+		const windowToolResult = (timestamp, thought) =>
+			JSON.stringify({
+				type: "message",
+				message: { role: "toolResult", toolName: "subagent", toolCallId: "call_1", timestamp, content: [], details: { mode: "single", results: [scoutResult(thought)] } },
+			});
+		writeFileSync(
+			sessionFile,
+			[JSON.stringify({ type: "session", version: 3, id: "s1" }), windowToolResult(5_000, "run one thought"), windowToolResult(12_000, "run two thought")].join("\n"),
+		);
+
+		const registry = createDispatchRegistry();
+		const task = registry.startTask({ mode: "single", prompt: "Task: EXT-9-1 window probe", now: 1_000 });
+		registry.startRound(task.id, [{ agent: "scout" }], 1_000);
+		registry.updateAgent(task.id, 1, 0, { status: "done", finishedAt: 5_000 });
+		registry.startRound(task.id, [{ agent: "scout" }], 8_000);
+		registry.updateAgent(task.id, 2, 0, { status: "done", finishedAt: 12_000 });
+
+		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
+			// Both settled rounds start collapsed: expand r1 and walk to its scout.
+			view.handleInput(DOWN);
+			assert.equal(view.selectedId, "t:task-1:r1");
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
+			assert.equal(view.selectedId, "t:task-1:r1:a0");
+			view.handleInput("t");
+			const runOneFrame = view.render(120).join("\n");
+			assert.ok(runOneFrame.includes("run one thought"), "t on the older run shows that run's thinking");
+			assert.ok(!runOneFrame.includes("run two thought"), "t on the older run never shows the newer run's thinking");
+
+			view.handleInput("t");
+			view.handleInput(DOWN);
+			assert.equal(view.selectedId, "t:task-1:r2");
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
+			assert.equal(view.selectedId, "t:task-1:r2:a0");
+			view.handleInput("t");
+			const runTwoFrame = view.render(120).join("\n");
+			assert.ok(runTwoFrame.includes("run two thought"), "t on the newer run shows the newer run's thinking");
+			assert.ok(!runTwoFrame.includes("run one thought"), "t on the newer run never shows the older run's thinking");
+		}, stubTui(), thinkingTheme);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
 // --- t guard rails: running agents, task rows, and missing transcripts ---
 
 {
