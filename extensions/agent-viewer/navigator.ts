@@ -514,9 +514,37 @@ export interface TranscriptThinkingLookup {
 	entries: DispatchThinkingEntry[];
 }
 
+/** The incremental transcript lookup the streamed t read feeds line by line and the whole-string API wraps. */
+export interface TranscriptThinkingScanner {
+	/** Consume the next transcript line in file order: lines that fail parse or shape are skipped. */
+	feed(line: string): void;
+	/** Resolve the lookup over every fed line so far. */
+	finish(): TranscriptThinkingLookup;
+}
+
 /**
- * A finished agent's full thinking, read out of the parent session
- * transcript for the t keybinding: the .jsonl is scanned in order and
+ * A result slot's message-timestamp span: the smallest and largest
+ * finite numeric timestamps across the slot's messages, or undefined
+ * when no message carries one, which disqualifies the slot from a
+ * windowed match. A slot whose messages all share one timestamp has
+ * first === last.
+ */
+function transcriptSlotSpan(messages: ActivityMessage[]): { first: number; last: number } | undefined {
+	let first: number | undefined;
+	let last: number | undefined;
+	for (const message of messages) {
+		const timestamp = message.timestamp;
+		if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) continue;
+		if (first === undefined || timestamp < first) first = timestamp;
+		if (last === undefined || timestamp > last) last = timestamp;
+	}
+	return first === undefined ? undefined : { first, last };
+}
+
+/**
+ * A finished agent's full thinking, read incrementally out of the
+ * parent session transcript for the t keybinding: lines are fed in
+ * file order and
  * the latest subagent toolResult whose details.results[] carries a
  * result for `agentName` wins (the file is append-only, so completed
  * results are stable, and one agent dispatched twice resolves to its
@@ -551,77 +579,74 @@ export interface TranscriptThinkingLookup {
  * subagent lines instead of the whole session, and the filter can only
  * skip, never match (a false positive merely falls through to the
  * parse and shape checks below).
- * Returns whether a matching record exists at all plus that record's
- * thinking: found=false when nothing matches (unknown agent, no
- * subagent results, empty file), found=true with empty entries when
- * the latest matching record holds no thinking parts (an agent that
- * finished without reasoning), so the viewer can name the record's
- * emptiness instead of denying the record exists.
+ * finish() returns whether a matching record exists at all plus that
+ * record's thinking: found=false when nothing matches (unknown agent,
+ * no subagent results, no lines fed), found=true with empty entries
+ * when the latest matching record holds no thinking parts (an agent
+ * that finished without reasoning), so the viewer can name the
+ * record's emptiness instead of denying the record exists.
  */
-
-/**
- * A result slot's message-timestamp span: the smallest and largest
- * finite numeric timestamps across the slot's messages, or undefined
- * when no message carries one, which disqualifies the slot from a
- * windowed match. A slot whose messages all share one timestamp has
- * first === last.
- */
-function transcriptSlotSpan(messages: ActivityMessage[]): { first: number; last: number } | undefined {
-	let first: number | undefined;
-	let last: number | undefined;
-	for (const message of messages) {
-		const timestamp = message.timestamp;
-		if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) continue;
-		if (first === undefined || timestamp < first) first = timestamp;
-		if (last === undefined || timestamp > last) last = timestamp;
-	}
-	return first === undefined ? undefined : { first, last };
-}
-
-export function extractTranscriptThinking(jsonl: string, agentName: string, window?: TranscriptRunWindow): TranscriptThinkingLookup {
+export function createTranscriptThinkingScanner(agentName: string, window?: TranscriptRunWindow): TranscriptThinkingScanner {
 	let best: DispatchThinkingEntry[] | undefined;
 	let windowed: DispatchThinkingEntry[] | undefined;
 	const windowStart = window !== undefined ? window.startedAt - TRANSCRIPT_WINDOW_TOLERANCE_MS : Number.NaN;
 	const windowEnd = window !== undefined ? window.finishedAt + TRANSCRIPT_WINDOW_TOLERANCE_MS : Number.NaN;
-	for (const line of jsonl.split("\n")) {
-		if (!line.includes("subagent")) continue;
-		let entry: {
-			type?: unknown;
-			message?: { role?: unknown; details?: { results?: unknown } };
-		};
-		try {
-			entry = JSON.parse(line);
-		} catch {
-			continue;
-		}
-		if (entry?.type !== "message" || entry.message?.role !== "toolResult") continue;
-		if ((entry.message as { toolName?: unknown }).toolName !== "subagent") continue;
-		const results = entry.message.details?.results;
-		if (!Array.isArray(results)) continue;
-		for (let i = results.length - 1; i >= 0; i--) {
-			const candidate = results[i] as { agent?: unknown; messages?: unknown } | undefined;
-			if (candidate?.agent !== agentName || !Array.isArray(candidate.messages)) continue;
-			const next = extractThinkingEntries(candidate.messages as ActivityMessage[], Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
-			best = next;
-			break;
-		}
-		if (window === undefined) continue;
-		let recordBest: { entries: DispatchThinkingEntry[]; spanEnd: number } | undefined;
-		for (let i = results.length - 1; i >= 0; i--) {
-			const candidate = results[i] as { agent?: unknown; messages?: unknown } | undefined;
-			if (candidate?.agent !== agentName || !Array.isArray(candidate.messages)) continue;
-			const messages = candidate.messages as ActivityMessage[];
-			const span = transcriptSlotSpan(messages);
-			if (span === undefined || span.first < windowStart || span.last > windowEnd) continue;
-			if (recordBest === undefined || span.last > recordBest.spanEnd) {
-				recordBest = {
-					entries: extractThinkingEntries(messages, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY),
-					spanEnd: span.last,
-				};
+	return {
+		feed(line: string): void {
+			if (!line.includes("subagent")) return;
+			let entry: {
+				type?: unknown;
+				message?: { role?: unknown; details?: { results?: unknown } };
+			};
+			try {
+				entry = JSON.parse(line);
+			} catch {
+				return;
 			}
-		}
-		if (recordBest !== undefined) windowed = recordBest.entries;
-	}
-	const winner = window !== undefined ? (windowed ?? best) : best;
-	return { found: winner !== undefined, entries: winner ?? [] };
+			if (entry?.type !== "message" || entry.message?.role !== "toolResult") return;
+			if ((entry.message as { toolName?: unknown }).toolName !== "subagent") return;
+			const results = entry.message.details?.results;
+			if (!Array.isArray(results)) return;
+			for (let i = results.length - 1; i >= 0; i--) {
+				const candidate = results[i] as { agent?: unknown; messages?: unknown } | undefined;
+				if (candidate?.agent !== agentName || !Array.isArray(candidate.messages)) continue;
+				const next = extractThinkingEntries(candidate.messages as ActivityMessage[], Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
+				best = next;
+				break;
+			}
+			if (window === undefined) return;
+			let recordBest: { entries: DispatchThinkingEntry[]; spanEnd: number } | undefined;
+			for (let i = results.length - 1; i >= 0; i--) {
+				const candidate = results[i] as { agent?: unknown; messages?: unknown } | undefined;
+				if (candidate?.agent !== agentName || !Array.isArray(candidate.messages)) continue;
+				const messages = candidate.messages as ActivityMessage[];
+				const span = transcriptSlotSpan(messages);
+				if (span === undefined || span.first < windowStart || span.last > windowEnd) continue;
+				if (recordBest === undefined || span.last > recordBest.spanEnd) {
+					recordBest = {
+						entries: extractThinkingEntries(messages, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY),
+						spanEnd: span.last,
+					};
+				}
+			}
+			if (recordBest !== undefined) windowed = recordBest.entries;
+		},
+		finish(): TranscriptThinkingLookup {
+			const winner = window !== undefined ? (windowed ?? best) : best;
+			return { found: winner !== undefined, entries: winner ?? [] };
+		},
+	};
+}
+
+/**
+ * Whole-string form of the transcript thinking lookup: splits `jsonl`
+ * into lines and feeds them through createTranscriptThinkingScanner,
+ * so the string API and the streamed read share one implementation
+ * and stay byte-identical by construction. See the scanner factory
+ * above for the full matching semantics.
+ */
+export function extractTranscriptThinking(jsonl: string, agentName: string, window?: TranscriptRunWindow): TranscriptThinkingLookup {
+	const scanner = createTranscriptThinkingScanner(agentName, window);
+	for (const line of jsonl.split("\n")) scanner.feed(line);
+	return scanner.finish();
 }

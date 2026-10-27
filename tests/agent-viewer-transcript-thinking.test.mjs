@@ -21,14 +21,21 @@
  * untruncated text with message timestamps, tolerance of a torn
  * (partial) trailing line from the live-appending file, and the
  * tri-state: not-found for absent agents or sessionless input,
- * found-but-empty for a record holding no thinking parts. Fixture shapes mirror the real transcript:
+ * found-but-empty for a record holding no thinking parts. The
+ * whole-string lookup is a thin wrapper over an incremental
+ * feed/finish scanner (createTranscriptThinkingScanner) so the streamed
+ * t read can feed readline's lines into the same logic: a parity
+ * corpus drives both entry points with identical strings across the
+ * fixture shapes, boundary variants pin the line-boundary differences
+ * (trailing newline, no trailing newline, blank lines, CRLF), and the
+ * scanner's own tri-state is pinned directly. Fixture shapes mirror the real transcript:
  * session entries of type "message" whose toolResult message carries
  * details.results[], and results[].messages holding bare assistant
  * messages with thinking parts.
  */
 
 import assert from "node:assert/strict";
-import { TRANSCRIPT_WINDOW_TOLERANCE_MS, extractTranscriptThinking } from "../extensions/agent-viewer/navigator.ts";
+import { TRANSCRIPT_WINDOW_TOLERANCE_MS, createTranscriptThinkingScanner, extractTranscriptThinking } from "../extensions/agent-viewer/navigator.ts";
 
 const thinkingMessage = (timestamp, thoughts) => ({
 	role: "assistant",
@@ -447,5 +454,108 @@ assert.deepEqual(
 	{ found: true, entries: [{ at: 1_000, text: "matched thought" }] },
 	"a non-toolResult line mentioning subagent falls through the filter and never matches",
 );
+
+// --- the incremental scanner: feed/finish parity with the whole-string lookup ---
+
+// The whole-string lookup is a thin wrapper over an incremental
+// feed/finish scanner (the wrapper splits and feeds the same lines),
+// so the streamed t read can feed readline's lines into the scanner
+// and resolve byte-identically to the whole-string lookup on the same
+// input. The corpus below reuses every fixture shape pinned above and
+// drives both entry points with identical strings across a matrix of
+// agent/window arguments, asserting identical lookups: tri-state,
+// window spans with the session-latest fallback, per-slot matching,
+// and torn-line tolerance must survive the incremental path exactly.
+const lookupByLines = (jsonl, agentName, window) => {
+	const scanner = createTranscriptThinkingScanner(agentName, window);
+	for (const line of jsonl.split("\n")) scanner.feed(line);
+	return scanner.finish();
+};
+
+const parityCorpus = [
+	["latest-match transcript", jsonl],
+	["thinkingless overwrite", overwrittenByThinkingless],
+	["thinking overwrite mirror", overwriteMirror],
+	["window pair", windowedJsonl],
+	["tolerance boundary", boundaryJsonl],
+	["windowed overwrite", windowedOverwrite],
+	["timestampless record", JSON.stringify(timestamplessRecord)],
+	["parallel same-name slots", parallelJsonl],
+	["chain rounds", chainJsonl],
+	["shared-span ambiguity", ambiguityJsonl],
+	["span-less degradation", degradationJsonl],
+	["torn trailing line", tornTail],
+	["uncapped large block", bigJsonl],
+];
+
+const parityArguments = [
+	["scout", undefined],
+	["scout", { startedAt: 1_000, finishedAt: 5_000 }],
+	["scout", { startedAt: 48_000, finishedAt: 52_000 }],
+	["worker", undefined],
+	["planner", undefined],
+	["reviewer", undefined],
+];
+
+for (const [fixtureName, fixture] of parityCorpus) {
+	for (const [agentName, window] of parityArguments) {
+		assert.deepEqual(
+			extractTranscriptThinking(fixture, agentName, window),
+			lookupByLines(fixture, agentName, window),
+			`the whole-string lookup and the line-fed scanner resolve identically (${fixtureName}, ${agentName}${window ? ", windowed" : ""})`,
+		);
+	}
+}
+
+// The scanner's own tri-state contract, pinned directly on the API the
+// streamed read consumes rather than only through the wrapper.
+assert.deepEqual(createTranscriptThinkingScanner("scout").finish(), { found: false, entries: [] }, "a scanner fed nothing finds no record");
+const scannerLatest = createTranscriptThinkingScanner("scout");
+for (const line of jsonl.split("\n")) scannerLatest.feed(line);
+assert.deepEqual(
+	scannerLatest.finish(),
+	{
+		found: true,
+		entries: [
+			{ at: 3_000, text: "scout newest" },
+			{ at: 3_100, text: "scout second block" },
+		],
+	},
+	"the line-fed scanner resolves the session-latest match with its full entries",
+);
+const scannerWindowed = createTranscriptThinkingScanner("scout", { startedAt: 1_000, finishedAt: 5_000 });
+for (const line of windowedJsonl.split("\n")) scannerWindowed.feed(line);
+assert.deepEqual(
+	scannerWindowed.finish(),
+	{ found: true, entries: [{ at: 2_000, text: "early run thought" }] },
+	"the line-fed scanner resolves a windowed match over the session-latest record",
+);
+
+// Line-boundary variants: the streamed read's line yields differ from
+// the wrapper's split exactly at file edges and separators, so parity
+// is pinned where those differences live. A trailing newline and blank
+// lines add empty lines the scanner skips unparsed either way; CRLF
+// endings leave a trailing \r on split-fed lines that JSON.parse
+// accepts as whitespace, and readline (crlfDelay) would strip it, so
+// both feeds must resolve identically to the canonical fixture.
+const variantRecord = JSON.stringify(subagentToolResult([result("scout", [thinkingMessage(1_000, ["boundary variant thought"])])]));
+const boundaryVariants = [
+	["no trailing newline", variantRecord],
+	["trailing newline", `${variantRecord}\n`],
+	["blank lines around the record", ["", variantRecord, "", ""].join("\n")],
+	["crlf endings", [variantRecord, variantRecord].join("\r\n")],
+];
+for (const [variantName, variant] of boundaryVariants) {
+	assert.deepEqual(
+		extractTranscriptThinking(variant, "scout"),
+		{ found: true, entries: [{ at: 1_000, text: "boundary variant thought" }] },
+		`the whole-string lookup resolves the ${variantName} fixture to the canonical record`,
+	);
+	assert.deepEqual(
+		lookupByLines(variant, "scout"),
+		{ found: true, entries: [{ at: 1_000, text: "boundary variant thought" }] },
+		`the line-fed scanner resolves the ${variantName} fixture to the canonical record`,
+	);
+}
 
 console.log("agent-viewer-transcript-thinking: all assertions passed");
