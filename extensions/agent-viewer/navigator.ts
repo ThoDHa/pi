@@ -559,6 +559,7 @@ export interface TranscriptThinkingLookup {
  * finished without reasoning), so the viewer can name the record's
  * emptiness instead of denying the record exists.
  */
+
 /**
  * A result slot's message-timestamp span: the smallest and largest
  * finite numeric timestamps across the slot's messages, or undefined
