@@ -196,6 +196,39 @@ assert.deepEqual(
 	"a window over a transcript with no matching record still finds nothing",
 );
 
+// --- parallel-shape fallback: one record, two same-name slots, one record-level timestamp ---
+
+// A blocking parallel dispatch writes ONE subagent toolResult at
+// dispatch completion, so its same-name slots share a single
+// record-level timestamp however far apart they finished. Only the
+// last finisher's row window reaches the record stamp; the earlier
+// finisher's window misses it and falls back to session-latest, which
+// resolves the same record's last matching slot in file order. The
+// earlier finisher's own slot stays unreachable at record level, so
+// both rows name the same slot's thinking: pinned as intentional
+// until slot-level matching replaces the record-level rule.
+const parallelJsonl = JSON.stringify(
+	subagentToolResult(
+		[
+			result("scout", [thinkingMessage(11_000, ["scout early finisher thought"])]),
+			result("scout", [thinkingMessage(49_000, ["scout last finisher thought"])]),
+		],
+		50_000,
+	),
+);
+
+assert.deepEqual(
+	extractTranscriptThinking(parallelJsonl, "scout", { startedAt: 48_000, finishedAt: 52_000 }),
+	{ found: true, entries: [{ at: 49_000, text: "scout last finisher thought" }] },
+	"the last finisher's window holds the parallel record and still resolves the record's last matching slot",
+);
+
+assert.deepEqual(
+	extractTranscriptThinking(parallelJsonl, "scout", { startedAt: 9_000, finishedAt: 13_000 }),
+	{ found: true, entries: [{ at: 49_000, text: "scout last finisher thought" }] },
+	"the earlier finisher's window misses the parallel record and falls back to the record's last matching slot, not its own slot",
+);
+
 // --- full text: no truncation, no collapsing, no caps ---
 
 const bigThought = "y".repeat(100_000);
