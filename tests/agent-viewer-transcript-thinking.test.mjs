@@ -196,17 +196,16 @@ assert.deepEqual(
 	"a window over a transcript with no matching record still finds nothing",
 );
 
-// --- parallel-shape fallback: one record, two same-name slots, one record-level timestamp ---
+// --- same-name parallel slots: each row resolves its own slot by span ---
 
 // A blocking parallel dispatch writes ONE subagent toolResult at
 // dispatch completion, so its same-name slots share a single
-// record-level timestamp however far apart they finished. Only the
-// last finisher's row window reaches the record stamp; the earlier
-// finisher's window misses it and falls back to session-latest, which
-// resolves the same record's last matching slot in file order. The
-// earlier finisher's own slot stays unreachable at record level, so
-// both rows name the same slot's thinking: pinned as intentional
-// until slot-level matching replaces the record-level rule.
+// record-level timestamp however far apart they finished, and that
+// stamp never gates the match. Each slot competes by its own
+// message-timestamp span: the earlier finisher's span sits inside its
+// own row's window while the last finisher's span end falls outside
+// it, and vice versa, so each row names its own slot's thinking
+// instead of the record's last matching slot in file order.
 const parallelJsonl = JSON.stringify(
 	subagentToolResult(
 		[
@@ -220,13 +219,100 @@ const parallelJsonl = JSON.stringify(
 assert.deepEqual(
 	extractTranscriptThinking(parallelJsonl, "scout", { startedAt: 48_000, finishedAt: 52_000 }),
 	{ found: true, entries: [{ at: 49_000, text: "scout last finisher thought" }] },
-	"the last finisher's window holds the parallel record and still resolves the record's last matching slot",
+	"the last finisher's window holds its own slot's span and resolves it",
 );
 
 assert.deepEqual(
 	extractTranscriptThinking(parallelJsonl, "scout", { startedAt: 9_000, finishedAt: 13_000 }),
-	{ found: true, entries: [{ at: 49_000, text: "scout last finisher thought" }] },
-	"the earlier finisher's window misses the parallel record and falls back to the record's last matching slot, not its own slot",
+	{ found: true, entries: [{ at: 11_000, text: "scout early finisher thought" }] },
+	"the earlier finisher's window holds its own slot's span and resolves it instead of the record's last matching slot",
+);
+
+// --- chain rounds: one record per chain, stamped at each chain's end, earlier steps reach their own run's slot ---
+
+// A chain round writes one record per chain, stamped when the whole
+// chain completes, so every step's record stamp sits after that
+// step's window and the stamp can never gate the match. Each step's
+// row resolves through its own slot's span inside its own window;
+// the fallback alone would hand the earlier round's step the next
+// round's slot instead.
+const chainJsonl = [
+	JSON.stringify(
+		subagentToolResult(
+			[
+				result("worker", [thinkingMessage(10_000, ["round 1 worker thought"])]),
+				result("verifier", [thinkingMessage(65_000, ["round 1 verifier thought"])]),
+				result("reviewer", [thinkingMessage(115_000, ["round 1 reviewer thought"])]),
+			],
+			160_500,
+		),
+	),
+	JSON.stringify(
+		subagentToolResult(
+			[
+				result("worker", [thinkingMessage(310_000, ["round 2 worker thought"])]),
+				result("verifier", [thinkingMessage(365_000, ["round 2 verifier thought"])]),
+				result("reviewer", [thinkingMessage(415_000, ["round 2 reviewer thought"])]),
+			],
+			460_500,
+		),
+	),
+].join("\n");
+
+assert.deepEqual(
+	extractTranscriptThinking(chainJsonl, "worker", { startedAt: 9_000, finishedAt: 61_000 }),
+	{ found: true, entries: [{ at: 10_000, text: "round 1 worker thought" }] },
+	"a chain round's earlier step resolves its own run's slot even though its record stamp sits at the chain's end",
+);
+
+assert.deepEqual(
+	extractTranscriptThinking(chainJsonl, "worker", { startedAt: 309_000, finishedAt: 361_000 }),
+	{ found: true, entries: [{ at: 310_000, text: "round 2 worker thought" }] },
+	"the later chain round's worker row resolves its own run's slot, not the earlier round's",
+);
+
+// --- same-wave parallel slots: shared span starts, staggered ends, late finisher first in results order ---
+
+// Mirrors the measured parallel record (call_96ad9c80): two scout
+// dispatches in one wave start 21 ms apart, finish ~165 s apart, and
+// the record lists the late finisher FIRST in results order. Both
+// rows' windows hold both spans' starts, so only containment of the
+// span end discriminates: the early row's window excludes the late
+// span's end, and the late row's window holds both spans, where the
+// latest span end is the row's own slot. File order alone would hand
+// both rows the record's first-listed late slot.
+const ambiguityJsonl = JSON.stringify(
+	subagentToolResult(
+		[
+			result("scout", [thinkingMessage(530_536, ["scout late first block"]), thinkingMessage(964_196, ["scout late finisher thought"])]),
+			result("scout", [thinkingMessage(530_557, ["scout early first block"]), thinkingMessage(799_007, ["scout early finisher thought"])]),
+		],
+		970_000,
+	),
+);
+
+assert.deepEqual(
+	extractTranscriptThinking(ambiguityJsonl, "scout", { startedAt: 530_000, finishedAt: 799_000 }),
+	{
+		found: true,
+		entries: [
+			{ at: 530_557, text: "scout early first block" },
+			{ at: 799_007, text: "scout early finisher thought" },
+		],
+	},
+	"the early finisher's row resolves its own slot: the late sibling's span end falls outside the window",
+);
+
+assert.deepEqual(
+	extractTranscriptThinking(ambiguityJsonl, "scout", { startedAt: 530_000, finishedAt: 964_000 }),
+	{
+		found: true,
+		entries: [
+			{ at: 530_536, text: "scout late first block" },
+			{ at: 964_196, text: "scout late finisher thought" },
+		],
+	},
+	"the late finisher's row resolves its own slot: within one record the latest span end wins even though the late slot is listed first",
 );
 
 // --- full text: no truncation, no collapsing, no caps ---
