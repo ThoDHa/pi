@@ -67,7 +67,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readdirSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { importPiTui } from "./provision-pi-tui.mjs";
@@ -1460,6 +1460,72 @@ function deferredTranscriptReader() {
 				assert.ok(!lateFrame.includes("reading transcript…"), "no second read starts on the re-press");
 				assert.ok(!lateFrame.includes("block 24 thought"), "the aborted read never lands late");
 			}
+		});
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+// --- t through the default reader is capped at the open-time byte length: a record appended mid-read never lands ---
+
+{
+	const dir = mkdtempSync(join(tmpdir(), "pi-navigator-thinking-cap-"));
+	try {
+		const sessionFile = join(dir, "session.jsonl");
+		const entry = (object) => JSON.stringify(object);
+		const scoutResult = (messages) => ({
+			agent: "scout",
+			agentSource: "user",
+			task: "probe",
+			exitCode: 0,
+			messages: messages.map(([timestamp, text]) => ({ role: "assistant", timestamp, content: [{ type: "thinking", thinking: text }] })),
+			stderr: "",
+			stopReason: "end",
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+		});
+		const toolResult = (results) =>
+			entry({
+				type: "message",
+				message: { role: "toolResult", toolName: "subagent", toolCallId: "call_1", content: [], details: { mode: "single", results } },
+			});
+		// The own record sits at the press-time head of the file: its slot's
+		// span (5_000, 5_024) sits inside the run's widened window. The
+		// appended sibling ends at 5_030, later than the own end and closer
+		// to the row's finishedAt 9_000, so under an uncapped feed it wins
+		// under the latest-end rule and under the closest-end rule alike;
+		// only a feed capped at the open-time length excludes it.
+		// Filler lines without the subagent substring keep the scan cheap
+		// while sizing the read (~65 MB, ~175 ms here) past the observation
+		// budgets, mirroring the abort pin's idiom.
+		const fillerLine = entry({ type: "message", message: { role: "assistant", timestamp: 9_500, content: [{ type: "text", text: "f".repeat(65_536) }] } });
+		writeFileSync(
+			sessionFile,
+			[
+				entry({ type: "session", version: 3, id: "s1" }),
+				toolResult([scoutResult([[5_000, "own pressed thought"], [5_024, "own pressed second block"]])]),
+				...Array.from({ length: 1_000 }, () => fillerLine),
+			].join("\n"),
+		);
+
+		const registry = createDispatchRegistry();
+		const task = registry.startTask({ mode: "single", prompt: "Task: EXT-12-1 cap probe", now: 1_000 });
+		registry.startRound(task.id, [{ agent: "scout" }], 1_000);
+		registry.updateAgent(task.id, 1, 0, { status: "done", finishedAt: 9_000, thinkingLog: [{ at: 1_050, text: "live buffer thought" }] });
+		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
+			view.handleInput(DOWN);
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
+			assert.equal(view.selectedId, "t:task-1:r1:a0");
+			view.handleInput("t");
+			assert.ok(view.render(120).join("\n").includes("reading transcript…"), "the press renders the loading note through the default reader");
+			await waitForOpenDescriptor(dir);
+			appendFileSync(sessionFile, `\n${toolResult([scoutResult([[5_030, "appended mid-read thought"]])])}`);
+			await waitForFrame(view, (frame) => frame.includes("full thinking"));
+			const landed = view.render(120).join("\n");
+			assert.ok(landed.includes("full thinking"), "the capped read lands on the reading view");
+			assert.ok(landed.includes("own pressed thought"), "the capped read lands the press-time record's own slot");
+			assert.ok(!landed.includes("appended mid-read thought"), "a same-name record appended mid-read never lands");
+			await waitForClosedDescriptor(dir);
 		});
 	} finally {
 		rmSync(dir, { recursive: true, force: true });

@@ -324,6 +324,58 @@ assert.deepEqual(
 	"the late finisher's row resolves its own slot: within one record the latest span end wins even though the late slot is listed first",
 );
 
+// --- the 2 s tolerance residual: the row's own slot ends closest to its finishedAt ---
+
+// Mirrors EXT-11 review DC1's falsifiable trigger: a same-name sibling
+// finishes 500 ms after the row's registry finishedAt, inside the 2 s
+// tolerance, so both spans compete in the widened window and the
+// sibling's span end is the higher one. A run's own span end lands
+// milliseconds past its registry finishedAt (measured: ~34-45 ms), so
+// the span end closest to finishedAt is the row's own slot, not the
+// latest one.
+const residualJsonl = JSON.stringify(
+	subagentToolResult([
+		result("scout", [thinkingMessage(1_000, ["own first block"]), thinkingMessage(9_950, ["own last thought"])]),
+		result("scout", [thinkingMessage(1_000, ["sibling first block"]), thinkingMessage(10_500, ["sibling last thought"])]),
+	], 10_000),
+);
+
+assert.deepEqual(
+	extractTranscriptThinking(residualJsonl, "scout", { startedAt: 1_000, finishedAt: 10_000 }),
+	{
+		found: true,
+		entries: [
+			{ at: 1_000, text: "own first block" },
+			{ at: 9_950, text: "own last thought" },
+		],
+	},
+	"a sibling finishing inside the tolerance resolves the row's own slot: its span end lies closest to the run's finishedAt",
+);
+
+// The exact distance tie: two competing span ends equidistant from the
+// finishedAt (100 ms on each side), with the later end listed first in
+// results order. The strict comparator keeps the first-encountered slot
+// of the reverse iteration, so the tie falls to the last matching slot
+// in file order, the landed tie-break rule.
+const equidistantJsonl = JSON.stringify(
+	subagentToolResult([
+		result("scout", [thinkingMessage(1_000, ["later end first block"]), thinkingMessage(10_100, ["later end thought"])]),
+		result("scout", [thinkingMessage(1_000, ["earlier end first block"]), thinkingMessage(9_900, ["earlier end thought"])]),
+	], 10_000),
+);
+
+assert.deepEqual(
+	extractTranscriptThinking(equidistantJsonl, "scout", { startedAt: 1_000, finishedAt: 10_000 }),
+	{
+		found: true,
+		entries: [
+			{ at: 1_000, text: "earlier end first block" },
+			{ at: 9_900, text: "earlier end thought" },
+		],
+	},
+	"distance ties fall to the last matching slot in file order even when the later end is listed first",
+);
+
 // --- span-less degradation: a window miss resolves exactly as the no-window lookup ---
 
 // Two matching records, neither holding a competing slot: the earlier
