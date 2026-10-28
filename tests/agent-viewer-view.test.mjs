@@ -64,7 +64,9 @@
  * unchanged; short content
  * keeps the scroll keys as no-ops; escape resolves the done callback;
  * a press of the open key closes the view with the same resolution
- * from the default and transcript-loading states; a remapped
+ * from the default and transcript-loading states, including while the
+ * real streamed transcript read is mid-flight, where the close's
+ * dispose aborts the read and the aborted read never lands; a remapped
  * navigatorKey registers, opens, and closes under the configured key
  * while the default key does not close the remapped view; and the
  * hints line truncates instead of overflowing a narrow width.
@@ -1638,6 +1640,90 @@ function deferredTranscriptReader() {
 			assert.ok(!landed.includes("appended mid-read thought"), "a same-name record appended mid-read never lands");
 			await waitForClosedDescriptor(dir);
 		});
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+// --- a close via the open key while the default reader is mid-flight: the close's dispose aborts the read and it never lands ---
+
+{
+	const dir = mkdtempSync(join(tmpdir(), "pi-navigator-thinking-close-"));
+	try {
+		const sessionFile = join(dir, "session.jsonl");
+		const entry = (object) => JSON.stringify(object);
+		const scoutResult = (thoughts) => ({
+			agent: "scout",
+			agentSource: "user",
+			task: "probe",
+			exitCode: 0,
+			messages: thoughts.map(([timestamp, text]) => ({ role: "assistant", timestamp, content: [{ type: "thinking", thinking: text }] })),
+			stderr: "",
+			stopReason: "end",
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+		});
+		const toolResult = (results) =>
+			entry({
+				type: "message",
+				message: { role: "toolResult", toolName: "subagent", toolCallId: "call_1", content: [], details: { mode: "single", results } },
+			});
+		// The own record sits at the file head, before the filler, so its
+		// thinking is fed to the scanner before the close aborts the read,
+		// making a guard-broken landing observable in the late frames.
+		// Filler lines without the subagent substring keep the scan cheap
+		// while sizing the read (~39 MB, ~170-290 ms here) past
+		// waitForClosedDescriptor's 50 ms budget (>3x margin): a close whose
+		// dispose fails to abort the read cannot reach EOF within it. If the
+		// margin thins on a faster or loaded machine, resize the filler,
+		// keeping the full read past the fd budget.
+		const fillerLine = entry({ type: "message", message: { role: "assistant", timestamp: 9_500, content: [{ type: "text", text: "f".repeat(65_536) }] } });
+		writeFileSync(
+			sessionFile,
+			[
+				entry({ type: "session", version: 3, id: "s1" }),
+				toolResult([scoutResult([[5_000, "close pin thought"], [5_024, "close pin second block"]])]),
+				...Array.from({ length: 600 }, () => fillerLine),
+			].join("\n"),
+		);
+
+		const registry = createDispatchRegistry();
+		const task = registry.startTask({ mode: "single", prompt: "Task: EXT-14-1 close pin probe", now: 1_000 });
+		registry.startRound(task.id, [{ agent: "scout" }], 1_000);
+		registry.updateAgent(task.id, 1, 0, { status: "done", finishedAt: 9_000, thinkingLog: [{ at: 1_050, text: "live buffer thought" }] });
+
+		let resolveDone;
+		const done = new Promise((resolve) => (resolveDone = resolve));
+		// The close mirrors the host's showExtensionCustom close callback
+		// (resolve(result); component?.dispose?.()): the view resolves done
+		// and the callback then synchronously disposes it, the link the
+		// suite cannot instantiate but this pin composes the real mid-flight
+		// read into.
+		const view = new NavigatorView(
+			stubTui(),
+			themeStub,
+			keybindings,
+			{ registry, detachedJobs: [], navigatorKey: "alt+n", sessionFile: () => sessionFile },
+			(result) => {
+				resolveDone(result);
+				view.dispose();
+			},
+		);
+		view.handleInput(DOWN);
+		view.handleInput(RIGHT);
+		view.handleInput(DOWN);
+		assert.equal(view.selectedId, "t:task-1:r1:a0");
+		view.handleInput("t");
+		assert.ok(view.render(120).join("\n").includes("reading transcript…"), "the press renders the loading note through the default reader");
+		await waitForOpenDescriptor(dir);
+		view.handleInput(ALT_N);
+		assert.equal(await closeOrTimeout(done), undefined, "the open key closes the view mid-read with the escape-equivalent resolution (done(undefined))");
+		await waitForClosedDescriptor(dir);
+		await settle();
+		for (let attempt = 0; attempt < 25; attempt++) {
+			await new Promise((resolve) => setTimeout(resolve, 2));
+			const lateFrame = view.render(120).join("\n");
+			assert.ok(!lateFrame.includes("close pin thought"), "the read aborted by the close never lands late");
+		}
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
