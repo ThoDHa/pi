@@ -62,7 +62,7 @@
  */
 
 import type { KeybindingsManager, Theme, TUI } from "@earendil-works/pi-coding-agent";
-import { createReadStream } from "node:fs";
+import { createReadStream, fstatSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { CURSOR_MARKER, type Focusable, type KeyId, type Keybinding, type TuiMouseEvent, type TuiMouseEventResult, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { HStack, Text, VStack } from "@earendil-works/pi-tui";
@@ -197,7 +197,12 @@ function formatClock(at: number): string {
  * a read stream yields the file line by line (and a torn trailing line
  * still yields, failing the scanner's parse guard exactly as the
  * whole-string split did), so no press ever allocates the file as one
- * string or blocks the UI thread for the whole read. The abort signal
+ * string or blocks the UI thread for the whole read. The feed is
+ * capped at the file's byte length observed when the stream opens: a
+ * line whose content reaches past that length is never fed and the
+ * reader closes early at the cap, so the lookup resolves exactly the
+ * snapshot a synchronous read at open would have seen and records
+ * appended while the read is in flight never compete. The abort signal
  * closes the stream mid-read; an aborted read resolves (the view drops
  * its result by the abort handle) and a failed open or read rejects,
  * which the view lands on its unavailable note.
@@ -212,6 +217,11 @@ function streamTranscriptLines(file: string, onLine: (line: string) => void, sig
 		const reader = createInterface({ input, crlfDelay: Infinity });
 		let settled = false;
 		let failure: unknown;
+		let limit = Number.POSITIVE_INFINITY;
+		let consumed = 0;
+		input.on("open", () => {
+			limit = fstatSync(input.fd).size;
+		});
 		const close = () => {
 			reader.close();
 			input.destroy();
@@ -227,7 +237,16 @@ function streamTranscriptLines(file: string, onLine: (line: string) => void, sig
 			close();
 		}
 		signal.addEventListener("abort", onAbort, { once: true });
-		reader.on("line", onLine);
+		reader.on("line", (line) => {
+			const bytes = Buffer.byteLength(line, "utf8");
+			if (consumed + bytes > limit) {
+				close();
+				return;
+			}
+			consumed += bytes + 1;
+			onLine(line);
+			if (consumed >= limit) close();
+		});
 		// reader.close() inside an error handler emits close synchronously,
 		// so the close handler settles with the recorded failure; the
 		// error handlers' own settle calls are then idempotent backstops.

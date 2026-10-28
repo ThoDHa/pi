@@ -553,12 +553,17 @@ function transcriptSlotSpan(messages: ActivityMessage[]): { first: number; last:
  * timestamps, and a slot competes when that span lies inside the
  * inclusive range [startedAt - TRANSCRIPT_WINDOW_TOLERANCE_MS,
  * finishedAt + TRANSCRIPT_WINDOW_TOLERANCE_MS] on both endpoints; the
- * last record in file order holding a competing slot wins, and within
- * it the competing slot with the highest span end (last in file order
- * on ties), so same-name slots inside one parallel record and earlier
- * steps of a chain round resolve their own runs even though their
- * shared record timestamp is stamped at dispatch completion. When no
- * slot competes, or no window is passed, every matching record
+ * last record in file order holding a competing slot wins, and
+ * within it the competing slot whose span end lies closest to the
+ * run's finishedAt (last in file order on ties), so same-name slots
+ * inside one parallel record and earlier steps of a chain round
+ * resolve their own runs even though their shared record timestamp is
+ * stamped at dispatch completion, and a same-name sibling finishing
+ * inside the tolerance resolves the row's own run as well: in the
+ * measured corpus, a run's own span end lands milliseconds from its
+ * registry finishedAt while a sibling ending inside the widened window
+ * ends seconds away, so the nearest end is the row's own. When no slot
+ * competes, or no window is passed, every matching record
  * competes under the session-latest rule and the winning record's
  * last matching slot in file order is used, so a window miss resolves
  * exactly as the two-argument lookup does. File order stays the
@@ -622,7 +627,7 @@ export function createTranscriptThinkingScanner(agentName: string, window?: Tran
 				const messages = candidate.messages as ActivityMessage[];
 				const span = transcriptSlotSpan(messages);
 				if (span === undefined || span.first < windowStart || span.last > windowEnd) continue;
-				if (recordBest === undefined || span.last > recordBest.spanEnd) {
+				if (recordBest === undefined || Math.abs(span.last - window.finishedAt) < Math.abs(recordBest.spanEnd - window.finishedAt)) {
 					recordBest = {
 						entries: extractThinkingEntries(messages, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY),
 						spanEnd: span.last,

@@ -1495,15 +1495,16 @@ function deferredTranscriptReader() {
 		// under the latest-end rule and under the closest-end rule alike;
 		// only a feed capped at the open-time length excludes it.
 		// Filler lines without the subagent substring keep the scan cheap
-		// while sizing the read (~65 MB, ~175 ms here) past the observation
-		// budgets, mirroring the abort pin's idiom.
+		// while sizing the read (~39 MB, ~170-290 ms here) past the ~50 ms
+		// append point and inside waitForFrame's 200-attempt budget,
+		// mirroring the abort pin's idiom at this machine's measured pace.
 		const fillerLine = entry({ type: "message", message: { role: "assistant", timestamp: 9_500, content: [{ type: "text", text: "f".repeat(65_536) }] } });
 		writeFileSync(
 			sessionFile,
 			[
 				entry({ type: "session", version: 3, id: "s1" }),
 				toolResult([scoutResult([[5_000, "own pressed thought"], [5_024, "own pressed second block"]])]),
-				...Array.from({ length: 1_000 }, () => fillerLine),
+				...Array.from({ length: 600 }, () => fillerLine),
 			].join("\n"),
 		);
 
@@ -1519,8 +1520,15 @@ function deferredTranscriptReader() {
 			view.handleInput("t");
 			assert.ok(view.render(120).join("\n").includes("reading transcript…"), "the press renders the loading note through the default reader");
 			await waitForOpenDescriptor(dir);
+			// The open event's dispatch can lag the kernel-visible fd by a poll
+			// tick, so an immediate append can precede the cap's capture and be
+			// included in the open-time size. Settle a bounded 50 ms (a few
+			// ticks, still a sixth of the ~175 ms read) before appending so the
+			// append lands mid-read past an already-captured cap.
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			assert.ok(view.render(120).join("\n").includes("reading transcript…"), "the read is still in flight at the append point");
 			appendFileSync(sessionFile, `\n${toolResult([scoutResult([[5_030, "appended mid-read thought"]])])}`);
-			await waitForFrame(view, (frame) => frame.includes("full thinking"));
+			await waitForFrame(view, (frame) => !frame.includes("reading transcript…"));
 			const landed = view.render(120).join("\n");
 			assert.ok(landed.includes("full thinking"), "the capped read lands on the reading view");
 			assert.ok(landed.includes("own pressed thought"), "the capped read lands the press-time record's own slot");
