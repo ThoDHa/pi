@@ -241,10 +241,11 @@ async function waitForOpenDescriptor(dir) {
 	assert.ok(openTranscriptDescriptors(dir) > 0, "the streamed transcript read never opened the session file");
 }
 
-// Waits until the aborted read's descriptor is closed on a budget the
-// pin's fixture cannot read to EOF within (a full read of ~65 MB takes
-// ~175 ms here), so a reader that ignores the abort fails here instead
-// of leaking the fd to EOF.
+// Waits until the aborted read's descriptor is closed on a budget no
+// riding fixture's full read can reach EOF within (the smallest real
+// transcript file, ~39 MB, reads in ~170-290 ms here, >3x this 50 ms
+// budget), so a reader that ignores the abort fails here instead of
+// leaking the fd to EOF.
 async function waitForClosedDescriptor(dir) {
 	for (let attempt = 0; attempt < 50; attempt++) {
 		if (openTranscriptDescriptors(dir) === 0) return;
@@ -252,6 +253,37 @@ async function waitForClosedDescriptor(dir) {
 	}
 	assert.ok(openTranscriptDescriptors(dir) === 0, "the aborted transcript read left the session file open");
 }
+
+const realScoutResult = (thinking) => ({
+	agent: "scout",
+	agentSource: "user",
+	task: "probe",
+	exitCode: 0,
+	messages: thinking.map(([timestamp, text]) => ({ role: "assistant", timestamp, content: [{ type: "thinking", thinking: text }] })),
+	stderr: "",
+	stopReason: "end",
+	usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+});
+const realToolResult = (results) =>
+	JSON.stringify({
+		type: "message",
+		message: { role: "toolResult", toolName: "subagent", toolCallId: "call_1", content: [], details: { mode: "single", results } },
+	});
+// Sizes a real transcript file past every timing budget riding its
+// read: each filler line is 64 KB of text without the subagent
+// substring, so the scan stays cheap while the read takes real time
+// (600 fillers ≈ ~39 MB, ~170-290 ms here; 1_000 ≈ ~65 MB, ~175 ms).
+// If a margin thins on a faster or loaded machine, raise fillerCount,
+// keeping each fixture's full read past the budget it must outlast.
+const realFillerLine = JSON.stringify({ type: "message", message: { role: "assistant", timestamp: 9_500, content: [{ type: "text", text: "f".repeat(65_536) }] } });
+const writeRealTranscriptFile = (dir, ownThinking, fillerCount) => {
+	const sessionFile = join(dir, "session.jsonl");
+	writeFileSync(
+		sessionFile,
+		[JSON.stringify({ type: "session", version: 3, id: "s1" }), realToolResult([realScoutResult(ownThinking)]), ...Array.from({ length: fillerCount }, () => realFillerLine)].join("\n"),
+	);
+	return sessionFile;
+};
 
 // --- hosting: the entry's open key drives ctx.ui.custom as a top-anchored full-width overlay ---
 
@@ -1512,34 +1544,12 @@ function deferredTranscriptReader() {
 {
 	const dir = mkdtempSync(join(tmpdir(), "pi-navigator-thinking-abort-"));
 	try {
-		const sessionFile = join(dir, "session.jsonl");
-		const entry = (object) => JSON.stringify(object);
-		const scoutResult = (thoughts) => ({
-			agent: "scout",
-			agentSource: "user",
-			task: "probe",
-			exitCode: 0,
-			messages: thoughts.map((text, index) => ({ role: "assistant", timestamp: 5_000 + index, content: [{ type: "thinking", thinking: text }] })),
-			stderr: "",
-			stopReason: "end",
-			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
-		});
-		const toolResult = (results) =>
-			entry({
-				type: "message",
-				message: { role: "toolResult", toolName: "subagent", toolCallId: "call_1", content: [], details: { mode: "single", results } },
-			});
-		// Filler lines without the subagent substring keep the scan cheap
-		// while sizing the file (~65 MB, ~175 ms to read here) well past
-		// waitForClosedDescriptor's 50 ms budget: the streamed read must
+		// The 1_000-filler file (~65 MB, ~175 ms here) keeps the read well
+		// past waitForClosedDescriptor's 50 ms budget: the streamed read must
 		// still be in flight when the pin re-presses, and an un-aborted read
 		// cannot reach EOF within the budget.
-		const fillerLine = entry({ type: "message", message: { role: "assistant", timestamp: 9_500, content: [{ type: "text", text: "f".repeat(65_536) }] } });
-		const blocks = Array.from({ length: 25 }, (_, i) => `block ${i} thought`);
-		writeFileSync(
-			sessionFile,
-			[entry({ type: "session", version: 3, id: "s1" }), toolResult([scoutResult(blocks)]), ...Array.from({ length: 1_000 }, () => fillerLine)].join("\n"),
-		);
+		const blocks = Array.from({ length: 25 }, (_, i) => [5_000 + i, `block ${i} thought`]);
+		const sessionFile = writeRealTranscriptFile(dir, blocks, 1_000);
 
 		const registry = createDispatchRegistry();
 		const task = registry.startTask({ mode: "single", prompt: "Task: EXT-10-1 abort probe", now: 1_000 });
@@ -1576,42 +1586,15 @@ function deferredTranscriptReader() {
 {
 	const dir = mkdtempSync(join(tmpdir(), "pi-navigator-thinking-cap-"));
 	try {
-		const sessionFile = join(dir, "session.jsonl");
-		const entry = (object) => JSON.stringify(object);
-		const scoutResult = (messages) => ({
-			agent: "scout",
-			agentSource: "user",
-			task: "probe",
-			exitCode: 0,
-			messages: messages.map(([timestamp, text]) => ({ role: "assistant", timestamp, content: [{ type: "thinking", thinking: text }] })),
-			stderr: "",
-			stopReason: "end",
-			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
-		});
-		const toolResult = (results) =>
-			entry({
-				type: "message",
-				message: { role: "toolResult", toolName: "subagent", toolCallId: "call_1", content: [], details: { mode: "single", results } },
-			});
 		// The own record sits at the press-time head of the file: its slot's
 		// span (5_000, 5_024) sits inside the run's widened window. The
 		// appended sibling ends at 5_030, later than the own end and closer
 		// to the row's finishedAt 9_000, so under an uncapped feed it wins
 		// under the latest-end rule and under the closest-end rule alike;
-		// only a feed capped at the open-time length excludes it.
-		// Filler lines without the subagent substring keep the scan cheap
-		// while sizing the read (~39 MB, ~170-290 ms here) past the ~50 ms
-		// append point and inside waitForFrame's 200-attempt budget,
-		// mirroring the abort pin's idiom at this machine's measured pace.
-		const fillerLine = entry({ type: "message", message: { role: "assistant", timestamp: 9_500, content: [{ type: "text", text: "f".repeat(65_536) }] } });
-		writeFileSync(
-			sessionFile,
-			[
-				entry({ type: "session", version: 3, id: "s1" }),
-				toolResult([scoutResult([[5_000, "own pressed thought"], [5_024, "own pressed second block"]])]),
-				...Array.from({ length: 600 }, () => fillerLine),
-			].join("\n"),
-		);
+		// only a feed capped at the open-time length excludes it. The
+		// 600-filler read (~39 MB, ~170-290 ms here) stays past the ~50 ms
+		// append point and inside waitForFrame's 200-attempt budget.
+		const sessionFile = writeRealTranscriptFile(dir, [[5_000, "own pressed thought"], [5_024, "own pressed second block"]], 600);
 
 		const registry = createDispatchRegistry();
 		const task = registry.startTask({ mode: "single", prompt: "Task: EXT-12-1 cap probe", now: 1_000 });
@@ -1632,7 +1615,7 @@ function deferredTranscriptReader() {
 			// append lands mid-read past an already-captured cap.
 			await new Promise((resolve) => setTimeout(resolve, 50));
 			assert.ok(view.render(120).join("\n").includes("reading transcript…"), "the read is still in flight at the append point");
-			appendFileSync(sessionFile, `\n${toolResult([scoutResult([[5_030, "appended mid-read thought"]])])}`);
+			appendFileSync(sessionFile, `\n${realToolResult([realScoutResult([[5_030, "appended mid-read thought"]])])}`);
 			await waitForFrame(view, (frame) => !frame.includes("reading transcript…"));
 			const landed = view.render(120).join("\n");
 			assert.ok(landed.includes("full thinking"), "the capped read lands on the reading view");
@@ -1650,41 +1633,13 @@ function deferredTranscriptReader() {
 {
 	const dir = mkdtempSync(join(tmpdir(), "pi-navigator-thinking-close-"));
 	try {
-		const sessionFile = join(dir, "session.jsonl");
-		const entry = (object) => JSON.stringify(object);
-		const scoutResult = (thoughts) => ({
-			agent: "scout",
-			agentSource: "user",
-			task: "probe",
-			exitCode: 0,
-			messages: thoughts.map(([timestamp, text]) => ({ role: "assistant", timestamp, content: [{ type: "thinking", thinking: text }] })),
-			stderr: "",
-			stopReason: "end",
-			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
-		});
-		const toolResult = (results) =>
-			entry({
-				type: "message",
-				message: { role: "toolResult", toolName: "subagent", toolCallId: "call_1", content: [], details: { mode: "single", results } },
-			});
 		// The own record sits at the file head, before the filler, so its
 		// thinking is fed to the scanner before the close aborts the read,
-		// making a guard-broken landing observable in the late frames.
-		// Filler lines without the subagent substring keep the scan cheap
-		// while sizing the read (~39 MB, ~170-290 ms here) past
+		// making a guard-broken landing observable in the late frames. The
+		// 600-filler read (~39 MB, ~170-290 ms here) stays past
 		// waitForClosedDescriptor's 50 ms budget (>3x margin): a close whose
-		// dispose fails to abort the read cannot reach EOF within it. If the
-		// margin thins on a faster or loaded machine, resize the filler,
-		// keeping the full read past the fd budget.
-		const fillerLine = entry({ type: "message", message: { role: "assistant", timestamp: 9_500, content: [{ type: "text", text: "f".repeat(65_536) }] } });
-		writeFileSync(
-			sessionFile,
-			[
-				entry({ type: "session", version: 3, id: "s1" }),
-				toolResult([scoutResult([[5_000, "close pin thought"], [5_024, "close pin second block"]])]),
-				...Array.from({ length: 600 }, () => fillerLine),
-			].join("\n"),
-		);
+		// dispose fails to abort the read cannot reach EOF within it.
+		const sessionFile = writeRealTranscriptFile(dir, [[5_000, "close pin thought"], [5_024, "close pin second block"]], 600);
 
 		const registry = createDispatchRegistry();
 		const task = registry.startTask({ mode: "single", prompt: "Task: EXT-14-1 close pin probe", now: 1_000 });
