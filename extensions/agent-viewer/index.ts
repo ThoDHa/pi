@@ -155,7 +155,7 @@ export default function (pi: ExtensionAPI) {
 			},
 		});
 		pi.registerShortcut(viewerKeys.navigatorKey, {
-			description: "Open the subagent navigator view",
+			description: "Toggle the subagent navigator view",
 			handler: async (ctx) => {
 				if (navigatorOpen) return;
 				navigatorOpen = true;
@@ -171,6 +171,7 @@ export default function (pi: ExtensionAPI) {
 							new NavigatorView(tui, theme, keybindings, {
 								registry: shared.registry,
 								detachedJobs: shared.detachedJobs,
+								navigatorKey: viewerKeys.navigatorKey,
 								sessionFile: () => ctx.sessionManager.getSessionFile(),
 							}, done),
 						{

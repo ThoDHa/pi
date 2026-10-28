@@ -268,7 +268,7 @@ async function waitForClosedDescriptor(dir) {
 	const { default: extensionMain } = await import("../extensions/agent-viewer/index.ts");
 	await extensionMain(piStub);
 	await sessionStart();
-	assert.equal(shortcuts["alt+n"].description, "Open the subagent navigator view");
+	assert.equal(shortcuts["alt+n"].description, "Toggle the subagent navigator view");
 
 	// Seed the shared registry and a session transcript before the open
 	// handler runs: the view snapshots the shared state at construction,
@@ -561,7 +561,7 @@ async function waitForClosedDescriptor(dir) {
 	registry.startRound(task.id, [{ agent: "reader" }], 1_000);
 	registry.updateAgent(task.id, 1, 0, { activity: namedLog(4) });
 	const bareKeybindings = new KeybindingsManager({});
-	const view = new NavigatorView(stubTui(), themeStub, bareKeybindings, { registry, detachedJobs: [] }, () => {});
+	const view = new NavigatorView(stubTui(), themeStub, bareKeybindings, { registry, detachedJobs: [], navigatorKey: "alt+n" }, () => {});
 	try {
 		view.handleInput(DOWN);
 		view.handleInput(DOWN);
@@ -1372,7 +1372,7 @@ function deferredTranscriptReader() {
 	registry.updateAgent(task.id, 1, 0, { status: "done", finishedAt: 9_000, thinkingLog: [{ at: 1_050, text: "live buffer thought" }] });
 	// The injected reader never opens this path; no temp file or cleanup needed.
 	const sessionFile = join(tmpdir(), "pi-navigator-stream", "session.jsonl");
-	const streamSources = (reader) => ({ registry, detachedJobs: [], sessionFile: () => sessionFile, readTranscriptLines: reader });
+	const streamSources = (reader) => ({ registry, detachedJobs: [], navigatorKey: "alt+n", sessionFile: () => sessionFile, readTranscriptLines: reader });
 	const selectScout = (view) => {
 		view.handleInput(DOWN);
 		view.handleInput(RIGHT);

@@ -50,8 +50,8 @@
  * is fully covered and must not scroll invisibly. Clicks and every
  * non-wheel event pass through unclaimed, and regular mode never
  * parses mouse at all, so the scroll keys remain the only scroll path
- * there. Escape resolves done(undefined), which closes
- * the overlay and restores the editor.
+ * there. Escape and a second press of the open key resolve
+ * done(undefined), which closes the overlay and restores the editor.
  *
  * The tool-noise toggle hides the file-reading tool calls (read,
  * grep, find, ls) so the default detail pane leads with thinking and
@@ -110,6 +110,14 @@ export const NAVIGATOR_POLL_INTERVAL_MS = 300;
 export interface NavigatorSources {
 	registry: DispatchRegistry;
 	detachedJobs: DetachedJobSnapshot[];
+	/**
+	 * The configured open key the view closes on: a press of it beside
+	 * escape resolves done(undefined), the same close escape produces,
+	 * so the key that opens the overlay toggles it. Wired from the
+	 * entry's resolved viewer keys so a remapped key closes what it
+	 * opened.
+	 */
+	navigatorKey: KeyId;
 	/**
 	 * Resolves the current session's .jsonl path for the t keybinding's
 	 * transcript read; absent or undefined-yielding means no transcript
@@ -465,7 +473,7 @@ export class NavigatorView implements Focusable {
 	}
 
 	handleInput(data: string): void {
-		if (matchesKey(data, "escape")) {
+		if (matchesKey(data, "escape") || matchesKey(data, this.sources.navigatorKey)) {
 			this.done(undefined);
 			return;
 		}
