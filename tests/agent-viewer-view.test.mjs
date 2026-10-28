@@ -63,7 +63,11 @@
  * unclaimed, and the selection never moving; tree toggling is
  * unchanged; short content
  * keeps the scroll keys as no-ops; escape resolves the done callback;
- * and the hints line truncates instead of overflowing a narrow width.
+ * a press of the open key closes the view with the same resolution
+ * from the default and transcript-loading states; a remapped
+ * navigatorKey registers, opens, and closes under the configured key
+ * while the default key does not close the remapped view; and the
+ * hints line truncates instead of overflowing a narrow width.
  */
 
 import assert from "node:assert/strict";
@@ -92,6 +96,8 @@ const DOWN = "\x1b[B";
 const LEFT = "\x1b[D";
 const RIGHT = "\x1b[C";
 const ESC = "\x1b";
+const ALT_N = "\x1bn";
+const ALT_V = "\x1bv";
 const CTRL_T = "\x14";
 const CTRL_O = "\x0f";
 
@@ -177,13 +183,21 @@ function scrollFixture() {
 async function withView(sources, run, tui = stubTui(), theme = themeStub) {
 	let resolveDone;
 	const done = new Promise((resolve) => (resolveDone = resolve));
-	const view = new NavigatorView(tui, theme, keybindings, sources, resolveDone);
+	const view = new NavigatorView(tui, theme, keybindings, { navigatorKey: "alt+n", ...sources }, resolveDone);
 	try {
 		await run(view, done);
 	} finally {
 		view.dispose();
 	}
 }
+
+// Settles to done's value when the view closes within the window and
+// to a unique sentinel when it does not, so a red or regressed close
+// pin fails as a clean assertion instead of hanging the suite on an
+// unsettled done.
+const CLOSE_NOT_REACHED = Symbol("close-not-reached");
+const closeOrTimeout = (done) =>
+	Promise.race([done, new Promise((resolve) => setTimeout(() => resolve(CLOSE_NOT_REACHED), 25))]);
 
 // Yields one event-loop turn: after an injected reader resolves or
 // rejects, the view's landing callback has run once this resolves.
@@ -346,6 +360,55 @@ async function waitForClosedDescriptor(dir) {
 	resolveCustom(undefined);
 	await opening;
 	rmSync(wireDir, { recursive: true, force: true });
+}
+
+// --- a remapped navigatorKey registers, opens, and closes under the configured key ---
+
+{
+	const shortcuts = {};
+	let sessionStart = null;
+	const piStub = {
+		getSettings: () => ({ subagentViewer: { navigatorKey: "alt+v" } }),
+		registerShortcut: (key, binding) => {
+			shortcuts[key] = binding;
+		},
+		on: (event, handler) => {
+			if (event === "session_start") sessionStart = handler;
+		},
+	};
+	const { default: extensionMain } = await import("../extensions/agent-viewer/index.ts");
+	await extensionMain(piStub);
+	await sessionStart();
+	assert.ok(shortcuts["alt+v"], "the remapped navigator key registers as the open shortcut");
+	assert.equal(shortcuts["alt+n"], undefined, "the default alt+n does not register once the key is remapped");
+
+	let capturedFactory = null;
+	let resolveCustom;
+	const ctx = {
+		sessionManager: { getSessionFile: () => undefined },
+		ui: {
+			custom: (factory) => {
+				capturedFactory = factory;
+				return new Promise((resolve) => {
+					resolveCustom = resolve;
+				});
+			},
+			setWidget() {},
+		},
+	};
+	const opening = shortcuts["alt+v"].handler(ctx);
+	assert.ok(capturedFactory, "the remapped key's handler hosts the view through ctx.ui.custom");
+
+	let resolveDone;
+	const done = new Promise((resolve) => (resolveDone = resolve));
+	const view = capturedFactory(stubTui(), themeStub, keybindings, resolveDone);
+	view.handleInput(ALT_N);
+	assert.equal(await closeOrTimeout(done), CLOSE_NOT_REACHED, "the default alt+n does not close a view the remapped alt+v opened");
+	view.handleInput(ALT_V);
+	assert.equal(await closeOrTimeout(done), undefined, "the configured alt+v closes the view with the escape-equivalent resolution (done(undefined))");
+	view.dispose();
+	resolveCustom(undefined);
+	await opening;
 }
 
 // --- frame budget, full width, tail anchor, indicator, re-anchor on selection change ---
@@ -641,6 +704,46 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 	view.handleInput(ESC);
 	assert.equal(await done, undefined, "escape resolves the done callback with undefined");
 });
+
+// --- a press of the open key closes the view like escape (the toggle) ---
+
+// While the overlay shows it holds keyboard focus, so the open key
+// reaches the view's own input loop, matched by nothing before the
+// toggle: the view itself closes on its configured key with the same
+// resolution escape produces.
+await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (view, done) => {
+	view.handleInput(ALT_N);
+	assert.equal(await closeOrTimeout(done), undefined, "a press of the open key closes the view with the escape-equivalent resolution (done(undefined))");
+});
+
+// The close is state-blind like escape: it fires while a transcript
+// read is in flight (the close's dispose path aborts the read), held
+// here by a never-settling injected reader so the loading state is
+// deterministic and no file is ever opened.
+{
+	const registry = createDispatchRegistry();
+	const task = registry.startTask({ mode: "single", prompt: "Task: EXT-13-1 toggle probe", now: 1_000 });
+	registry.startRound(task.id, [{ agent: "scout" }], 1_000);
+	registry.updateAgent(task.id, 1, 0, { status: "done", finishedAt: 9_000 });
+	await withView(
+		{
+			registry,
+			detachedJobs: [],
+			sessionFile: () => join(tmpdir(), "pi-navigator-toggle", "session.jsonl"),
+			readTranscriptLines: () => new Promise(() => {}),
+		},
+		async (view, done) => {
+			view.handleInput(DOWN);
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
+			assert.equal(view.selectedId, "t:task-1:r1:a0");
+			view.handleInput("t");
+			assert.ok(view.render(120).join("\n").includes("reading transcript…"), "the fixture holds the transcript-loading state with the read in flight");
+			view.handleInput(ALT_N);
+			assert.equal(await closeOrTimeout(done), undefined, "the open key closes the view from the transcript-loading state with the escape-equivalent resolution (done(undefined))");
+		},
+	);
+}
 
 // --- the tree pane keeps its "+N more" clip while the detail pane windows ---
 
