@@ -208,7 +208,7 @@ const settle = () => new Promise((resolve) => setImmediate(resolve));
 // Waits for the default streamed reader to land on a bounded budget:
 // real temp .jsonl files complete within a few event-loop turns.
 async function waitForFrame(view, probe) {
-	for (let attempt = 0; attempt < 200; attempt++) {
+	for (let attempt = 0; attempt < 1_200; attempt++) {
 		if (probe(view.render(120).join("\n"))) return;
 		await new Promise((resolve) => setTimeout(resolve, 1));
 	}
@@ -232,7 +232,8 @@ function openTranscriptDescriptors(dir) {
 }
 
 // Waits until the streamed read's descriptor is open, proving the read
-// is genuinely in flight, on the same bounded budget as waitForFrame.
+// is genuinely in flight, on a bounded budget the open clears within a
+// few poll ticks, far inside waitForFrame's read-landing budget.
 async function waitForOpenDescriptor(dir) {
 	for (let attempt = 0; attempt < 200; attempt++) {
 		if (openTranscriptDescriptors(dir) > 0) return;
@@ -243,7 +244,7 @@ async function waitForOpenDescriptor(dir) {
 
 // Waits until the aborted read's descriptor is closed on a budget no
 // riding fixture's full read can reach EOF within (the smallest real
-// transcript file, ~39 MB, reads in ~170-290 ms here, >3x this 50 ms
+// transcript file, ~39 MB, reads in ~170-430 ms here, >3x this 50 ms
 // budget), so a reader that ignores the abort fails here instead of
 // leaking the fd to EOF.
 async function waitForClosedDescriptor(dir) {
@@ -272,7 +273,7 @@ const realToolResult = (results) =>
 // Sizes a real transcript file past every timing budget riding its
 // read: each filler line is 64 KB of text without the subagent
 // substring, so the scan stays cheap while the read takes real time
-// (600 fillers ≈ ~39 MB, ~170-290 ms here; 1_000 ≈ ~65 MB, ~175 ms).
+// (600 fillers ≈ ~39 MB, ~170-430 ms here; 1_000 ≈ ~65 MB, ~460-600 ms).
 // If a margin thins on a faster or loaded machine, raise fillerCount,
 // keeping each fixture's full read past the budget it must outlast.
 const realFillerLine = JSON.stringify({ type: "message", message: { role: "assistant", timestamp: 9_500, content: [{ type: "text", text: "f".repeat(65_536) }] } });
@@ -1544,7 +1545,7 @@ function deferredTranscriptReader() {
 {
 	const dir = mkdtempSync(join(tmpdir(), "pi-navigator-thinking-abort-"));
 	try {
-		// The 1_000-filler file (~65 MB, ~175 ms here) keeps the read well
+		// The 1_000-filler file (~65 MB, ~460-600 ms here) keeps the read well
 		// past waitForClosedDescriptor's 50 ms budget: the streamed read must
 		// still be in flight when the pin re-presses, and an un-aborted read
 		// cannot reach EOF within the budget.
@@ -1592,8 +1593,8 @@ function deferredTranscriptReader() {
 		// to the row's finishedAt 9_000, so under an uncapped feed it wins
 		// under the latest-end rule and under the closest-end rule alike;
 		// only a feed capped at the open-time length excludes it. The
-		// 600-filler read (~39 MB, ~170-290 ms here) stays past the ~50 ms
-		// append point and inside waitForFrame's 200-attempt budget.
+		// 600-filler read (~39 MB, ~170-430 ms here) stays past the ~50 ms
+		// append point and inside waitForFrame's 1_200-attempt budget.
 		const sessionFile = writeRealTranscriptFile(dir, [[5_000, "own pressed thought"], [5_024, "own pressed second block"]], 600);
 
 		const registry = createDispatchRegistry();
@@ -1611,7 +1612,7 @@ function deferredTranscriptReader() {
 			// The open event's dispatch can lag the kernel-visible fd by a poll
 			// tick, so an immediate append can precede the cap's capture and be
 			// included in the open-time size. Settle a bounded 50 ms (a few
-			// ticks, still a sixth of the ~175 ms read) before appending so the
+			// ticks, still under a third of the ~170-430 ms read) before appending so the
 			// append lands mid-read past an already-captured cap.
 			await new Promise((resolve) => setTimeout(resolve, 50));
 			assert.ok(view.render(120).join("\n").includes("reading transcript…"), "the read is still in flight at the append point");
@@ -1636,7 +1637,7 @@ function deferredTranscriptReader() {
 		// The own record sits at the file head, before the filler, so its
 		// thinking is fed to the scanner before the close aborts the read,
 		// making a guard-broken landing observable in the late frames. The
-		// 600-filler read (~39 MB, ~170-290 ms here) stays past
+		// 600-filler read (~39 MB, ~170-430 ms here) stays past
 		// waitForClosedDescriptor's 50 ms budget (>3x margin): a close whose
 		// dispose fails to abort the read cannot reach EOF within it.
 		const sessionFile = writeRealTranscriptFile(dir, [[5_000, "close pin thought"], [5_024, "close pin second block"]], 600);
