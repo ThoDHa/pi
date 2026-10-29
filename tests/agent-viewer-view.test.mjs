@@ -205,10 +205,19 @@ const closeOrTimeout = (done) =>
 // rejects, the view's landing callback has run once this resolves.
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
-// Waits for the default streamed reader to land on a bounded budget:
-// real temp .jsonl files complete within a few event-loop turns.
+// Attempt budgets for the real-transcript wait helpers below; comments
+// cite these identifiers rather than restating the numerals, so a
+// recalibration cannot leave a stale citation behind.
+const WAIT_FRAME_ATTEMPTS = 1_200;
+const WAIT_OPEN_DESCRIPTOR_ATTEMPTS = 200;
+const WAIT_CLOSED_DESCRIPTOR_ATTEMPTS = 50;
+
+// Waits for the default streamed reader to land within
+// WAIT_FRAME_ATTEMPTS polls, a budget sized to outlast the sized
+// fixtures' real .jsonl reads even under sustained suite IO (their
+// measured read pace lives in the realFillerLine sizing note below).
 async function waitForFrame(view, probe) {
-	for (let attempt = 0; attempt < 1_200; attempt++) {
+	for (let attempt = 0; attempt < WAIT_FRAME_ATTEMPTS; attempt++) {
 		if (probe(view.render(120).join("\n"))) return;
 		await new Promise((resolve) => setTimeout(resolve, 1));
 	}
@@ -233,9 +242,9 @@ function openTranscriptDescriptors(dir) {
 
 // Waits until the streamed read's descriptor is open, proving the read
 // is genuinely in flight, on a bounded budget the open clears within a
-// few poll ticks, far inside waitForFrame's read-landing budget.
+// few poll ticks, far inside waitForFrame's WAIT_FRAME_ATTEMPTS budget.
 async function waitForOpenDescriptor(dir) {
-	for (let attempt = 0; attempt < 200; attempt++) {
+	for (let attempt = 0; attempt < WAIT_OPEN_DESCRIPTOR_ATTEMPTS; attempt++) {
 		if (openTranscriptDescriptors(dir) > 0) return;
 		await new Promise((resolve) => setTimeout(resolve, 1));
 	}
@@ -244,11 +253,11 @@ async function waitForOpenDescriptor(dir) {
 
 // Waits until the aborted read's descriptor is closed on a budget no
 // riding fixture's full read can reach EOF within (the smallest real
-// transcript file, ~39 MB, reads in ~170-430 ms here, >3x this 50 ms
-// budget), so a reader that ignores the abort fails here instead of
-// leaking the fd to EOF.
+// transcript file, ~39 MB, reads in ~170-430 ms here, >3x the
+// WAIT_CLOSED_DESCRIPTOR_ATTEMPTS budget), so a reader that ignores
+// the abort fails here instead of leaking the fd to EOF.
 async function waitForClosedDescriptor(dir) {
-	for (let attempt = 0; attempt < 50; attempt++) {
+	for (let attempt = 0; attempt < WAIT_CLOSED_DESCRIPTOR_ATTEMPTS; attempt++) {
 		if (openTranscriptDescriptors(dir) === 0) return;
 		await new Promise((resolve) => setTimeout(resolve, 1));
 	}
@@ -1545,10 +1554,11 @@ function deferredTranscriptReader() {
 {
 	const dir = mkdtempSync(join(tmpdir(), "pi-navigator-thinking-abort-"));
 	try {
-		// The 1_000-filler file (~65 MB, ~460-600 ms here) keeps the read well
-		// past waitForClosedDescriptor's 50 ms budget: the streamed read must
-		// still be in flight when the pin re-presses, and an un-aborted read
-		// cannot reach EOF within the budget.
+		// The 1_000-filler file (~65 MB, ~460-600 ms here) keeps the read
+		// well past waitForClosedDescriptor's WAIT_CLOSED_DESCRIPTOR_ATTEMPTS
+		// budget: the streamed read must still be in flight when the pin
+		// re-presses, and an un-aborted read cannot reach EOF within the
+		// budget.
 		const blocks = Array.from({ length: 25 }, (_, i) => [5_000 + i, `block ${i} thought`]);
 		const sessionFile = writeRealTranscriptFile(dir, blocks, 1_000);
 
@@ -1594,7 +1604,7 @@ function deferredTranscriptReader() {
 		// under the latest-end rule and under the closest-end rule alike;
 		// only a feed capped at the open-time length excludes it. The
 		// 600-filler read (~39 MB, ~170-430 ms here) stays past the ~50 ms
-		// append point and inside waitForFrame's 1_200-attempt budget.
+		// append point and inside waitForFrame's WAIT_FRAME_ATTEMPTS budget.
 		const sessionFile = writeRealTranscriptFile(dir, [[5_000, "own pressed thought"], [5_024, "own pressed second block"]], 600);
 
 		const registry = createDispatchRegistry();
@@ -1638,8 +1648,9 @@ function deferredTranscriptReader() {
 		// thinking is fed to the scanner before the close aborts the read,
 		// making a guard-broken landing observable in the late frames. The
 		// 600-filler read (~39 MB, ~170-430 ms here) stays past
-		// waitForClosedDescriptor's 50 ms budget (>3x margin): a close whose
-		// dispose fails to abort the read cannot reach EOF within it.
+		// waitForClosedDescriptor's WAIT_CLOSED_DESCRIPTOR_ATTEMPTS budget
+		// (>3x margin): a close whose dispose fails to abort the read cannot
+		// reach EOF within it.
 		const sessionFile = writeRealTranscriptFile(dir, [[5_000, "close pin thought"], [5_024, "close pin second block"]], 600);
 
 		const registry = createDispatchRegistry();
