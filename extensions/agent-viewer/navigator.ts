@@ -194,22 +194,24 @@ export function buildNavigatorTasks(registry: DispatchRegistry, jobs: Iterable<D
 	return [...views.filter((view) => view.live), ...views.filter((view) => !view.live)];
 }
 
-/** Expansion state the view owns across polls: collapsed tasks and the user's sticky round expand/collapse overrides. */
+/** Expansion state the view owns across polls: collapsed tasks, the user's sticky round expand/collapse overrides, and the Completed umbrella's sticky expand state. */
 export interface NavigatorExpansionState {
 	collapsedTasks: Set<string>;
 	/** Round id -> expanded; a round without an override auto-expands while live and stays collapsed once completed. */
 	roundOverrides: Map<string, boolean>;
+	/** The Completed umbrella defaults collapsed; left/right on its row flips this. */
+	completedExpanded: boolean;
 }
 
 export function createExpansionState(): NavigatorExpansionState {
-	return { collapsedTasks: new Set(), roundOverrides: new Map() };
+	return { collapsedTasks: new Set(), roundOverrides: new Map(), completedExpanded: false };
 }
 
 export interface NavigatorRow {
-	kind: "task" | "round" | "agent";
+	kind: "task" | "round" | "agent" | "umbrella";
 	id: string;
-	depth: 0 | 1 | 2;
-	/** Index of the owning task view, for Tab navigation order. */
+	depth: 0 | 1 | 2 | 3;
+	/** Index of the owning task view; informational only (pinned by the tree suite, no production consumer sorts by it), and under an expanded umbrella the umbrella row ties with the first settled view's build index. */
 	taskOrder: number;
 	taskId: string;
 	live: boolean;
@@ -221,6 +223,17 @@ export interface NavigatorRow {
 	agentRef?: NavigatorAgentRef;
 }
 
+/** The umbrella's aggregated glyph over the settled views: done when every settled view is done, failed when every one is failed, mixed otherwise. */
+function settledUmbrellaGlyph(views: NavigatorTaskView[]): StatusGlyphName {
+	if (views.every((view) => view.glyph === "done")) return "done";
+	if (views.every((view) => view.glyph === "failed")) return "failed";
+	return "mixed";
+}
+
+function dispatchCountText(count: number): string {
+	return count === 1 ? "1 dispatch" : `${count} dispatches`;
+}
+
 /**
  * Flatten task views into the visible rows the view renders.
  * Tasks render as header rows and hide their whole subtree when
@@ -228,16 +241,20 @@ export interface NavigatorRow {
  * expanded only while live or when the user overrode it, so completed
  * rounds collapse to their summary line and the live round
  * auto-expands; agent rows render under an expanded round. Detached
- * agents render directly under their task row.
+ * agents render directly under their task row. Settled tasks fold under
+ * one umbrella row (label Completed, glyph aggregated over them) that
+ * defaults collapsed and toggles through the same path; beneath an
+ * expanded umbrella their subtrees render one depth deeper, ids and
+ * refs unchanged.
  */
 export function flattenNavigatorTree(tasks: NavigatorTaskView[], state: NavigatorExpansionState): NavigatorRow[] {
 	const rows: NavigatorRow[] = [];
-	tasks.forEach((task, taskOrder) => {
+	const emitTaskSubtree = (task: NavigatorTaskView, taskOrder: number, base: 0 | 1) => {
 		const taskRowId = `t:${task.id}`;
 		rows.push({
 			kind: "task",
 			id: taskRowId,
-			depth: 0,
+			depth: base,
 			taskOrder,
 			taskId: task.id,
 			live: task.live,
@@ -248,12 +265,14 @@ export function flattenNavigatorTree(tasks: NavigatorTaskView[], state: Navigato
 		if (state.collapsedTasks.has(task.id)) return;
 
 		if (task.source === "registry") {
+			const roundDepth: 1 | 2 = base === 0 ? 1 : 2;
+			const agentDepth: 2 | 3 = base === 0 ? 2 : 3;
 			for (const round of task.rounds) {
 				const roundRowId = `${taskRowId}:r${round.index}`;
 				rows.push({
 					kind: "round",
 					id: roundRowId,
-					depth: 1,
+					depth: roundDepth,
 					taskOrder,
 					taskId: task.id,
 					live: round.live,
@@ -268,7 +287,7 @@ export function flattenNavigatorTree(tasks: NavigatorTaskView[], state: Navigato
 					rows.push({
 						kind: "agent",
 						id: `${roundRowId}:a${slot}`,
-						depth: 2,
+						depth: agentDepth,
 						taskOrder,
 						taskId: task.id,
 						live: agent.status === "running",
@@ -282,11 +301,12 @@ export function flattenNavigatorTree(tasks: NavigatorTaskView[], state: Navigato
 				});
 			}
 		} else {
+			const agentDepth: 1 | 2 = base === 0 ? 1 : 2;
 			task.agents.forEach((agent, slot) => {
 				rows.push({
 					kind: "agent",
 					id: `${taskRowId}:a${slot}`,
-					depth: 1,
+					depth: agentDepth,
 					taskOrder,
 					taskId: task.id,
 					live: agent.status === "running",
@@ -298,7 +318,30 @@ export function flattenNavigatorTree(tasks: NavigatorTaskView[], state: Navigato
 				});
 			});
 		}
+	};
+
+	const settled = tasks.filter((task) => !task.live);
+	tasks.forEach((task, taskOrder) => {
+		if (task.live) emitTaskSubtree(task, taskOrder, 0);
 	});
+	if (settled.length > 0) {
+		rows.push({
+			kind: "umbrella",
+			id: "u:completed",
+			depth: 0,
+			taskOrder: tasks.length - settled.length,
+			taskId: "completed",
+			live: false,
+			glyph: settledUmbrellaGlyph(settled),
+			label: "Completed",
+			detail: dispatchCountText(settled.length),
+		});
+		if (state.completedExpanded) {
+			tasks.forEach((task, taskOrder) => {
+				if (!task.live) emitTaskSubtree(task, taskOrder, 1);
+			});
+		}
+	}
 	return rows;
 }
 
@@ -307,8 +350,8 @@ export function flattenNavigatorTree(tasks: NavigatorTaskView[], state: Navigato
  * adds its raw id to collapsedTasks and expanding deletes it (the
  * flatten contract keys that set on raw task ids); a round toggle
  * stores the override under the row's namespaced id, overriding the
- * live-expanded/completed-collapsed default; agent rows are leaves
- * and a no-op.
+ * live-expanded/completed-collapsed default; the umbrella toggle
+ * writes completedExpanded; agent rows are leaves and a no-op.
  */
 export function toggleNavigatorRow(state: NavigatorExpansionState, row: NavigatorRow, expand: boolean): void {
 	if (row.kind === "task") {
@@ -316,6 +359,8 @@ export function toggleNavigatorRow(state: NavigatorExpansionState, row: Navigato
 		else state.collapsedTasks.add(row.taskId);
 	} else if (row.kind === "round") {
 		state.roundOverrides.set(row.id, expand);
+	} else if (row.kind === "umbrella") {
+		state.completedExpanded = expand;
 	}
 }
 
@@ -327,11 +372,11 @@ export function moveCursor(rows: NavigatorRow[], currentIndex: number, delta: nu
 
 /**
  * Jump to the next (direction 1) or previous (direction -1) task
- * header row, wrapping at the ends. Returns the current index when no
- * task row exists.
+ * header row, the umbrella row included, wrapping at the ends.
+ * Returns the current index when no such row exists.
  */
 export function nextTaskRow(rows: NavigatorRow[], currentIndex: number, direction: 1 | -1): number {
-	const taskIndices = rows.flatMap((row, index) => (row.kind === "task" ? [index] : []));
+	const taskIndices = rows.flatMap((row, index) => (row.kind === "task" || row.kind === "umbrella" ? [index] : []));
 	if (taskIndices.length === 0) return currentIndex;
 	if (direction === 1) {
 		const next = taskIndices.find((index) => index > currentIndex);
@@ -354,7 +399,7 @@ export interface NavigatorDetailMember {
 }
 
 export interface NavigatorDetailModel {
-	kind: "agent" | "task" | "round" | "empty";
+	kind: "agent" | "task" | "round" | "umbrella" | "empty";
 	title: string;
 	statusText: string;
 	fields: NavigatorDetailField[];
@@ -395,11 +440,34 @@ function resolveAgentView(row: NavigatorRow, task: NavigatorTaskView): Navigator
  * result text, and the run window (the agent's startedAt/finishedAt
  * when both are finite) that scopes the t keybinding's transcript
  * lookup to that run. Task and round targets carry summary fields
- * plus one member line per child round or agent. A missing row,
+ * plus one member line per child round or agent. The umbrella target
+ * summarizes the settled partition: one dispatches field and one
+ * member line per settled dispatch. A missing row,
  * unknown task, or unresolvable ref yields the empty model.
  */
 export function resolveDetailModel(row: NavigatorRow | null | undefined, tasks: NavigatorTaskView[]): NavigatorDetailModel {
 	if (!row) return emptyDetailModel();
+
+	if (row.kind === "umbrella") {
+		const settled = tasks.filter((candidate) => !candidate.live);
+		return {
+			kind: "umbrella",
+			title: "Completed",
+			statusText: settledUmbrellaGlyph(settled),
+			fields: [{ label: "dispatches", value: String(settled.length) }],
+			members: settled.map((view) => ({
+				glyph: view.glyph,
+				label: view.label,
+				detail: `${view.mode} · ${view.durationText}`,
+			})),
+			activity: [],
+			thinking: [],
+			usageText: undefined,
+			resultText: undefined,
+			runWindow: undefined,
+		};
+	}
+
 	const task = tasks.find((candidate) => candidate.id === row.taskId);
 	if (!task) return emptyDetailModel();
 

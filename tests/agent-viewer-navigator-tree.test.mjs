@@ -162,7 +162,9 @@ const brokenView = brokenTasks[brokenTasks.length - 1];
 assert.equal(brokenView.agents.length, 1, "a chain broken at step 1 publishes only the started step");
 assert.equal(brokenView.agents[0].status, "failed");
 assert.equal(brokenView.agents[0].finishedAt, 4_000, "the started step keeps its own finish, not the job's");
-const brokenRows = flattenNavigatorTree(brokenTasks, createExpansionState());
+const brokenUmbrellaExpanded = createExpansionState();
+brokenUmbrellaExpanded.completedExpanded = true;
+const brokenRows = flattenNavigatorTree(brokenTasks, brokenUmbrellaExpanded);
 assert.deepEqual(
 	brokenRows.filter((row) => row.taskId === "job-5").map((row) => row.kind),
 	["task", "agent"],
@@ -254,9 +256,9 @@ assert.equal(lateFirstView.durationText, "8s", "task duration ends at the latest
 	// The tree renders rows in the partitioned order.
 	const mixedRows = flattenNavigatorTree(mixed, createExpansionState());
 	assert.deepEqual(
-		mixedRows.map((row) => row.taskId),
-		["job-live", "job-live", settledTask.id, settledTask.id, "job-settled", "job-settled"],
-		"the live task's rows render before the settled tasks' rows",
+		mixedRows.map((row) => row.id),
+		["t:job-live", "t:job-live:a0", "u:completed"],
+		"the live task's rows render above the Completed umbrella row holding the settled tasks",
 	);
 }
 
@@ -508,6 +510,7 @@ assert.equal(moveCursor([], 0, 1), 0, "moving on an empty tree stays at index 0"
 	const umbrellaTasks = buildNavigatorTasks(umbrellaRegistry, [failedJob], 5_000);
 	const expandedState = createExpansionState();
 	expandedState.completedExpanded = true;
+	expandedState.roundOverrides.set(`t:${doneTask.id}:r1`, true);
 	const expandedRows = flattenNavigatorTree(umbrellaTasks, expandedState);
 	assert.deepEqual(
 		expandedRows.map((row) => row.id),
@@ -619,6 +622,7 @@ assert.equal(moveCursor([], 0, 1), 0, "moving on an empty tree stays at index 0"
 	assert.equal(collapsedRows[0].detail, "2 dispatches");
 	const expandedState = createExpansionState();
 	expandedState.completedExpanded = true;
+	expandedState.roundOverrides.set(`t:${settledTask.id}:r1`, true);
 	assert.deepEqual(
 		flattenNavigatorTree(settledViews, expandedState).map((row) => row.id),
 		["u:completed", `t:${settledTask.id}`, `t:${settledTask.id}:r1`, `t:${settledTask.id}:r1:a0`, "t:job-settled", "t:job-settled:a0"],
@@ -648,7 +652,7 @@ assert.equal(moveCursor([], 0, 1), 0, "moving on an empty tree stays at index 0"
 	const expandedUmbrellaIndex = expandedRows.findIndex((row) => row.kind === "umbrella");
 	const settledTaskIndex = expandedRows.findIndex((row) => row.kind === "task" && row.taskId === settledTask.id);
 	assert.equal(nextTaskRow(expandedRows, expandedUmbrellaIndex, 1), settledTaskIndex, "tab from the umbrella reaches the settled task header under the expanded umbrella");
-	assert.equal(nextTaskRow(expandedRows, settledTaskIndex, 1), expandedUmbrellaIndex, "tab from the settled task header wraps to the umbrella");
+	assert.equal(nextTaskRow(expandedRows, settledTaskIndex, 1), 0, "tab from the last task header in cycle order wraps to the first live task header");
 	assert.equal(nextTaskRow(expandedRows, settledTaskIndex, -1), expandedUmbrellaIndex, "shift+tab from the settled task header reaches the umbrella");
 }
 // <<< EXT-17 T6

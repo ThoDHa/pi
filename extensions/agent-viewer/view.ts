@@ -595,7 +595,7 @@ export class NavigatorView implements Focusable {
 		const cursor = selected ? "▸ " : "  ";
 		const glyph = theme.fg(GLYPH_COLORS[row.glyph], statusGlyph(row.glyph));
 		const label =
-			row.kind === "task"
+			row.kind === "task" || row.kind === "umbrella"
 				? theme.fg("accent", theme.bold(row.label))
 				: theme.fg("toolTitle", row.kind === "round" ? theme.bold(row.label) : row.label);
 		const detail = row.detail ? theme.fg("muted", ` · ${row.detail}`) : "";

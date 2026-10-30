@@ -70,9 +70,12 @@ const detached = {
 
 const tasks = buildNavigatorTasks(registry, [detached], NOW);
 // The fixture's settled rounds default to collapsed (completed rounds
-// collapse to their glyph line); expand them so the agent rows are
-// visible for the agent-target assertions.
+// collapse to their glyph line), and the settled tasks fold under the
+// Completed umbrella (collapsed by default); expand the round overrides
+// and the umbrella so the settled task, round, and agent rows are
+// visible for the target assertions below.
 const expandedState = createExpansionState();
+expandedState.completedExpanded = true;
 expandedState.roundOverrides.set("t:task-1:r1", true);
 expandedState.roundOverrides.set("t:task-2:r1", true);
 const rows = flattenNavigatorTree(tasks, expandedState);
@@ -182,7 +185,7 @@ assert.equal(resolveDetailModel(orphanRow, tasks).kind, "empty", "a row whose ta
 		mode: "chain",
 		status: "failed",
 		agents: [{ agent: "ghost", status: "failed", startedAt: 2_000, finishedAt: 4_000 }],
-		agNames: ["ghost"],
+		agentNames: ["ghost"],
 		taskPreview: "for EXT-17-2 sweep the ruins",
 		startedAt: 2_000,
 		finishedAt: 4_000,

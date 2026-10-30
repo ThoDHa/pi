@@ -46,7 +46,7 @@
  * matching record holding no thinking renders the found-but-empty
  * note instead of denying the record, with the same live-buffer
  * retention; live tasks render
- * their rows above settled ones; tree overflow budgets the window one
+ * their rows above the Completed umbrella row holding settled ones; tree overflow budgets the window one
  * row short so the newest line and the indicator survive the +N more
  * clip; a taller resize while held suppresses the marker once the
  * tail is actually visible and the following pageDown re-acquires the
@@ -79,7 +79,7 @@ import { join } from "node:path";
 import { importPiTui } from "./provision-pi-tui.mjs";
 import { createDispatchRegistry, getSharedDispatchState } from "../extensions/subagent/registry.ts";
 import { SCROLL_NEW_INDICATOR, viewBodyRows } from "../extensions/agent-viewer/detail-scroll.ts";
-import { buildNavigatorTasks, createExpansionState, flattenNavigatorTree } from "../extensions/agent-viewer/navigator.ts";
+import { buildNavigatorTasks, createExpansionState, flattenNavigatorTree, resolveDetailModel } from "../extensions/agent-viewer/navigator.ts";
 
 // view.ts statically imports @earendil-works/pi-tui, so both its import
 // and the suite's own specifier bindings must wait for the shim provisioning
@@ -390,6 +390,8 @@ const writeRealTranscriptFile = (dir, ownThinking, fillerCount) => {
 
 	const view = capturedFactory(stubTui(), themeStub, keybindings, () => {});
 	assert.ok(view instanceof NavigatorView, "the custom factory builds the navigator view");
+	view.handleInput(RIGHT);
+	view.handleInput(DOWN);
 	view.handleInput(DOWN);
 	view.handleInput(RIGHT);
 	view.handleInput(DOWN);
@@ -670,10 +672,13 @@ const writeRealTranscriptFile = (dir, ownThinking, fillerCount) => {
 	};
 	await withView({ registry, detachedJobs: [liveDetached] }, async (view) => {
 		const rendered = view.render(120).join("\n");
+		const liveIndex = rendered.indexOf("live detached probe");
+		const umbrellaIndex = rendered.indexOf("Completed");
 		assert.ok(
-			rendered.indexOf("live detached probe") !== -1 && rendered.indexOf("live detached probe") < rendered.indexOf("EXT-9-1"),
-			"the live task's rows render above the settled task's rows",
+			liveIndex !== -1 && umbrellaIndex !== -1 && liveIndex < umbrellaIndex,
+			"the live task's rows render above the Completed umbrella row",
 		);
+		assert.ok(!rendered.includes("EXT-9-1"), "the settled task renders no rows outside the umbrella");
 	});
 }
 
@@ -777,6 +782,8 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 			readTranscriptLines: () => new Promise(() => {}),
 		},
 		async (view, done) => {
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
 			view.handleInput(DOWN);
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
@@ -1059,6 +1066,8 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		const sources = { registry, detachedJobs: [], sessionFile: () => sessionFile };
 	await withView(sources, async (view) => {
 		const poll = () => view.refresh();
+		view.handleInput(RIGHT);
+		view.handleInput(DOWN);
 		view.handleInput(DOWN);
 		view.handleInput(RIGHT);
 		view.handleInput(DOWN);
@@ -1107,8 +1116,12 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		registry.startRound(chain.id, [{ agent: "scout", step: 1 }], 20_000);
 		registry.updateAgent(chain.id, 1, 0, { status: "failed", finishedAt: 21_000, result: { exitCode: 1, stopReason: "error" } });
 		await withView(sources, async (view) => {
-			// Both settled rounds start collapsed: expand r1, walk past scout
-			// and the task-2 header, then expand r2 to reach the failed agent.
+			// Both settled tasks fold under the Completed umbrella: expand it,
+			// walk past scout and the task-2 header, then expand r2 to reach
+			// the failed agent.
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
+			assert.equal(view.selectedId, "t:task-1");
 			view.handleInput(DOWN);
 			assert.equal(view.selectedId, "t:task-1:r1");
 			view.handleInput(RIGHT);
@@ -1165,7 +1178,11 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		registry.updateAgent(task.id, 2, 0, { status: "done", finishedAt: 12_000 });
 
 		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
-			// Both settled rounds start collapsed: expand r1 and walk to its scout.
+			// The settled task folds under the Completed umbrella: expand it
+			// and walk to r1's scout.
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
+			assert.equal(view.selectedId, "t:task-1");
 			view.handleInput(DOWN);
 			assert.equal(view.selectedId, "t:task-1:r1");
 			view.handleInput(RIGHT);
@@ -1291,6 +1308,8 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 
 		// Lookup miss with a live buffer: the note names the record's absence and the live section stays visible.
 		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
 			view.handleInput(DOWN);
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
@@ -1305,6 +1324,8 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 
 		// Lookup miss with an empty buffer: the plain absent-record note.
 		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
 			view.handleInput(DOWN);
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
@@ -1321,6 +1342,8 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		// A record that exists but holds no thinking: the found-but-empty note
 		// names the record's emptiness instead of denying the record exists.
 		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
 			view.handleInput(DOWN);
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
@@ -1338,6 +1361,8 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 
 		// Found-but-empty with a live buffer: the stand-in note plus the retained live section.
 		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
 			view.handleInput(DOWN);
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
@@ -1418,6 +1443,8 @@ function deferredTranscriptReader() {
 	const sessionFile = join(tmpdir(), "pi-navigator-stream", "session.jsonl");
 	const streamSources = (reader) => ({ registry, detachedJobs: [], navigatorKey: "alt+n", sessionFile: () => sessionFile, readTranscriptLines: reader });
 	const selectScout = (view) => {
+		view.handleInput(RIGHT);
+		view.handleInput(DOWN);
 		view.handleInput(DOWN);
 		view.handleInput(RIGHT);
 		view.handleInput(DOWN);
@@ -1567,6 +1594,8 @@ function deferredTranscriptReader() {
 		registry.startRound(task.id, [{ agent: "scout" }], 1_000);
 		registry.updateAgent(task.id, 1, 0, { status: "done", finishedAt: 9_000, thinkingLog: [{ at: 1_050, text: "live buffer thought" }] });
 		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
 			view.handleInput(DOWN);
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
@@ -1612,6 +1641,8 @@ function deferredTranscriptReader() {
 		registry.startRound(task.id, [{ agent: "scout" }], 1_000);
 		registry.updateAgent(task.id, 1, 0, { status: "done", finishedAt: 9_000, thinkingLog: [{ at: 1_050, text: "live buffer thought" }] });
 		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
 			view.handleInput(DOWN);
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
@@ -1675,6 +1706,8 @@ function deferredTranscriptReader() {
 				view.dispose();
 			},
 		);
+		view.handleInput(RIGHT);
+		view.handleInput(DOWN);
 		view.handleInput(DOWN);
 		view.handleInput(RIGHT);
 		view.handleInput(DOWN);
@@ -1750,8 +1783,8 @@ await withView({ registry: createDispatchRegistry(), detachedJobs: [] }, async (
 		registry.updateAgent(settledTask.id, 1, 0, { status: "done", finishedAt: 2_000, activity: [{ at: 1_100, kind: "text", text: "early note" }] });
 		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
 			const collapsed = view.render(120).join("\n");
+			assert.deepEqual(view.rows.map((row) => row.id), ["u:completed"], "the collapsed tree holds the umbrella row alone");
 			assert.ok(collapsed.includes("Completed"), "the collapsed umbrella row renders");
-			assert.ok(!collapsed.includes("EXT-17-1"), "no settled task row renders outside the umbrella");
 			assert.ok(!collapsed.includes("early"), "the settled agent row stays hidden behind the umbrella");
 			assert.ok(collapsed.includes("dispatches: 1"), "the umbrella detail names the settled dispatch count");
 			assert.ok(collapsed.includes("single · 1s"), "the umbrella detail lists one member line per settled dispatch");
@@ -1762,11 +1795,10 @@ await withView({ registry: createDispatchRegistry(), detachedJobs: [] }, async (
 			view.handleInput(RIGHT);
 			const expanded = view.render(120).join("\n");
 			assert.ok(expanded.includes("EXT-17-1"), "right expands the umbrella and reveals the settled task row");
-			assert.ok(expanded.includes("early"), "the settled agent row renders under the expanded umbrella");
 			assert.ok(expanded.includes("Completed"), "the umbrella row stays visible when expanded");
 
 			view.handleInput(LEFT);
-			assert.ok(!view.render(120).join("\n").includes("EXT-17-1"), "left collapses the umbrella again");
+			assert.deepEqual(view.rows.map((row) => row.id), ["u:completed"], "left collapses the umbrella again");
 
 			// The t affordance survives the fold: expand, walk to the finished agent, stream its transcript.
 			view.handleInput(RIGHT);
@@ -1775,6 +1807,7 @@ await withView({ registry: createDispatchRegistry(), detachedJobs: [] }, async (
 			view.handleInput(DOWN);
 			assert.equal(view.selectedId, `t:${settledTask.id}:r1`);
 			view.handleInput(RIGHT);
+			assert.ok(view.render(120).join("\n").includes("early"), "the settled agent row renders under the expanded umbrella");
 			view.handleInput(DOWN);
 			assert.equal(view.selectedId, `t:${settledTask.id}:r1:a0`);
 			view.handleInput("t");

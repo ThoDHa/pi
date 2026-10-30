@@ -64,6 +64,8 @@ export interface StripTaskView {
 	label: string;
 	mode: string;
 	live: boolean;
+	/** The task's own outcome glyph: running while live, the settled aggregation otherwise; the Completed line aggregates this field over the settled views. */
+	glyph: StatusGlyphName;
 	entries: StripEntry[];
 }
 
@@ -98,11 +100,12 @@ function roundEntryLine(entry: StripRoundEntry): StripLine {
 
 /**
  * Render the strip's lines under the line budget. Live tasks render
- * before finished ones (stable within each group); the hint line is
- * always last; when content exceeds maxLines minus the overflow and
- * hint reservations, the tail is summarized as one "+N more" line
- * (N = omitted content lines), which cuts finished content first
- * because live content leads.
+ * before the settled group, and the settled views collapse to one
+ * Completed line (aggregated glyph, dispatch count) closing the
+ * content; the hint line is always last; when content exceeds maxLines
+ * minus the overflow and hint reservations, the tail is summarized as
+ * one "+N more" line (N = omitted content lines), which cuts finished
+ * content first because live content leads.
  */
 export function renderStripLines(
 	tasks: StripTaskView[],
@@ -113,9 +116,9 @@ export function renderStripLines(
 		return [{ segments: [{ text: "No active dispatches", color: "muted" }] }, hintLine];
 	}
 
-	const liveFirst = [...tasks.filter((task) => task.live), ...tasks.filter((task) => !task.live)];
 	const lines: StripLine[] = [];
-	for (const task of liveFirst) {
+	for (const task of tasks) {
+		if (!task.live) continue;
 		lines.push({
 			segments: [
 				{ text: task.label, color: "accent", bold: true },
@@ -126,11 +129,33 @@ export function renderStripLines(
 			lines.push(entry.kind === "agent" ? agentEntryLine(entry) : roundEntryLine(entry));
 		}
 	}
+	const settled = tasks.filter((task) => !task.live);
+	if (settled.length > 0) {
+		const glyph = aggregateSettledGlyph(settled);
+		lines.push({
+			segments: [
+				{ text: statusGlyph(glyph), color: GLYPH_COLORS[glyph] },
+				{ text: " Completed", color: "accent", bold: true },
+				{ text: ` · ${dispatchCountText(settled.length)}`, color: "dim" },
+			],
+		});
+	}
 
 	const maxContent = Math.max(1, (options.maxLines ?? STRIP_MAX_LINES) - 2);
 	if (lines.length <= maxContent) return [...lines, hintLine];
 	const omitted = lines.length - maxContent;
 	return [...lines.slice(0, maxContent), { segments: [{ text: `+${omitted} more`, color: "muted" }] }, hintLine];
+}
+
+/** The Completed glyph over the settled views' own outcome glyphs: done when all are done, failed when all are failed, mixed otherwise. */
+function aggregateSettledGlyph(views: StripTaskView[]): StatusGlyphName {
+	if (views.every((view) => view.glyph === "done")) return "done";
+	if (views.every((view) => view.glyph === "failed")) return "failed";
+	return "mixed";
+}
+
+function dispatchCountText(count: number): string {
+	return count === 1 ? "1 dispatch" : `${count} dispatches`;
 }
 
 function roundStatus(round: DispatchRoundNode): StatusGlyphName {
@@ -167,6 +192,13 @@ function agentEntry(agent: DispatchAgentNode, now: number): StripAgentEntry {
 	};
 }
 
+/** A settled task's outcome glyph over its rounds' agent nodes: done when none failed, failed when all failed, mixed otherwise. */
+function aggregateNodeGlyph(nodes: readonly DispatchAgentNode[]): StatusGlyphName {
+	const failed = nodes.filter((node) => node.status === "failed").length;
+	if (failed === 0) return "done";
+	return failed === nodes.length ? "failed" : "mixed";
+}
+
 /**
  * Assemble the strip's task views from the blocking-path dispatch
  * registry plus the detached jobs registry. Task labels resolve from
@@ -174,7 +206,9 @@ function agentEntry(agent: DispatchAgentNode, now: number): StripAgentEntry {
  * "(detached)" wording when the resolution comes up empty so a task
  * header never renders bare; a finished round of a
  * live task collapses to one round entry; within a task, live rounds'
- * agent entries lead so the budget's tail cut spares live content. A
+ * agent entries lead so the budget's tail cut spares live content; a
+ * live view carries the running glyph and a settled view the
+ * aggregation of its agents' outcomes. A
  * detached job becomes one task view labeled through the same
  * resolveTaskLabel heuristic as blocking tasks, falling back to
  * "(detached)" when the resolution comes up empty. Its per-slot
@@ -199,7 +233,13 @@ export function buildStripTasks(
 			for (const agent of round.agents) entries.push(agentEntry(agent, now));
 		}
 		for (const round of finishedRounds) entries.push(collapsedRoundEntry(round, now));
-		views.push({ label: resolveTaskLabel(task.prompt) || "(detached)", mode: task.mode, live, entries });
+		views.push({
+			label: resolveTaskLabel(task.prompt) || "(detached)",
+			mode: task.mode,
+			live,
+			glyph: live ? "running" : aggregateNodeGlyph(task.rounds.flatMap((round) => round.agents)),
+			entries,
+		});
 	}
 
 	for (const job of jobs) {
@@ -211,6 +251,7 @@ export function buildStripTasks(
 			label: resolveTaskLabel(job.taskPreview) || "(detached)",
 			mode: job.mode,
 			live: job.status === "running",
+			glyph: job.status,
 			entries,
 		});
 	}
