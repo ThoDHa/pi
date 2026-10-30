@@ -171,4 +171,38 @@ assert.deepEqual(emptyModel.thinking, [], "the empty model carries an empty thin
 const orphanRow = { ...taskRow, taskId: "task-999" };
 assert.equal(resolveDetailModel(orphanRow, tasks).kind, "empty", "a row whose task vanished resolves empty");
 
+// >>> EXT-17 D1: the umbrella detail model, one member line per settled dispatch
+{
+	const umbrellaRegistry = createDispatchRegistry();
+	const settledTask = umbrellaRegistry.startTask({ mode: "single", prompt: "Task: EXT-17-1 umbrella detail", now: 1_000 });
+	umbrellaRegistry.startRound(settledTask.id, [{ agent: "early" }], 1_000);
+	umbrellaRegistry.updateAgent(settledTask.id, 1, 0, { status: "done", finishedAt: 2_000 });
+	const failedJob = {
+		id: "job-17",
+		mode: "chain",
+		status: "failed",
+		agents: [{ agent: "ghost", status: "failed", startedAt: 2_000, finishedAt: 4_000 }],
+		agNames: ["ghost"],
+		taskPreview: "for EXT-17-2 sweep the ruins",
+		startedAt: 2_000,
+		finishedAt: 4_000,
+	};
+	const umbrellaViews = buildNavigatorTasks(umbrellaRegistry, [failedJob], 5_000);
+	const umbrellaRow = flattenNavigatorTree(umbrellaViews, createExpansionState()).find((row) => row.kind === "umbrella");
+	assert.ok(umbrellaRow, "the fixture exposes the umbrella row");
+	const umbrellaModel = resolveDetailModel(umbrellaRow, umbrellaViews);
+	assert.equal(umbrellaModel.kind, "umbrella");
+	assert.equal(umbrellaModel.title, "Completed");
+	assert.equal(umbrellaModel.statusText, "mixed", "the detail header carries the aggregated glyph");
+	assert.deepEqual(umbrellaModel.fields, [{ label: "dispatches", value: "2" }]);
+	assert.equal(umbrellaModel.members.length, 2, "one member line per settled dispatch");
+	assert.deepEqual(umbrellaModel.members[0], { glyph: "done", label: "EXT-17-1", detail: "single · 1s" });
+	assert.deepEqual(umbrellaModel.members[1], { glyph: "failed", label: "EXT-17-2", detail: "chain · 2s" });
+	assert.deepEqual(umbrellaModel.activity, []);
+	assert.deepEqual(umbrellaModel.thinking, []);
+	assert.equal(umbrellaModel.usageText, undefined);
+	assert.equal(umbrellaModel.resultText, undefined);
+}
+// <<< EXT-17 D1
+
 console.log("agent-viewer-navigator-detail: all assertions passed");

@@ -1708,4 +1708,114 @@ await withView({ registry: createDispatchRegistry(), detachedJobs: [] }, async (
 	}
 });
 
+// >>> EXT-17 V1: the umbrella hides settled rows until expanded, keeps detail and t reachable
+{
+	const dir = mkdtempSync(join(tmpdir(), "pi-navigator-v1-"));
+	try {
+		const sessionFile = join(dir, "session.jsonl");
+		writeFileSync(
+			sessionFile,
+			[
+				JSON.stringify({ type: "session", version: 3, id: "s1" }),
+				JSON.stringify({
+					type: "message",
+					message: {
+						role: "toolResult",
+						toolName: "subagent",
+						toolCallId: "call_1",
+						content: [],
+						details: {
+							mode: "single",
+							results: [
+								{
+									agent: "early",
+									agentSource: "user",
+									task: "probe",
+									exitCode: 0,
+									messages: [{ role: "assistant", timestamp: 1_500, content: [{ type: "thinking", thinking: "revealed thought" }] }],
+									stderr: "",
+									stopReason: "end",
+									usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+								},
+							],
+						},
+					},
+				}),
+			].join("\n"),
+		);
+
+		const registry = createDispatchRegistry();
+		const settledTask = registry.startTask({ mode: "single", prompt: "Task: EXT-17-1 view fold probe", now: 1_000 });
+		registry.startRound(settledTask.id, [{ agent: "early" }], 1_000);
+		registry.updateAgent(settledTask.id, 1, 0, { status: "done", finishedAt: 2_000, activity: [{ at: 1_100, kind: "text", text: "early note" }] });
+		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
+			const collapsed = view.render(120).join("\n");
+			assert.ok(collapsed.includes("Completed"), "the collapsed umbrella row renders");
+			assert.ok(!collapsed.includes("EXT-17-1"), "no settled task row renders outside the umbrella");
+			assert.ok(!collapsed.includes("early"), "the settled agent row stays hidden behind the umbrella");
+			assert.ok(collapsed.includes("dispatches: 1"), "the umbrella detail names the settled dispatch count");
+			assert.ok(collapsed.includes("single · 1s"), "the umbrella detail lists one member line per settled dispatch");
+
+			view.handleInput("t");
+			assert.equal(view.render(120).join("\n"), collapsed, "t on the umbrella row is a no-op");
+
+			view.handleInput(RIGHT);
+			const expanded = view.render(120).join("\n");
+			assert.ok(expanded.includes("EXT-17-1"), "right expands the umbrella and reveals the settled task row");
+			assert.ok(expanded.includes("early"), "the settled agent row renders under the expanded umbrella");
+			assert.ok(expanded.includes("Completed"), "the umbrella row stays visible when expanded");
+
+			view.handleInput(LEFT);
+			assert.ok(!view.render(120).join("\n").includes("EXT-17-1"), "left collapses the umbrella again");
+
+			// The t affordance survives the fold: expand, walk to the finished agent, stream its transcript.
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
+			assert.equal(view.selectedId, `t:${settledTask.id}`);
+			view.handleInput(DOWN);
+			assert.equal(view.selectedId, `t:${settledTask.id}:r1`);
+			view.handleInput(RIGHT);
+			view.handleInput(DOWN);
+			assert.equal(view.selectedId, `t:${settledTask.id}:r1:a0`);
+			view.handleInput("t");
+			await waitForFrame(view, (frame) => frame.includes("revealed thought"));
+			assert.ok(view.render(120).join("\n").includes("full thinking"), "t still streams the revealed finished agent's transcript");
+		});
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+// <<< EXT-17 V1
+
+// >>> EXT-17 V2: a task settling mid-session clamps the selection onto a surviving row
+{
+	const registry = createDispatchRegistry();
+	const settlingTask = registry.startTask({ mode: "single", prompt: "Task: EXT-17-1 settle clamp probe", now: 1_000 });
+	registry.startRound(settlingTask.id, [{ agent: "settler" }], 1_000);
+	const earlierTask = registry.startTask({ mode: "single", prompt: "Task: EXT-17-2 earlier probe", now: 500 });
+	registry.startRound(earlierTask.id, [{ agent: "prior" }], 500);
+	registry.updateAgent(earlierTask.id, 1, 0, { status: "done", finishedAt: 800 });
+	await withView({ registry, detachedJobs: [] }, async (view) => {
+		// The poll never fires inside a synchronous suite: refresh() is the
+		// exact method the 300ms interval calls, so the settle is picked up
+		// by calling it directly (bounded, never an unbounded wait).
+		view.handleInput(DOWN);
+		assert.equal(view.selectedId, `t:${settlingTask.id}:r1`);
+		view.handleInput(DOWN);
+		assert.equal(view.selectedId, `t:${settlingTask.id}:r1:a0`);
+
+		registry.updateAgent(settlingTask.id, 1, 0, { status: "done", finishedAt: 2_000 });
+		view.refresh();
+		const frame = view.render(120);
+		assert.ok(frame.join("\n").includes("Completed"), "the settled tree renders the umbrella");
+		const surviving = view.rows[view.selectedIndex];
+		assert.ok(surviving, "the clamped selection lands on a surviving row");
+		assert.equal(surviving.id, view.selectedId, "the adopted selection names a rendered row");
+		const model = resolveDetailModel(surviving, view.tasks);
+		assert.notEqual(model.kind, "empty", "the adopted row's detail model resolves");
+		assert.ok(frame.length > 0, "the view renders after the settle clamp");
+	});
+}
+// <<< EXT-17 V2
+
 console.log("agent-viewer-view: all assertions passed");
