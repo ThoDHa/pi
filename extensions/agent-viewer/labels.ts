@@ -12,16 +12,24 @@ export const TASK_LABEL_MAX_WIDTH = 60;
 
 const FLEET_REFERENCE_PATTERN = /\bEXT-\d+(?:-\d+)?\b/i;
 
+/** Matches a trailing eight-digit segment, the shape of a task-file filename's date (EXT-19-20261030). */
+const DATE_SEGMENT_PATTERN = /-\d{8}$/;
+
 /**
  * First fleet task reference in the prompt text, normalized to
  * uppercase ("ext-4-1" -> "EXT-4-1"), or null when the prompt names
- * no EXT-N[-M] task. Multi-reference prompts yield the first
- * reference, matching the fleet convention of naming the dispatched
- * task before the ones it coordinates with.
+ * no EXT-N[-M] task. A trailing eight-digit date segment is stripped
+ * from the capture: prompts citing their task file by path
+ * (…/EXT-19-20261030-0918-….md) would otherwise capture the
+ * filename's date segment, a span mimicking the EXT-N-M child-id
+ * shape; real child ids carry small sequential numbers, so only
+ * filename dates match the shape. Multi-reference prompts yield the
+ * first reference, matching the fleet convention of naming the
+ * dispatched task before the ones it coordinates with.
  */
 export function findFleetTaskReference(prompt: string): string | null {
 	const match = FLEET_REFERENCE_PATTERN.exec(prompt);
-	return match ? match[0].toUpperCase() : null;
+	return match ? match[0].toUpperCase().replace(DATE_SEGMENT_PATTERN, "") : null;
 }
 
 /**

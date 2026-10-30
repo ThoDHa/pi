@@ -1858,41 +1858,55 @@ const stripAnsi = (text) => text.replace(/\x1b(\[[0-9;]*[A-Za-z]|\]8;;\x07|_[^\x
 // >>> EXT-19 V1: the task detail renders the job's full source text, stable across polls
 {
 	const registry = createDispatchRegistry();
-	const prompt = "Read /home/x/.pi/.tasks/current/EXT-19-20261030-0918-show-what-each-job-is-working-on.md\n\nFollow the Work Log entry EXT-19-1 and log interim progress.";
+	// A long assignment: its section alone overflows the body budget, so the
+	// pane pages (the derived activity line is the pane tail under D4). The
+	// first line stays marker-free: the fallback label is built from the
+	// prompt's first words, so head markers must not live inside it.
+	const prompt = [
+		"You are the worker for this assignment; read every directive line before touching anything.",
+		"",
+		...Array.from({ length: 29 }, (_, index) => `directive marker ${String(index + 2).padStart(2, "0")}`),
+	].join("\n");
 	const task = registry.startTask({ mode: "single", prompt, now: 1_000 });
 	registry.startRound(task.id, [{ agent: "worker" }], 1_000);
-	registry.updateAgent(task.id, 1, 0, { activity: mapperLog(40) });
+	registry.updateAgent(task.id, 1, 0, { activity: [{ at: 1_100, kind: "text", text: "worker note" }] });
 	await withView({ registry, detachedJobs: [] }, async (view) => {
 		const poll = () => view.refresh();
 		assert.equal(view.selectedId, "t:task-1", "the fixture opens on the task row");
 
-		// The pane follows the activity tail by default, so the prompt section above is clipped.
-
-		// The pane follows the activity tail by default, so the prompt section above is clipped.
+		// The pane follows the pane tail by default, so the prompt head above is clipped.
 		const tailFrame = view.render(120).join("\n");
-		assert.ok(!tailFrame.includes("Follow the Work Log entry"), "the tail view clips the prompt section above the activity");
+		assert.ok(!tailFrame.includes("marker 02"), "the tail view clips the prompt section's head");
 
 		view.handleInput(HOME);
 		const headFrame = view.render(120).join("\n");
 		assert.ok(headFrame.includes("prompt"), "the section label renders below the header");
-		assert.ok(
-			headFrame.indexOf("prompt") < headFrame.indexOf("<dim:Read /home/x/.pi/.tasks/current/EXT-19-20261030"),
-			"the section label sits above its source lines",
-		);
-		assert.ok(
-			headFrame.includes("<dim:Read /home/x/.pi/.tasks/current/EXT-19-20261030-0918-show-what-each-job-is-working-on.md>"),
-			"each source line renders as its own dim pane line",
-		);
-		assert.ok(headFrame.includes("<dim:Follow the Work Log entry EXT-19-1 and log interim progress."), "the last source line renders");
+		assert.ok(headFrame.includes("directive marker 02"), "each source line renders as its own pane line");
 		assert.ok(headFrame.includes("\u200b"), "a blank source line renders a zero-width space so the paragraph break survives");
-		assert.ok(!headFrame.includes("log line 39"), "the held head view clips the activity tail below");
+		assert.ok(!headFrame.includes("worker note"), "the held head view clips the activity tail below");
 
 		// A held window does not drift while the immutable prompt section re-renders on a poll.
-		registry.updateAgent(task.id, 1, 0, { activity: [...mapperLog(40), activityEntry(40, 2_000)] });
+		registry.updateAgent(task.id, 1, 0, { activity: [{ at: 1_100, kind: "text", text: "worker note" }, { at: 6_000, kind: "text", text: "worker newer note" }] });
 		poll();
 		const stableFrame = view.render(120).join("\n");
-		assert.ok(stableFrame.includes("<dim:Read /home/x/.pi/.tasks/current/EXT-19-20261030"), "the held window stays on the prompt section across the poll");
-		assert.ok(!stableFrame.includes("log line 40"), "the held window stays off the new tail after the poll");
+		assert.ok(stableFrame.includes("marker 02"), "the held window stays on the prompt section across the poll");
+		assert.ok(!stableFrame.includes("worker newer note"), "the held window stays off the new tail after the poll");
+		view.handleInput(END);
+		assert.ok(view.render(120).join("\n").includes("worker newer note"), "end returns the pane to the tail and the derived activity line");
+	});
+}
+
+// Source lines render dim through the theme, one styled span per source line.
+{
+	const registry = createDispatchRegistry();
+	const task = registry.startTask({ mode: "single", prompt: "first short line\n\nthird short line", now: 1_000 });
+	registry.startRound(task.id, [{ agent: "worker" }], 1_000);
+	await withView({ registry, detachedJobs: [] }, async (view) => {
+		const frame = view.render(120).join("\n");
+		assert.ok(frame.indexOf("prompt") < frame.indexOf("<dim:first short line>"), "the section label sits above its source lines");
+		assert.ok(frame.includes("<dim:first short line>"), "a source line renders as one dim styled span");
+		assert.ok(frame.includes("<dim:third short line>"), "each source line carries its own styled span");
+		assert.ok(frame.includes("\u200b"), "a blank source line renders a zero-width space so the paragraph break survives");
 	}, stubTui(), dimTaggingTheme);
 }
 
@@ -1925,7 +1939,7 @@ const stripAnsi = (text) => text.replace(/\x1b(\[[0-9;]*[A-Za-z]|\]8;;\x07|_[^\x
 		assert.ok(row.trimEnd().endsWith("…"), "the overlong row ends in an honest ellipsis instead of a silent cut");
 		assert.ok(visibleWidth(row.trimEnd()) <= TREE_W_AT_120, "the truncated row fits its pane width");
 		const joined = frame.join("\n");
-		assert.ok(!joined.includes("auditor"), "no continuation of the cut label renders anywhere in the frame");
+		assert.ok(joined.includes("auditor"), "the cut tail stays readable where there is room: the detail pane renders the full assignment");
 		assert.ok(!joined.includes("… +"), "the fixture does not ride the tree-overflow clip");
 		assert.ok(frame[frame.indexOf(rowLine) + 1].includes("round 1"), "the next tree row renders on the following line: one row per row, no wrap continuation");
 	});
@@ -1951,5 +1965,28 @@ const stripAnsi = (text) => text.replace(/\x1b(\[[0-9;]*[A-Za-z]|\]8;;\x07|_[^\x
 	});
 }
 // <<< EXT-19 V3
+
+// >>> EXT-19 V3 (exactly fit): a focused row whose natural width equals the pane width recuts without a false ellipsis
+{
+	const registry = createDispatchRegistry();
+	// A single-mode task row composes as cursor (2 columns) + glyph (the
+	// running ⏳ measures 2) + separator (1) + label + " · single" (9), so
+	// a 38-character label lands the composed row at exactly treeW (52 at
+	// 120 columns).
+	registry.startTask({ mode: "single", prompt: "focused row exactly fits".padEnd(38, "x"), now: 1_000 });
+	registry.startRound(registry.getTask("task-1").id, [{ agent: "worker" }], 1_000);
+	await withView({ registry, detachedJobs: [] }, async (view) => {
+		view.focused = true;
+		assert.equal(view.selectedId, "t:task-1");
+		const frame = view.render(120);
+		const markerLine = frame.find((line) => line.includes(CURSOR_MARKER));
+		assert.ok(markerLine, "the exactly-fitting focused row renders the cursor marker");
+		assert.ok(frame.join("").split(CURSOR_MARKER).length - 1 === 1, "exactly the selected row carries the marker");
+		const row = stripAnsi(sliceByColumn(markerLine, 0, TREE_W_AT_120));
+		assert.ok(!row.includes("…"), "the full row fit, so no ellipsis claims a cut that never happened");
+		assert.equal(visibleWidth(row.trimEnd()), TREE_W_AT_120 - 1, "the row recuts one column short, reserving the marker's column");
+	});
+}
+// <<< EXT-19 V3 (exactly fit)
 
 console.log("agent-viewer-view: all assertions passed");

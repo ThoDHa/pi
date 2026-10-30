@@ -64,7 +64,7 @@
 import type { KeybindingsManager, Theme, TUI } from "@earendil-works/pi-coding-agent";
 import { createReadStream, fstatSync } from "node:fs";
 import { createInterface } from "node:readline";
-import { CURSOR_MARKER, type Focusable, type KeyId, type Keybinding, type TuiMouseEvent, type TuiMouseEventResult, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, type Focusable, type KeyId, type Keybinding, type TuiMouseEvent, type TuiMouseEventResult, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { HStack, Text, VStack } from "@earendil-works/pi-tui";
 import { filterActivityEntries } from "./activity-filter.ts";
 import { statusGlyph, type DetachedJobSnapshot, type DispatchRegistry, type DispatchThinkingEntry } from "../subagent/registry.ts";
@@ -164,6 +164,12 @@ const THINKING_SECTION_LABEL = "thinking · live";
 
 /** Label heading the transcript reading view the t keybinding opens. */
 const TRANSCRIPT_SECTION_LABEL = "full thinking · transcript · t to return";
+
+/** Label heading the prompt section below the task header. */
+const PROMPT_SECTION_LABEL = "prompt";
+
+/** Identity key of the prompt section's label line: a structural slot like the pane's other static lines. */
+const PROMPT_LABEL_LINE_KEY = "prompt-label";
 
 /** Note rendered when the transcript cannot be read (no tracking, no file). */
 const TRANSCRIPT_UNAVAILABLE_NOTE = "session transcript unavailable";
@@ -588,7 +594,7 @@ export class NavigatorView implements Focusable {
 		return this.renderDetailLines().map((line) => line.key);
 	}
 
-	private renderTreeRow(row: NavigatorRow): string {
+	private renderTreeRow(row: NavigatorRow, treeW: number): string {
 		const theme = this.theme;
 		const selected = row.id === this.selectedId;
 		const indent = "  ".repeat(row.depth);
@@ -601,7 +607,18 @@ export class NavigatorView implements Focusable {
 		const detail = row.detail ? theme.fg("muted", ` · ${row.detail}`) : "";
 		const activity = row.activity ? theme.fg("dim", ` · ${row.activity}`) : "";
 		const line = `${indent}${cursor}${glyph} ${label}${detail}${activity}`;
-		return selected && this.focused ? line + CURSOR_MARKER : line;
+		// The row is cut to the pane width itself, so pi-tui's Text never
+		// wraps it into a second pane line and the layout's column slice
+		// never engages: every cut ends in an honest ellipsis.
+		const truncated = truncateToWidth(line, treeW, "…");
+		if (!(selected && this.focused)) return truncated;
+		// pi-tui's column slice drops a zero-width code parked exactly at the
+		// slice end, so the focused row recuts one column short to park the
+		// marker strictly inside the pane. The branch reads the row's own
+		// width: an overlong row keeps its ellipsis across the recut, while a
+		// row that already fit recuts without one, since an ellipsis on fully
+		// fitted content claims a cut that never happened.
+		return visibleWidth(line) > treeW ? truncateToWidth(line, treeW - 1, "…") + CURSOR_MARKER : truncateToWidth(line, treeW - 1, "") + CURSOR_MARKER;
 	}
 
 	/**
@@ -643,6 +660,19 @@ export class NavigatorView implements Focusable {
 			text: `${titleGlyph} ${theme.fg("toolTitle", theme.bold(model.title))} ${theme.fg("muted", model.statusText)}`,
 			key: HEADER_LINE_KEY,
 		});
+		if (model.sourceText) {
+			// The assignment's full source text, one pane line per source line
+			// with the thinking section's zero-width blank convention. Keys
+			// carry the line's index: the prompt is immutable for its task, so
+			// a held window re-finds its anchor across every poll's rebuild.
+			lines.push({ text: theme.fg("muted", PROMPT_SECTION_LABEL), key: PROMPT_LABEL_LINE_KEY });
+			for (const [lineIndex, sourceLine] of model.sourceText.split("\n").entries()) {
+				lines.push({
+					text: sourceLine.trim() ? theme.fg("dim", sourceLine) : "\u200b",
+					key: `prompt:${lineIndex}`,
+				});
+			}
+		}
 		if (this.transcript && this.transcript.agent === model.title && model.kind === "agent") {
 			lines.push({ text: theme.fg("muted", TRANSCRIPT_SECTION_LABEL), key: THINKING_LABEL_LINE_KEY });
 			if (this.transcript.state === "loading") {
@@ -721,7 +751,7 @@ export class NavigatorView implements Focusable {
 		const detailW = bodyWidth - treeW - PANE_GAP;
 
 		const bodyRows = viewBodyRows(this.tui.terminal.rows);
-		const treeRows = this.rows.map((row) => this.renderTreeRow(row));
+		const treeRows = this.rows.map((row) => this.renderTreeRow(row, treeW));
 		const omitted = Math.max(0, treeRows.length - bodyRows);
 		const viewport = this.detailViewport();
 		const detailLines = this.renderDetailLines();

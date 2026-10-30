@@ -134,8 +134,13 @@ const taskModel = resolveDetailModel(taskRow, tasks);
 assert.equal(taskModel.kind, "task");
 assert.equal(taskModel.title, "EXT-9-8");
 assert.equal(taskModel.statusText, "done");
-assert.deepEqual(taskModel.activity, [], "task targets stream no activity of their own");
 assert.deepEqual(taskModel.thinking, [], "task targets stream no thinking of their own");
+// EXT-19 D8 adaptation of the former "task targets stream no activity of their
+// own" pin (original intent: task targets aggregate their children and stream
+// no raw activity log themselves): D4 supersedes it with exactly one derived
+// entry, the task's agents' latest (greatest at), so the pin still rules out a
+// raw log streaming through while naming the new surface.
+assert.deepEqual(taskModel.activity, [{ at: 3_000, kind: "toolCall", name: "bash", args: { command: "rg alpha" }, text: "$ rg alpha" }], "task targets carry exactly their agents' latest activity entry, not a raw log");
 assert.equal(taskModel.members.length, 1);
 assert.equal(taskModel.members[0].label, "round 1");
 assert.equal(taskModel.members[0].glyph, "done");
@@ -254,14 +259,20 @@ assert.equal(resolveDetailModel(orphanRow, tasks).kind, "empty", "a row whose ta
 	const blankRow = flattenNavigatorTree(blankViews, createExpansionState()).find((row) => row.kind === "task");
 	assert.ok(blankRow, "the fixture exposes the blank-prompt task row");
 	assert.equal(resolveDetailModel(blankRow, blankViews).sourceText, "", "an empty prompt resolves an empty source text, so the section is omitted");
-	// Agent, round, and umbrella selections render no prompt section.
+	// Agent, round, and umbrella selections render no prompt section. The
+	// mutations below are load-bearing: completedExpanded flattens the
+	// settled subtrees so the round find resolves a round row, and the
+	// round override exposes the settled registry agent row the agent
+	// find selects, so either mutation missing fails the kind pins.
 	const state = createExpansionState();
 	state.completedExpanded = true;
 	state.roundOverrides.set("t:task-1:r1", true);
-	const allRows = flattenNavigatorTree(tasks, expandedState);
-	const agentModel = resolveDetailModel(allRows.find((row) => row.kind === "agent"), tasks);
+	const allRows = flattenNavigatorTree(tasks, state);
+	const agentModel = resolveDetailModel(allRows.find((row) => row.agentRef?.source === "registry"), tasks);
+	assert.equal(agentModel.kind, "agent");
 	assert.equal(agentModel.sourceText, "", "agent targets carry no prompt section");
 	const roundModel2 = resolveDetailModel(allRows.find((row) => row.kind === "round"), tasks);
+	assert.equal(roundModel2.kind, "round");
 	assert.equal(roundModel2.sourceText, "", "round targets carry no prompt section");
 	const umbrellaRow2 = allRows.find((row) => row.kind === "umbrella");
 	assert.ok(umbrellaRow2, "the fixture exposes the umbrella row");

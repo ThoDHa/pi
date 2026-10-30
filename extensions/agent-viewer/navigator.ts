@@ -74,6 +74,8 @@ export interface NavigatorTaskView {
 	id: string;
 	source: "registry" | "detached";
 	label: string;
+	/** The assignment's full source text the detail pane's prompt section renders: a registry task carries its whole prompt, a detached job the snapshot's 80-character taskPreview. */
+	sourceText: string;
 	mode: DispatchMode;
 	live: boolean;
 	glyph: StatusGlyphName;
@@ -156,6 +158,7 @@ export function buildNavigatorTasks(registry: DispatchRegistry, jobs: Iterable<D
 			id: task.id,
 			source: "registry",
 			label: resolveTaskLabel(task.prompt) || "(detached)",
+			sourceText: task.prompt,
 			mode: task.mode,
 			live: taskLive,
 			// A live task never carries a settled glyph (done, failed, or
@@ -182,6 +185,7 @@ export function buildNavigatorTasks(registry: DispatchRegistry, jobs: Iterable<D
 			id: job.id,
 			source: "detached",
 			label: resolveTaskLabel(job.taskPreview) || "(detached)",
+			sourceText: job.taskPreview,
 			mode: job.mode,
 			live: job.status === "running",
 			glyph: job.status,
@@ -232,6 +236,31 @@ function settledUmbrellaGlyph(views: NavigatorTaskView[]): StatusGlyphName {
 
 function dispatchCountText(count: number): string {
 	return count === 1 ? "1 dispatch" : `${count} dispatches`;
+}
+
+/**
+ * The task's latest agent activity entry for the task detail pane:
+ * the entry with the greatest `at` across the task's agents (registry
+ * rounds flattened, detached agents direct), last-in-order winning on
+ * equal timestamps and an entry without a finite timestamp competing
+ * as zero. Empty when no agent has streamed activity. A latest entry
+ * the tool-noise filter hides renders nothing, the same contract
+ * agent detail panes follow.
+ */
+function latestAgentActivity(task: NavigatorTaskView): DispatchActivityEntry[] {
+	const agents = task.source === "registry" ? task.rounds.flatMap((round) => round.agents) : task.agents;
+	let latest: DispatchActivityEntry | undefined;
+	let latestAt = 0;
+	for (const agent of agents) {
+		for (const entry of agent.activityLog) {
+			const at = Number.isFinite(entry.at) ? entry.at : 0;
+			if (!latest || at >= latestAt) {
+				latest = entry;
+				latestAt = at;
+			}
+		}
+	}
+	return latest ? [latest] : [];
 }
 
 /**
@@ -404,6 +433,8 @@ export interface NavigatorDetailModel {
 	statusText: string;
 	fields: NavigatorDetailField[];
 	members: NavigatorDetailMember[];
+	/** Task models only: the assignment's full source text the prompt section renders (registry: the whole prompt; detached: the snapshot's 80-character preview). Empty for every other target, which renders no prompt section. */
+	sourceText: string;
 	activity: DispatchActivityEntry[];
 	thinking: DispatchThinkingEntry[];
 	usageText: string | undefined;
@@ -413,7 +444,7 @@ export interface NavigatorDetailModel {
 }
 
 function emptyDetailModel(): NavigatorDetailModel {
-	return { kind: "empty", title: "", statusText: "", fields: [], members: [], activity: [], thinking: [], usageText: undefined, resultText: undefined, runWindow: undefined };
+	return { kind: "empty", title: "", statusText: "", fields: [], members: [], sourceText: "", activity: [], thinking: [], usageText: undefined, resultText: undefined, runWindow: undefined };
 }
 
 function agentResultText(agent: NavigatorAgentView): string | undefined {
@@ -460,6 +491,7 @@ export function resolveDetailModel(row: NavigatorRow | null | undefined, tasks: 
 				label: view.label,
 				detail: `${view.mode} · ${view.durationText}`,
 			})),
+			sourceText: "",
 			activity: [],
 			thinking: [],
 			usageText: undefined,
@@ -492,6 +524,7 @@ export function resolveDetailModel(row: NavigatorRow | null | undefined, tasks: 
 			statusText: agent.status,
 			fields,
 			members: [],
+			sourceText: "",
 			activity: agent.activityLog,
 			thinking: agent.thinkingLog,
 			usageText: agent.usage ? formatUsageSummary(agent.usage) || undefined : undefined,
@@ -517,6 +550,7 @@ export function resolveDetailModel(row: NavigatorRow | null | undefined, tasks: 
 				label: agent.name,
 				detail: agent.activity ? `${agent.activity} · ${agent.durationText}` : agent.durationText,
 			})),
+			sourceText: "",
 			activity: [],
 			thinking: [],
 			usageText: undefined,
@@ -548,7 +582,8 @@ export function resolveDetailModel(row: NavigatorRow | null | undefined, tasks: 
 						label: agent.name,
 						detail: agent.activity ? `${agent.activity} · ${agent.durationText}` : agent.durationText,
 					})),
-		activity: [],
+		sourceText: task.sourceText,
+		activity: latestAgentActivity(task),
 		thinking: [],
 		usageText: undefined,
 		resultText: undefined,
