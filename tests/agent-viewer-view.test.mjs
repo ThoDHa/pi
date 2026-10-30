@@ -84,7 +84,7 @@ import { buildNavigatorTasks, createExpansionState, flattenNavigatorTree, resolv
 // view.ts statically imports @earendil-works/pi-tui, so both its import
 // and the suite's own specifier bindings must wait for the shim provisioning
 // that importPiTui performs.
-const { KeybindingsManager, truncateToWidth, visibleWidth } = await importPiTui();
+const { KeybindingsManager, CURSOR_MARKER, sliceByColumn, truncateToWidth, visibleWidth } = await importPiTui();
 const { NavigatorView, WHEEL_MAX_DELTA_LINES } = await import("../extensions/agent-viewer/view.ts");
 
 const ROWS = 24;
@@ -1850,5 +1850,106 @@ await withView({ registry: createDispatchRegistry(), detachedJobs: [] }, async (
 	});
 }
 // <<< EXT-17 V2
+
+// >>> EXT-19 V2 helpers: the pane geometry render(120) composes against, and ANSI stripping for row-shape pins
+const TREE_W_AT_120 = Math.max(26, Math.floor(120 * 0.44));
+const stripAnsi = (text) => text.replace(/\x1b(\[[0-9;]*[A-Za-z]|\]8;;\x07|_[^\x07]*\x07)/g, "");
+
+// >>> EXT-19 V1: the task detail renders the job's full source text, stable across polls
+{
+	const registry = createDispatchRegistry();
+	const prompt = "Read /home/x/.pi/.tasks/current/EXT-19-20261030-0918-show-what-each-job-is-working-on.md\n\nFollow the Work Log entry EXT-19-1 and log interim progress.";
+	const task = registry.startTask({ mode: "single", prompt, now: 1_000 });
+	registry.startRound(task.id, [{ agent: "worker" }], 1_000);
+	registry.updateAgent(task.id, 1, 0, { activity: mapperLog(40) });
+	await withView({ registry, detachedJobs: [] }, async (view) => {
+		const poll = () => view.refresh();
+		assert.equal(view.selectedId, "t:task-1", "the fixture opens on the task row");
+
+		// The pane follows the activity tail by default, so the prompt section above is clipped.
+
+		// The pane follows the activity tail by default, so the prompt section above is clipped.
+		const tailFrame = view.render(120).join("\n");
+		assert.ok(!tailFrame.includes("Follow the Work Log entry"), "the tail view clips the prompt section above the activity");
+
+		view.handleInput(HOME);
+		const headFrame = view.render(120).join("\n");
+		assert.ok(headFrame.includes("prompt"), "the section label renders below the header");
+		assert.ok(
+			headFrame.indexOf("prompt") < headFrame.indexOf("<dim:Read /home/x/.pi/.tasks/current/EXT-19-20261030"),
+			"the section label sits above its source lines",
+		);
+		assert.ok(
+			headFrame.includes("<dim:Read /home/x/.pi/.tasks/current/EXT-19-20261030-0918-show-what-each-job-is-working-on.md>"),
+			"each source line renders as its own dim pane line",
+		);
+		assert.ok(headFrame.includes("<dim:Follow the Work Log entry EXT-19-1 and log interim progress."), "the last source line renders");
+		assert.ok(headFrame.includes("\u200b"), "a blank source line renders a zero-width space so the paragraph break survives");
+		assert.ok(!headFrame.includes("log line 39"), "the held head view clips the activity tail below");
+
+		// A held window does not drift while the immutable prompt section re-renders on a poll.
+		registry.updateAgent(task.id, 1, 0, { activity: [...mapperLog(40), activityEntry(40, 2_000)] });
+		poll();
+		const stableFrame = view.render(120).join("\n");
+		assert.ok(stableFrame.includes("<dim:Read /home/x/.pi/.tasks/current/EXT-19-20261030"), "the held window stays on the prompt section across the poll");
+		assert.ok(!stableFrame.includes("log line 40"), "the held window stays off the new tail after the poll");
+	}, stubTui(), dimTaggingTheme);
+}
+
+// A task whose source text is empty renders no prompt section.
+{
+	const registry = createDispatchRegistry();
+	const task = registry.startTask({ mode: "single", prompt: "", now: 1_000 });
+	registry.startRound(task.id, [{ agent: "quiet" }], 1_000);
+	registry.updateAgent(task.id, 1, 0, { activity: [{ at: 1_100, kind: "text", text: "quiet note" }] });
+	await withView({ registry, detachedJobs: [] }, async (view) => {
+		assert.equal(view.selectedId, "t:task-1");
+		const frame = view.render(120).join("\n");
+		assert.ok(frame.includes("quiet note"), "the empty-source task still renders its detail pane");
+		assert.ok(!frame.includes("prompt"), "an empty source text renders no prompt section");
+	});
+}
+// <<< EXT-19 V1
+
+// >>> EXT-19 V2: an overlong tree row ends in an honest ellipsis and fits its pane width
+{
+	const registry = createDispatchRegistry();
+	registry.startTask({ mode: "single", prompt: "Summarize the reconciliation report for the fourth quarter and list every mismatch found by the auditor", now: 1_000 });
+	registry.startRound(registry.getTask("task-1").id, [{ agent: "worker" }], 1_000);
+	await withView({ registry, detachedJobs: [] }, async (view) => {
+		assert.equal(view.selectedId, "t:task-1", "the fixture opens on the long-label task row");
+		const frame = view.render(120);
+		const rowLine = frame.find((line) => line.includes("Summarize the reconciliation"));
+		assert.ok(rowLine, "the fixture renders the overlong tree row");
+		const row = stripAnsi(sliceByColumn(rowLine, 0, TREE_W_AT_120));
+		assert.ok(row.trimEnd().endsWith("…"), "the overlong row ends in an honest ellipsis instead of a silent cut");
+		assert.ok(visibleWidth(row.trimEnd()) <= TREE_W_AT_120, "the truncated row fits its pane width");
+		const joined = frame.join("\n");
+		assert.ok(!joined.includes("auditor"), "no continuation of the cut label renders anywhere in the frame");
+		assert.ok(!joined.includes("… +"), "the fixture does not ride the tree-overflow clip");
+		assert.ok(frame[frame.indexOf(rowLine) + 1].includes("round 1"), "the next tree row renders on the following line: one row per row, no wrap continuation");
+	});
+}
+// <<< EXT-19 V2
+
+// >>> EXT-19 V3: the focused selected row's cursor marker survives the ellipsis cut
+{
+	const registry = createDispatchRegistry();
+	registry.startTask({ mode: "single", prompt: "Summarize the reconciliation report for the fourth quarter and list every mismatch found by the auditor", now: 1_000 });
+	registry.startRound(registry.getTask("task-1").id, [{ agent: "worker" }], 1_000);
+	await withView({ registry, detachedJobs: [] }, async (view) => {
+		view.focused = true;
+		assert.equal(view.selectedId, "t:task-1");
+		const frame = view.render(120);
+		const markerLine = frame.find((line) => line.includes(CURSOR_MARKER));
+		assert.ok(markerLine, "the focused selected row renders the cursor marker");
+		assert.ok(frame.join("").split(CURSOR_MARKER).length - 1 === 1, "exactly the selected row carries the marker");
+		const row = stripAnsi(sliceByColumn(markerLine, 0, TREE_W_AT_120));
+		assert.ok(row.trimEnd().endsWith("…"), "the marker rides the truncated row's honest ellipsis");
+		assert.ok(markerLine.indexOf(CURSOR_MARKER) > markerLine.indexOf("…"), "the marker sits after the cut, at the row's end cell");
+		assert.ok(visibleWidth(row.trimEnd()) <= TREE_W_AT_120, "the marker-carrying row still fits its pane width");
+	});
+}
+// <<< EXT-19 V3
 
 console.log("agent-viewer-view: all assertions passed");

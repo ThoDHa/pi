@@ -208,4 +208,128 @@ assert.equal(resolveDetailModel(orphanRow, tasks).kind, "empty", "a row whose ta
 }
 // <<< EXT-17 D1
 
+// >>> EXT-19 D1: a registry task's detail model carries the full prompt text
+{
+	const registry = createDispatchRegistry();
+	const prompt = "Read the task file /home/x/.pi/.tasks/current/EXT-19-20261030-0918-show-what-each-job-is-working-on.md\n\nYour contract is the Work Log entry; log interim progress as you go.";
+	const sourceTask = registry.startTask({ mode: "single", prompt, now: 1_000 });
+	registry.startRound(sourceTask.id, [{ agent: "worker" }], 1_000);
+	const sourceViews = buildNavigatorTasks(registry, [], 2_000);
+	const sourceRow = flattenNavigatorTree(sourceViews, createExpansionState()).find((row) => row.kind === "task");
+	assert.ok(sourceRow, "the fixture exposes the registry task row");
+	const sourceModel = resolveDetailModel(sourceRow, sourceViews);
+	assert.equal(sourceModel.kind, "task");
+	assert.equal(sourceModel.sourceText, prompt, "a registry task's source text is its whole prompt, blank lines included");
+}
+// <<< EXT-19 D1
+
+// >>> EXT-19 D2: a detached job's source text is the snapshot's task preview, as-is
+{
+	const registry = createDispatchRegistry();
+	const previewJob = {
+		id: "job-preview",
+		mode: "single",
+		status: "running",
+		agentNames: ["watcher"],
+		// The snapshot's 80-character cap the producer applies (subagent
+		// index.ts taskPreview): a task-file path truncated mid-date.
+		taskPreview: "Read /home/x/.pi/.tasks/current/EXT-18-20261029-1200-widen-detached-task-prev.md and widen the 80-",
+		startedAt: 1_000,
+	};
+	const previewViews = buildNavigatorTasks(registry, [previewJob], 2_000);
+	const previewRow = flattenNavigatorTree(previewViews, createExpansionState()).find((row) => row.kind === "task");
+	assert.ok(previewRow, "the fixture exposes the detached task row");
+	const previewModel = resolveDetailModel(previewRow, previewViews);
+	assert.equal(previewModel.kind, "task");
+	assert.equal(previewModel.sourceText, previewJob.taskPreview, "a detached job's source text is the snapshot preview, cap included");
+}
+// <<< EXT-19 D2
+
+// >>> EXT-19 D3: empty source text renders no section; non-task targets carry none
+{
+	const registry = createDispatchRegistry();
+	const blankTask = registry.startTask({ mode: "single", prompt: "", now: 1_000 });
+	registry.startRound(blankTask.id, [{ agent: "quiet" }], 1_000);
+	const blankViews = buildNavigatorTasks(registry, [], 2_000);
+	const blankRow = flattenNavigatorTree(blankViews, createExpansionState()).find((row) => row.kind === "task");
+	assert.ok(blankRow, "the fixture exposes the blank-prompt task row");
+	assert.equal(resolveDetailModel(blankRow, blankViews).sourceText, "", "an empty prompt resolves an empty source text, so the section is omitted");
+	// Agent, round, and umbrella selections render no prompt section.
+	const state = createExpansionState();
+	state.completedExpanded = true;
+	state.roundOverrides.set("t:task-1:r1", true);
+	const allRows = flattenNavigatorTree(tasks, expandedState);
+	const agentModel = resolveDetailModel(allRows.find((row) => row.kind === "agent"), tasks);
+	assert.equal(agentModel.sourceText, "", "agent targets carry no prompt section");
+	const roundModel2 = resolveDetailModel(allRows.find((row) => row.kind === "round"), tasks);
+	assert.equal(roundModel2.sourceText, "", "round targets carry no prompt section");
+	const umbrellaRow2 = allRows.find((row) => row.kind === "umbrella");
+	assert.ok(umbrellaRow2, "the fixture exposes the umbrella row");
+	assert.equal(resolveDetailModel(umbrellaRow2, tasks).sourceText, "", "the umbrella target carries no prompt section");
+}
+// <<< EXT-19 D3
+
+// >>> EXT-19 D4: the task detail carries one derived latest-activity entry
+{
+	const registry = createDispatchRegistry();
+	const activityTask = registry.startTask({ mode: "chain", prompt: "Task: EXT-19-4 activity probe", now: 1_000 });
+	registry.startRound(activityTask.id, [{ agent: "first", step: 1 }], 1_000);
+	registry.startRound(activityTask.id, [{ agent: "second", step: 2 }], 2_000);
+	registry.updateAgent(activityTask.id, 1, 0, {
+		activity: [
+			{ at: 5_000, kind: "text", text: "first agent note" },
+			{ at: 7_000, kind: "text", text: "first agent newer" },
+		],
+	});
+	registry.updateAgent(activityTask.id, 2, 0, {
+		activity: [{ at: 6_000, kind: "toolCall", name: "bash", args: { command: "rg beta" }, text: "$ rg beta" }],
+	});
+	const activityViews = buildNavigatorTasks(registry, [], 8_000);
+	const activityRow = flattenNavigatorTree(activityViews, createExpansionState()).find((row) => row.kind === "task");
+	assert.ok(activityRow, "the fixture exposes the activity task row");
+	const activityModel = resolveDetailModel(activityRow, activityViews);
+	assert.equal(activityModel.kind, "task");
+	assert.deepEqual(
+		activityModel.activity,
+		[{ at: 7_000, kind: "text", text: "first agent newer" }],
+		"the greatest-at entry across every round's agents wins, as exactly one entry",
+	);
+
+	// Tie rule: equal timestamps resolve last-in-order across the agents.
+	const tieRegistry = createDispatchRegistry();
+	const tieTask = tieRegistry.startTask({ mode: "single", prompt: "Task: EXT-19-5 tie probe", now: 1_000 });
+	tieRegistry.startRound(tieTask.id, [{ agent: "alpha" }, { agent: "beta" }], 1_000);
+	tieRegistry.updateAgent(tieTask.id, 1, 0, { activity: [{ at: 4_000, kind: "text", text: "alpha entry" }] });
+	tieRegistry.updateAgent(tieTask.id, 1, 1, { activity: [{ at: 4_000, kind: "text", text: "beta entry" }] });
+	const tieViews = buildNavigatorTasks(tieRegistry, [], 5_000);
+	const tieRow = flattenNavigatorTree(tieViews, createExpansionState()).find((row) => row.kind === "task");
+	assert.ok(tieRow, "the fixture exposes the tie task row");
+	assert.deepEqual(resolveDetailModel(tieRow, tieViews).activity, [{ at: 4_000, kind: "text", text: "beta entry" }], "equal timestamps resolve last-in-order");
+
+	// Detached path: the derivation reads the job's agents the same way.
+	const detachedActivity = {
+		id: "job-activity",
+		mode: "single",
+		status: "running",
+		agentNames: ["solo"],
+		taskPreview: "detached activity probe",
+		startedAt: 1_000,
+		agents: [{ agent: "solo", status: "running", startedAt: 1_000, activity: [{ at: 3_500, kind: "thinking", text: "weighing it" }] }],
+	};
+	const detachedViews = buildNavigatorTasks(createDispatchRegistry(), [detachedActivity], 4_000);
+	const detachedRow = flattenNavigatorTree(detachedViews, createExpansionState()).find((row) => row.kind === "task");
+	assert.ok(detachedRow, "the fixture exposes the detached activity row");
+	assert.deepEqual(resolveDetailModel(detachedRow, detachedViews).activity, [{ at: 3_500, kind: "thinking", text: "weighing it" }], "detached agents feed the same derivation");
+
+	// No activity anywhere resolves to no entry, like today.
+	const silentRegistry = createDispatchRegistry();
+	const silentTask = silentRegistry.startTask({ mode: "single", prompt: "Task: EXT-19-6 silence probe", now: 1_000 });
+	silentRegistry.startRound(silentTask.id, [{ agent: "hush" }], 1_000);
+	const silentViews = buildNavigatorTasks(silentRegistry, [], 2_000);
+	const silentRow = flattenNavigatorTree(silentViews, createExpansionState()).find((row) => row.kind === "task");
+	assert.ok(silentRow, "the fixture exposes the silent task row");
+	assert.deepEqual(resolveDetailModel(silentRow, silentViews).activity, [], "a task with no agent activity carries none");
+}
+// <<< EXT-19 D4
+
 console.log("agent-viewer-navigator-detail: all assertions passed");

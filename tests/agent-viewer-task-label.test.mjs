@@ -60,4 +60,37 @@ assert.ok(sliced.endsWith("…"));
 assertFleetLabel("", "");
 assertFleetLabel("   \n\t  ", "");
 
+// >>> EXT-19 L1: a task-file path's date segment does not survive into the label
+// A prompt citing its task file by path (…/EXT-19-20261030-0918-….md) made the
+// greedy reference match capture the filename's date segment (EXT-19-20261030),
+// a span mimicking the EXT-N-M child-id shape that identifies nothing.
+assertFleetLabel(
+	"Read the task file /home/x/.pi/.tasks/current/EXT-19-20261030-0918-show-what-each-job-is-working-on.md; your contract is the Work Log entry",
+	"EXT-19",
+);
+assert.equal(
+	findFleetTaskReference("see /home/x/.pi/.tasks/current/EXT-19-20261030-0918-show-what-each-job-is-working-on.md"),
+	"EXT-19",
+	"the reference primitive strips the date segment too",
+);
+// <<< EXT-19 L1
+
+// >>> EXT-19 L2: a path-cited child keeps its id (green by design: the capture
+// already ends at the child number, so the date-segment strip is a no-op here)
+assertFleetLabel(
+	"Read /home/x/.pi/.tasks/current/EXT-19-1-20261030-0918-collapse-completed-jobs-under-a-completed-umbrella.md and follow it",
+	"EXT-19-1",
+);
+// <<< EXT-19 L2
+
+// >>> EXT-19 L3: plain references and the fallback are untouched by the strip
+assertFleetLabel("Task: EXT-19 execution dispatch for the readability fix", "EXT-19");
+assertFleetLabel("Task: EXT-4-2 checkpoint for the parser", "EXT-4-2");
+// Seven digits is not a filename date: a capture ending in a seven-digit
+// segment keeps its full shape (the normalization's lower boundary).
+assertFleetLabel("sync EXT-5-1234567 with the ledger", "EXT-5-1234567");
+// A bare date-shaped number with no EXT prefix takes the first-words fallback.
+assertFleetLabel("run the 20261030 reconciliation sweep", "run the 20261030 reconciliation sweep");
+// <<< EXT-19 L3
+
 console.log(`agent-viewer-task-label: all assertions passed`);
