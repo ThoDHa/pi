@@ -1,4 +1,4 @@
-# Agent Viewer
+# Periscope
 
 Ambient observation surfaces for subagent dispatches. This is a
 standalone extension: it lives in its own directory under

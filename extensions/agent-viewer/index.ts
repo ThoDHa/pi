@@ -1,5 +1,5 @@
 /**
- * Agent Viewer - ambient observation surfaces for subagent dispatches
+ * Periscope - ambient observation surfaces for subagent dispatches
  *
  * A standalone extension (auto-discovered from its own directory
  * under extensions/, no settings.json edits) that owns everything

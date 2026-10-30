@@ -777,7 +777,7 @@ export class NavigatorView implements Focusable {
 		if (omitted > 0) clipped.push(theme.fg("muted", `… +${omitted} more`));
 
 		const filterState = this.showToolNoise ? "tools shown" : "tools hidden";
-		const header = `${theme.fg("accent", theme.bold("Navigator"))} ${theme.fg("muted", `· ${filterState} · ctrl+t`)}`;
+		const header = `${theme.fg("accent", theme.bold("Periscope"))} ${theme.fg("muted", `· ${filterState} · ctrl+t`)}`;
 		return [header, ...clipped, theme.fg("muted", HINTS_LINE)].map((line) => truncateToWidth(line, width));
 	}
 }
