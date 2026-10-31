@@ -10,11 +10,19 @@
  * longer words), the first-words fallback for unmatched prompts
  * (whitespace collapse, word-boundary fill up to the fixed width,
  * ellipsis suffix, hard slice when a single word exceeds the width),
- * and the empty-prompt edge.
+ * the empty-prompt edge, and the shared helpers that moved here from
+ * navigator.ts/strip.ts (dispatch count wording, settled-glyph
+ * aggregation).
  */
 
 import assert from "node:assert/strict";
-import { findFleetTaskReference, resolveTaskLabel, TASK_LABEL_MAX_WIDTH } from "../extensions/agent-viewer/labels.ts";
+import {
+	aggregateSettledGlyph,
+	dispatchCountText,
+	findFleetTaskReference,
+	resolveTaskLabel,
+	TASK_LABEL_MAX_WIDTH,
+} from "../extensions/agent-viewer/labels.ts";
 
 /** Assert the label is a fleet reference with the expected value. */
 function assertFleetLabel(prompt, expected) {
@@ -92,5 +100,25 @@ assertFleetLabel("sync EXT-5-1234567 with the ledger", "EXT-5-1234567");
 // A bare date-shaped number with no EXT prefix takes the first-words fallback.
 assertFleetLabel("run the 20261030 reconciliation sweep", "run the 20261030 reconciliation sweep");
 // <<< EXT-19 L3
+
+// >>> EXT-18 L1: dispatchCountText moved here verbatim from navigator.ts/strip.ts
+// The singular/plural boundary is the wording the Completed umbrella and the
+// strip's Completed line render.
+assert.equal(dispatchCountText(1), "1 dispatch");
+assert.equal(dispatchCountText(2), "2 dispatches");
+assert.equal(dispatchCountText(0), "0 dispatches");
+// <<< EXT-18 L1
+
+// >>> EXT-18 L2: aggregateSettledGlyph unifies the two settled-glyph aggregations
+// (the navigator's settledUmbrellaGlyph and the strip's aggregateSettledGlyph):
+// done when every view is done, failed when every one is failed, mixed otherwise.
+assert.equal(aggregateSettledGlyph([{ glyph: "done" }, { glyph: "done" }]), "done");
+assert.equal(aggregateSettledGlyph([{ glyph: "failed" }, { glyph: "failed" }]), "failed");
+assert.equal(aggregateSettledGlyph([{ glyph: "done" }, { glyph: "failed" }]), "mixed");
+// The empty input yields "done" through vacuous every truth; unreachable in
+// production (both call sites guard settled.length > 0), pinned as the
+// actual behavior.
+assert.equal(aggregateSettledGlyph([]), "done");
+// <<< EXT-18 L2
 
 console.log(`agent-viewer-task-label: all assertions passed`);
