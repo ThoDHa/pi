@@ -20,7 +20,9 @@
  * mergeAgentUpdate helpers the per-agent activity wiring shares
  * (thinking entries interleaved in stream order, empty and redacted
  * thinking skipped, the shared ACTIVITY_LOG_MAX cap), the
- * formatUsageSummary usage formatter,
+ * formatUsageSummary usage formatter, the formatTaskPreview
+ * single-line task form (whitespace collapse, the 80-character cap,
+ * boundary lengths),
  * per-slot agent nodes on the detached-job snapshot, the
  * replace-by-id detached-snapshot upsert (array identity preserved),
  * and the globalThis-converged shared dispatch state the viewer
@@ -36,6 +38,7 @@ import {
 	extractLastActivity,
 	extractThinkingEntries,
 	extractThinkingLog,
+	formatTaskPreview,
 	formatUsageSummary,
 	getSharedDispatchState,
 	mergeAgentUpdate,
@@ -518,6 +521,28 @@ assert.equal(
 	formatUsageSummary({ input: 500, output: 200, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 }),
 	"1 turn ↑500 ↓200",
 );
+
+// --- formatTaskPreview: the one-line task form single-line status surfaces derive ---
+
+assert.equal(
+	formatTaskPreview("Read\n\tthe  file\t and report\n back"),
+	"Read the file and report back",
+	"runs of whitespace including newlines and tabs collapse to single spaces",
+);
+assert.equal(formatTaskPreview(""), "", "empty input stays empty");
+const longTask = "Sweep the ruins and report every finding back to the coordinator with full context attached".repeat(2);
+assert.equal(longTask.length, 182, "the long fixture exceeds the cap so the slice is exercised");
+assert.equal(formatTaskPreview(longTask).length, 80, "the one-line form is capped at 80 characters");
+assert.equal(formatTaskPreview(longTask), formatTaskPreview(longTask.slice(0, 80)), "the cap slice keeps the first 80 characters");
+for (const boundaryLength of [79, 80, 81]) {
+	const boundaryTask = "x".repeat(boundaryLength);
+	const expected = boundaryTask.slice(0, 80);
+	assert.equal(
+		formatTaskPreview(boundaryTask),
+		expected,
+		`a ${boundaryLength}-character task renders ${expected.length} characters (79/80 unchanged, 81 sliced)`,
+	);
+}
 
 // --- getSharedDispatchState: one globalThis-converged state ---
 
