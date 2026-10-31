@@ -733,4 +733,66 @@ assert.equal(moveCursor([], 0, 1), 0, "moving on an empty tree stays at index 0"
 }
 // <<< EXT-17 T9
 
+// >>> EXT-21 T1: the cursor path crosses the expanded umbrella in both directions
+{
+	const umbrellaRegistry = createDispatchRegistry();
+	const liveTask = umbrellaRegistry.startTask({ mode: "single", prompt: "Task: EXT-21-1 live probe", now: 1_000 });
+	umbrellaRegistry.startRound(liveTask.id, [{ agent: "busy" }], 1_000);
+	const doneTask = umbrellaRegistry.startTask({ mode: "single", prompt: "Task: EXT-21-1 done probe", now: 2_000 });
+	umbrellaRegistry.startRound(doneTask.id, [{ agent: "early" }], 2_000);
+	umbrellaRegistry.updateAgent(doneTask.id, 1, 0, { status: "done", finishedAt: 3_000 });
+	const failedJob = {
+		id: "job-failed",
+		mode: "single",
+		status: "failed",
+		agentNames: ["ghost"],
+		taskPreview: "for EXT-21-2 sweep the ruins",
+		startedAt: 1_000,
+		finishedAt: 4_000,
+	};
+	const umbrellaTasks = buildNavigatorTasks(umbrellaRegistry, [failedJob], 5_000);
+	const expandedState = createExpansionState();
+	expandedState.completedExpanded = true;
+	expandedState.roundOverrides.set(`t:${doneTask.id}:r1`, true);
+	const expandedRows = flattenNavigatorTree(umbrellaTasks, expandedState);
+	assert.deepEqual(
+		expandedRows.map((row) => row.id),
+		[
+			"t:task-1",
+			"t:task-1:r1",
+			"t:task-1:r1:a0",
+			"u:completed",
+			`t:${doneTask.id}`,
+			`t:${doneTask.id}:r1`,
+			`t:${doneTask.id}:r1:a0`,
+			"t:job-failed",
+			"t:job-failed:a0",
+		],
+		"the expanded fixture lays out the live rows, the umbrella, and the settled member rows in that order",
+	);
+	const rowIdAt = (index) => expandedRows[index].id;
+	let cursor = expandedRows.findIndex((row) => row.id === "t:task-1:r1:a0");
+	const step = (delta) => {
+		cursor = moveCursor(expandedRows, cursor, delta);
+		return rowIdAt(cursor);
+	};
+	assert.equal(step(1), "u:completed", "down from the last live row lands on the umbrella row");
+	assert.equal(step(1), `t:${doneTask.id}`, "down from the umbrella lands on the settled task header");
+	assert.equal(step(1), `t:${doneTask.id}:r1`, "down walks the settled round row");
+	assert.equal(step(1), `t:${doneTask.id}:r1:a0`, "down walks the settled agent row");
+	assert.equal(step(1), "t:job-failed", "down walks the settled detached job header");
+	assert.equal(step(1), "t:job-failed:a0", "down walks the settled detached agent row");
+	assert.equal(step(1), "t:job-failed:a0", "down from the last visible row stays clamped on it");
+	assert.equal(step(-1), "t:job-failed", "up from the deepest settled member row walks back to the detached job header");
+	assert.equal(step(-1), `t:${doneTask.id}:r1:a0`, "up walks the settled agent row");
+	assert.equal(step(-1), `t:${doneTask.id}:r1`, "up walks the settled round row");
+	assert.equal(step(-1), `t:${doneTask.id}`, "up walks the settled task header");
+	assert.equal(step(-1), "u:completed", "up from the settled task header lands back on the umbrella row");
+	assert.equal(step(-1), "t:task-1:r1:a0", "up from the umbrella returns to the last live row");
+	assert.equal(step(-1), "t:task-1:r1", "up walks the live round row");
+	assert.equal(step(-1), "t:task-1", "up walks the live task header");
+	assert.equal(step(-1), "t:task-1", "up from the first row stays clamped on it");
+}
+// <<< EXT-21 T1
+
 console.log("agent-viewer-navigator-tree: all assertions passed");
