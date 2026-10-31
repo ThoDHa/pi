@@ -13,7 +13,7 @@
  * pin the tree behavior directly.
  */
 
-import { resolveTaskLabel } from "./labels.ts";
+import { aggregateSettledGlyph, dispatchCountText, resolveTaskLabel } from "./labels.ts";
 import {
 	type ActivityMessage,
 	type DetachedJobSnapshot,
@@ -227,17 +227,6 @@ export interface NavigatorRow {
 	agentRef?: NavigatorAgentRef;
 }
 
-/** The umbrella's aggregated glyph over the settled views: done when every settled view is done, failed when every one is failed, mixed otherwise. */
-function settledUmbrellaGlyph(views: NavigatorTaskView[]): StatusGlyphName {
-	if (views.every((view) => view.glyph === "done")) return "done";
-	if (views.every((view) => view.glyph === "failed")) return "failed";
-	return "mixed";
-}
-
-function dispatchCountText(count: number): string {
-	return count === 1 ? "1 dispatch" : `${count} dispatches`;
-}
-
 /**
  * The task's latest agent activity entry for the task detail pane:
  * the entry with the greatest `at` across the task's agents (registry
@@ -361,7 +350,7 @@ export function flattenNavigatorTree(tasks: NavigatorTaskView[], state: Navigato
 			taskOrder: tasks.length - settled.length,
 			taskId: "completed",
 			live: false,
-			glyph: settledUmbrellaGlyph(settled),
+			glyph: aggregateSettledGlyph(settled),
 			label: "Completed",
 			detail: dispatchCountText(settled.length),
 		});
@@ -484,7 +473,7 @@ export function resolveDetailModel(row: NavigatorRow | null | undefined, tasks: 
 		return {
 			kind: "umbrella",
 			title: "Completed",
-			statusText: settledUmbrellaGlyph(settled),
+			statusText: aggregateSettledGlyph(settled),
 			fields: [{ label: "dispatches", value: String(settled.length) }],
 			members: settled.map((view) => ({
 				glyph: view.glyph,

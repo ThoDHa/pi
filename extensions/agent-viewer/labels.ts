@@ -1,11 +1,16 @@
 /**
- * Dispatch task-label heuristic
+ * Shared agent-viewer presentation helpers
  *
  * A dispatch carries no task-ID field, only its prompt text, so the
  * label for a task node is parsed from that text: the first fleet
  * task reference (EXT-N or EXT-N-M) when the prompt carries one, the
- * prompt's first words up to a fixed width otherwise.
+ * prompt's first words up to a fixed width otherwise. Alongside the
+ * label heuristic this module hosts the helpers the navigator and
+ * strip surfaces share: the settled-dispatch count wording and the
+ * settled-glyph aggregation over outcome glyphs.
  */
+
+import type { StatusGlyphName } from "../subagent/registry.ts";
 
 /** Fixed upper width for first-words fallback labels, ellipsis included. */
 export const TASK_LABEL_MAX_WIDTH = 60;
@@ -56,4 +61,28 @@ export function resolveTaskLabel(prompt: string): string {
 	}
 	if (!filled) filled = collapsed.slice(0, TASK_LABEL_MAX_WIDTH - ellipsis.length);
 	return `${filled}${ellipsis}`;
+}
+
+/**
+ * Aggregated glyph over settled task views: done when every view's
+ * glyph is done, failed when every one is failed, mixed otherwise.
+ * The structural parameter serves both the navigator's
+ * NavigatorTaskView and the strip's StripTaskView without coupling
+ * this module to either; the flatten and strip callers guard a
+ * non-empty list, while the detail caller receives the umbrella row
+ * only when the settled partition is non-empty (an empty list
+ * vacuously yields "done").
+ */
+export function aggregateSettledGlyph(views: readonly { glyph: StatusGlyphName }[]): StatusGlyphName {
+	if (views.every((view) => view.glyph === "done")) return "done";
+	if (views.every((view) => view.glyph === "failed")) return "failed";
+	return "mixed";
+}
+
+/**
+ * Dispatch-count wording for the Completed surfaces: "1 dispatch" in
+ * the singular, "N dispatches" otherwise.
+ */
+export function dispatchCountText(count: number): string {
+	return count === 1 ? "1 dispatch" : `${count} dispatches`;
 }

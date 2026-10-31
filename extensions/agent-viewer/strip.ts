@@ -15,7 +15,7 @@
  * pin the budget and glyph behavior directly.
  */
 
-import { resolveTaskLabel } from "./labels.ts";
+import { aggregateSettledGlyph, dispatchCountText, resolveTaskLabel } from "./labels.ts";
 import {
 	type DetachedJobSnapshot,
 	type DispatchAgentNode,
@@ -145,17 +145,6 @@ export function renderStripLines(
 	if (lines.length <= maxContent) return [...lines, hintLine];
 	const omitted = lines.length - maxContent;
 	return [...lines.slice(0, maxContent), { segments: [{ text: `+${omitted} more`, color: "muted" }] }, hintLine];
-}
-
-/** The Completed glyph over the settled views' own outcome glyphs: done when all are done, failed when all are failed, mixed otherwise. */
-function aggregateSettledGlyph(views: StripTaskView[]): StatusGlyphName {
-	if (views.every((view) => view.glyph === "done")) return "done";
-	if (views.every((view) => view.glyph === "failed")) return "failed";
-	return "mixed";
-}
-
-function dispatchCountText(count: number): string {
-	return count === 1 ? "1 dispatch" : `${count} dispatches`;
 }
 
 function roundStatus(round: DispatchRoundNode): StatusGlyphName {
