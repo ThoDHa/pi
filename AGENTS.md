@@ -1,6 +1,6 @@
 # User Instructions (AGENTS.md)
 
-Generated from the dotfiles opencode rules by `make sync-agents-md`; verify with `make test-agents-md`. Source of truth: `~/.config/opencode/rules/core.md`, `coding-standards.md`, `execution-standards.md`, and `qhaway-memory.md`; the four sections below are their full verbatim text in that order.
+Generated from the dotfiles opencode rules by `make sync-agents-md`; verify with `make test-agents-md`. Source of truth: `~/.config/opencode/rules/core.md`, `coding-standards.md`, `execution-standards.md`, and `qhaway-memory.md`; the four sections below are their full verbatim text in that order. This single artifact serves pi directly and Claude Code through the `~/.claude/CLAUDE.md` symlink; memory or content edits belong in the opencode rules source files, never in this generated artifact.
 
 # Core Behavioral Requirements
 
@@ -364,6 +364,12 @@ Broader behavioral standards in [`core.md`](core.md) govern task execution uncha
 The reset time in a provider rate-limit error reflects the provider's timezone, not the user's local time. Implementations MUST NOT interpret it as local time, MUST NOT schedule waits or plan work around it, MUST NOT claim quota is fresh based on it, and MUST NOT present it as a local time.
 
 When a rate limit must be reported, implementations quote the error's wording without converting or acting on the timestamp.
+
+### Detached Operations and Completion Notifications
+
+When an operation runs detached or in the background (a dispatched subagent, a shell script or command started detached, and similar) and the harness delivers a completion notification for it, implementations MUST NOT poll its state (repeated status checks, sleep-and-recheck loops, or other progress probing) and MUST NOT block the session waiting for it: the completion notification arrives on its own, other work continues until it does, and dependent work resumes on its arrival.
+
+The rule assumes that notification system exists: where the harness provides no completion notification for a detached operation, that operation runs in the foreground and is observed directly.
 
 ---
 
