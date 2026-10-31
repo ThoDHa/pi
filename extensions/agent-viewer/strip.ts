@@ -66,6 +66,7 @@ export interface StripTaskView {
 	live: boolean;
 	/** The task's own outcome glyph: running while live, the settled aggregation otherwise; the Completed line aggregates this field over the settled views. */
 	glyph: StatusGlyphName;
+	/** Settled views' entries are a model-level contract only: renderStripLines reads settled views' glyph and length only. */
 	entries: StripEntry[];
 }
 
