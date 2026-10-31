@@ -294,6 +294,7 @@ export interface DetachedJobSnapshot {
 	mode: DispatchMode;
 	status: DispatchAgentStatus;
 	agentNames: string[];
+	/** The assignment's full first-step task text, line breaks preserved (registry parity); single-line status surfaces derive their compact form through formatTaskPreview. */
 	taskPreview: string;
 	startedAt: number;
 	finishedAt?: number;
@@ -411,6 +412,20 @@ export function formatUsageSummary(usage: {
 	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
 	if (usage.contextTokens && usage.contextTokens > 0) parts.push(`ctx:${formatTokenCount(usage.contextTokens)}`);
 	return parts.join(" ");
+}
+
+const TASK_PREVIEW_MAX_CHARS = 80;
+
+/**
+ * One-line task form for single-line status surfaces (the jobs tool's
+ * status line): runs of whitespace, including newlines and tabs,
+ * collapse to single spaces, then the line is capped at
+ * TASK_PREVIEW_MAX_CHARS. Pure, so plain-node suites pin it directly;
+ * the detached snapshot's taskPreview field itself stays the raw full
+ * text so multi-line surfaces keep the assignment's true shape.
+ */
+export function formatTaskPreview(task: string): string {
+	return task.replace(/\s+/g, " ").slice(0, TASK_PREVIEW_MAX_CHARS);
 }
 
 /** Structural subset of a streamed message, so pi message types satisfy it without an import. */

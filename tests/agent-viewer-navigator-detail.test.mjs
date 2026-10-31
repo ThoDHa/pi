@@ -228,17 +228,18 @@ assert.equal(resolveDetailModel(orphanRow, tasks).kind, "empty", "a row whose ta
 }
 // <<< EXT-19 D1
 
-// >>> EXT-19 D2: a detached job's source text is the snapshot's task preview, as-is
+// >>> EXT-19 D2, re-anchored by EXT-20: a detached job's source text is the snapshot's full task text, line breaks included
 {
 	const registry = createDispatchRegistry();
+	const taskText = "Read the task file /home/x/.pi/.tasks/current/EXT-20-20261030-1555-widen-the-detached-task-preview-cap.md\n\nYour contract is the approved plan; carry the full first-step task in the snapshot, line breaks preserved.";
 	const previewJob = {
 		id: "job-preview",
 		mode: "single",
 		status: "running",
 		agentNames: ["watcher"],
-		// The snapshot's 80-character cap the producer applies (subagent
-		// index.ts taskPreview): a task-file path truncated mid-date.
-		taskPreview: "Read /home/x/.pi/.tasks/current/EXT-18-20261029-1200-widen-detached-task-prev.md and widen the 80-",
+		// The producer's full first-step task (subagent index.ts
+		// taskPreview): no whitespace collapse, no 80-character slice.
+		taskPreview: taskText,
 		startedAt: 1_000,
 	};
 	const previewViews = buildNavigatorTasks(registry, [previewJob], 2_000);
@@ -246,7 +247,7 @@ assert.equal(resolveDetailModel(orphanRow, tasks).kind, "empty", "a row whose ta
 	assert.ok(previewRow, "the fixture exposes the detached task row");
 	const previewModel = resolveDetailModel(previewRow, previewViews);
 	assert.equal(previewModel.kind, "task");
-	assert.equal(previewModel.sourceText, previewJob.taskPreview, "a detached job's source text is the snapshot preview, cap included");
+	assert.equal(previewModel.sourceText, taskText, "a detached job's source text is the snapshot's full task text, line breaks included");
 }
 // <<< EXT-19 D2
 

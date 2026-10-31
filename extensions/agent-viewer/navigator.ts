@@ -74,7 +74,7 @@ export interface NavigatorTaskView {
 	id: string;
 	source: "registry" | "detached";
 	label: string;
-	/** The assignment's full source text the detail pane's prompt section renders: a registry task carries its whole prompt, a detached job the snapshot's 80-character taskPreview. */
+	/** The assignment's full source text the detail pane's prompt section renders: a registry task carries its whole prompt, a detached job the snapshot's full taskPreview (line breaks preserved). */
 	sourceText: string;
 	mode: DispatchMode;
 	live: boolean;
@@ -422,7 +422,7 @@ export interface NavigatorDetailModel {
 	statusText: string;
 	fields: NavigatorDetailField[];
 	members: NavigatorDetailMember[];
-	/** Task models only: the assignment's full source text the prompt section renders (registry: the whole prompt; detached: the snapshot's 80-character preview). Empty for every other target, which renders no prompt section. */
+	/** Task models only: the assignment's full source text the prompt section renders (registry: the whole prompt; detached: the snapshot's full task text). Empty for every other target, which renders no prompt section. */
 	sourceText: string;
 	activity: DispatchActivityEntry[];
 	thinking: DispatchThinkingEntry[];

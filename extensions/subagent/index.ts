@@ -40,6 +40,7 @@ import {
 	extractLastActivity,
 	extractThinkingLog,
 	formatDuration,
+	formatTaskPreview,
 	formatUsageSummary,
 	getSharedDispatchState,
 	mergeAgentUpdate,
@@ -566,7 +567,7 @@ function createDetachedJob(id: string, mode: DetachedJob["mode"], steps: Dispatc
 	const done = new Promise<void>((resolve) => {
 		resolveDone = resolve;
 	});
-	const taskPreview = steps[0]?.task.replace(/\s+/g, " ").slice(0, 80) ?? "";
+	const taskPreview = steps[0]?.task ?? "";
 	return {
 		id,
 		mode,
@@ -789,7 +790,7 @@ function jobResultMessage(job: DetachedJob): string {
 
 function formatJobStatusLine(job: DetachedJob): string {
 	const state = job.status === "running" ? `running ${jobElapsed(job)}` : `ran ${jobElapsed(job)}`;
-	let line = `${statusGlyph(job.status)} ${job.id} [${job.status}] ${job.agentNames.join(", ")} (${job.mode}): ${state}; task: ${job.taskPreview || "..."}`;
+	let line = `${statusGlyph(job.status)} ${job.id} [${job.status}] ${job.agentNames.join(", ")} (${job.mode}): ${state}; task: ${formatTaskPreview(job.taskPreview) || "..."}`;
 	if (job.status === "running") return line;
 	line += job.collected ? "; collected" : "; output ready, collect with jobs wait";
 	if (job.status === "failed" && job.error) line += `; error: ${job.error.slice(0, JOB_ERROR_PREVIEW_CHARS)}`;
