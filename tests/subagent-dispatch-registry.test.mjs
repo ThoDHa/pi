@@ -533,7 +533,7 @@ assert.equal(formatTaskPreview(""), "", "empty input stays empty");
 const longTask = "Sweep the ruins and report every finding back to the coordinator with full context attached".repeat(2);
 assert.equal(longTask.length, 182, "the long fixture exceeds the cap so the slice is exercised");
 assert.equal(formatTaskPreview(longTask).length, 80, "the one-line form is capped at 80 characters");
-assert.equal(formatTaskPreview(longTask), formatTaskPreview(longTask.slice(0, 80)), "the cap slice keeps the first 80 characters");
+assert.equal(formatTaskPreview(longTask), longTask.slice(0, 80), "the cap slice keeps the first 80 characters");
 for (const boundaryLength of [79, 80, 81]) {
 	const boundaryTask = "x".repeat(boundaryLength);
 	const expected = boundaryTask.slice(0, 80);
