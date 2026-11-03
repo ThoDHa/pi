@@ -65,6 +65,8 @@ export interface StripTaskView {
 	live: boolean;
 	/** The task's own outcome glyph: running while live, the settled aggregation otherwise; each settled summary line renders it. */
 	glyph: StatusGlyphName;
+	/** The view's settle time: a registry task's latest finite agent finish, a detached job's finishedAt, null when neither carries a finite timestamp. Settled views order the settled block by it, newest first; a view without one keeps its exact insertion slot; live views carry it unread. */
+	settledAt: number | null;
 	/** Task start to its latest finish (now while live); rendered on the settled summary line. */
 	durationText: string;
 	/** Settled views' entries are a model-level contract only: renderStripLines reads settled views' glyph, label, and durationText only. */
@@ -78,6 +80,33 @@ export const GLYPH_COLORS: Record<StatusGlyphName, StripColor> = {
 	failed: "error",
 	mixed: "warning",
 };
+
+/** A settled view whose task carries a finite settle time. */
+interface TimestampedTaskView extends StripTaskView {
+	settledAt: number;
+}
+
+function hasSettleTime(view: StripTaskView): view is TimestampedTaskView {
+	return view.settledAt !== null;
+}
+
+/**
+ * Order the settled block newest-first by settle time. A view without
+ * a finite settle time keeps its exact insertion slot: the timestamped
+ * views fill the remaining slots newest first around it, so the
+ * stamp-less view neither drifts nor blocks its neighbors' order.
+ */
+function orderSettledViews(tasks: StripTaskView[]): StripTaskView[] {
+	const timestamped = tasks.filter(hasSettleTime);
+	timestamped.sort((a, b) => b.settledAt - a.settledAt);
+	const ordered: StripTaskView[] = [];
+	let nextTimestamped = 0;
+	for (const task of tasks) {
+		if (hasSettleTime(task)) ordered.push(timestamped[nextTimestamped++]);
+		else ordered.push(task);
+	}
+	return ordered;
+}
 
 function agentEntryLine(entry: StripAgentEntry): StripLine {
 	return {
@@ -104,11 +133,12 @@ function roundEntryLine(entry: StripRoundEntry): StripLine {
  * Render the strip's lines under the line budget. Live tasks render
  * before the settled group, and each settled dispatch renders one
  * summary line of its own (its own outcome glyph, its summary label,
- * its duration) closing the content; the hint line is always last;
- * when content exceeds maxLines minus the overflow and hint
- * reservations, the tail is summarized as one "+N more" line
- * (N = omitted content lines), which cuts finished content first
- * because live content leads.
+ * its duration) closing the content; the settled group orders
+ * newest-first by settle time, so the budget's tail cut drops the
+ * oldest settled lines first while live content still leads; the hint
+ * line is always last; when content exceeds maxLines minus the
+ * overflow and hint reservations, the tail is summarized as one
+ * "+N more" line (N = omitted content lines).
  */
 export function renderStripLines(
 	tasks: StripTaskView[],
@@ -132,7 +162,7 @@ export function renderStripLines(
 			lines.push(entry.kind === "agent" ? agentEntryLine(entry) : roundEntryLine(entry));
 		}
 	}
-	const settled = tasks.filter((task) => !task.live);
+	const settled = orderSettledViews(tasks.filter((task) => !task.live));
 	for (const task of settled) {
 		lines.push({
 			segments: [
@@ -203,7 +233,10 @@ function aggregateNodeGlyph(nodes: readonly DispatchAgentNode[]): StatusGlyphNam
  * aggregation of its agents' outcomes, and every view derives its
  * durationText the way the navigator's task view does (registry tasks
  * from task start to the latest agent finish, now while live; detached
- * jobs from start to finishedAt, now while running). A
+ * jobs from start to finishedAt, now while running). Every view also
+ * carries its settle time (a registry task's latest finite agent
+ * finish, a detached job's finishedAt, null when neither exists),
+ * which orders the settled block newest-first at render time. A
  * detached job becomes one task view labeled through the same
  * summary chain as blocking tasks. Its per-slot
  * agent nodes (the EXT-1-3 wiring) stream per-agent
@@ -229,11 +262,15 @@ export function buildStripTasks(
 		for (const round of finishedRounds) entries.push(collapsedRoundEntry(round, now));
 		const allAgents = task.rounds.flatMap((round) => round.agents);
 		const finishTimes = allAgents.map((agent) => agent.finishedAt ?? now);
+		const finishStamps = allAgents
+			.map((agent) => agent.finishedAt)
+			.filter((stamp): stamp is number => typeof stamp === "number");
 		views.push({
 			label: resolveTaskDisplayLabel(task.prompt),
 			mode: task.mode,
 			live,
 			glyph: live ? "running" : aggregateNodeGlyph(allAgents),
+			settledAt: finishStamps.length > 0 ? Math.max(...finishStamps) : null,
 			durationText: formatDuration((finishTimes.length > 0 ? Math.max(...finishTimes) : now) - task.startedAt),
 			entries,
 		});
@@ -249,6 +286,7 @@ export function buildStripTasks(
 			mode: job.mode,
 			live: job.status === "running",
 			glyph: job.status,
+			settledAt: typeof job.finishedAt === "number" ? job.finishedAt : null,
 			durationText: formatDuration(fallbackEnd - job.startedAt),
 			entries,
 		});

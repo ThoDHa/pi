@@ -559,6 +559,18 @@ assert.equal(emptyView.entries.length, 0);
 	assert.equal(mixedStampViews[1].settledAt, 40_000, "a settled detached job's settle time is its finishedAt");
 	const mixedStampLines = renderStripLines(mixedStampViews, { hint: "hint" });
 	assert.ok(lineContains(mixedStampLines[0], "no finish stamp"), "a view with no finite settle time keeps its settled insertion position");
+
+	// The three-view arrangement pins the frozen-slot semantics: a
+	// timestamp-less view between two timestamped ones keeps its exact
+	// insertion slot while the timestamped views fill the remaining
+	// slots newest-first, a case a pairwise-tie reading renders wrong.
+	const stampFirst = { label: "stamp first", mode: "single", live: false, glyph: "done", settledAt: 100, durationText: "1s", entries: [] };
+	const stamplessMiddle = { label: "stampless middle", mode: "single", live: false, glyph: "done", settledAt: null, durationText: "1s", entries: [] };
+	const stampLast = { label: "stamp last", mode: "single", live: false, glyph: "done", settledAt: 200, durationText: "1s", entries: [] };
+	const frozenLines = renderStripLines([stampFirst, stamplessMiddle, stampLast], { hint: "hint" });
+	assert.ok(lineContains(frozenLines[0], "stamp last"), "the newest settle time fills the first free slot around a timestamp-less view");
+	assert.ok(lineContains(frozenLines[1], "stampless middle"), "a timestamp-less view keeps its exact insertion slot");
+	assert.ok(lineContains(frozenLines[2], "stamp first"), "the older timestamped view fills the slot after the timestamp-less view");
 }
 // <<< EXT-22 O1
 

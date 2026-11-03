@@ -2,12 +2,16 @@
  * Shared agent-viewer presentation helpers
  *
  * A dispatch carries no task-ID field, only its prompt text, so the
- * label for a task node is parsed from that text: the first fleet
- * task reference (EXT-N or EXT-N-M) when the prompt carries one, the
- * prompt's first words up to a fixed width otherwise. Alongside the
- * label heuristic this module hosts the helpers the navigator and
- * strip surfaces share: the settled-dispatch count wording and the
- * settled-glyph aggregation over outcome glyphs.
+ * label for a task node is parsed from that text through the
+ * display-label chain both surfaces render (resolveTaskSummary,
+ * resolveTaskLabel, resolveTaskDisplayLabel): the first task-file
+ * citation's id plus slug summary when the prompt cites one, the
+ * first fleet task reference (EXT-N or EXT-N-M) or the prompt's
+ * first words up to a fixed width otherwise, and "(detached)" when
+ * both come up empty. Alongside the label resolvers this module hosts
+ * the helpers the navigator and strip surfaces share: the
+ * settled-dispatch count wording and the settled-glyph aggregation
+ * over outcome glyphs.
  */
 
 import type { StatusGlyphName } from "../subagent/registry.ts";
