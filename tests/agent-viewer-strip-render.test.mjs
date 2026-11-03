@@ -9,7 +9,9 @@
  * always last, live tasks prioritized before the settled summary
  * lines (EXT-22: one summary line per settled dispatch carrying its
  * own glyph, summary label, and duration, replacing the aggregated
- * Completed line), the
+ * Completed line; the settled block ordered newest-first by settle
+ * time, ties and views without a finite settle time keeping their
+ * insertion position), the
  * "+N more" overflow summary (content lines are capped at maxLines minus the overflow and hint reservations), the
  * no-dispatch placeholder, the glyph/color conventions shared
  * with the blocking path, and render-time task-label derivation from
@@ -59,6 +61,7 @@ const liveTask = {
 	mode: "parallel",
 	live: true,
 	glyph: "running",
+	settledAt: null,
 	entries: [
 		{ kind: "agent", name: "worker", glyph: "running", durationText: "45s" },
 		{ kind: "agent", name: "scout", glyph: "done", durationText: "1m2s" },
@@ -91,6 +94,7 @@ const failedTask = {
 	mode: "single",
 	live: true,
 	glyph: "running",
+	settledAt: null,
 	entries: [{ kind: "agent", name: "worker", glyph: "failed", durationText: "5s" }],
 };
 const failedLines = renderStripLines([failedTask], { hint: "hint" });
@@ -103,6 +107,7 @@ const finishedTask = {
 	mode: "single",
 	live: false,
 	glyph: "done",
+	settledAt: null,
 	durationText: "9s",
 	entries: [{ kind: "agent", name: "scout", glyph: "done", durationText: "9s" }],
 };
@@ -120,6 +125,7 @@ const collapsedRound = {
 	mode: "chain",
 	live: true,
 	glyph: "running",
+	settledAt: null,
 	entries: [{ kind: "round", label: "round 1", glyph: "done", summary: "1/1 done", durationText: "2m" }],
 };
 const collapsedLines = renderStripLines([collapsedRound], { hint: "hint" });
@@ -142,6 +148,7 @@ const bigTask = {
 	mode: "parallel",
 	live: true,
 	glyph: "running",
+	settledAt: null,
 	entries: Array.from({ length: 20 }, (_, i) => ({
 		kind: "agent",
 		name: `agent-${i}`,
@@ -163,6 +170,7 @@ const exactTask = {
 	mode: "single",
 	live: true,
 	glyph: "running",
+	settledAt: null,
 	entries: Array.from({ length: 9 }, (_, i) => ({ kind: "agent", name: `a${i}`, glyph: "done", durationText: "1s" })),
 };
 const exactLines = renderStripLines([exactTask], { hint: "hint", maxLines: 12 });
@@ -252,6 +260,7 @@ assert.equal(detachedFailedView.label, "scout the repo", "detached labels fall b
 assert.equal(detachedFailedView.live, false);
 assert.equal(detachedFailedView.entries[0].glyph, "failed", "detached glyph keys off job.status");
 assert.equal(detachedFailedView.entries[0].durationText, "30s", "finished detached duration = finishedAt - startedAt");
+assert.equal(detachedFailedView.settledAt, 60_000, "a settled detached view's settle time is its finishedAt");
 
 const detachedBlankView = views[3];
 assert.equal(detachedBlankView.label, "(detached)", "an empty taskPreview falls back to (detached) instead of a bare header");
@@ -356,8 +365,8 @@ assert.equal(emptyView.entries.length, 0);
 
 // >>> EXT-17 S1, adapted by EXT-22: the settled dispatch's summary line renders after the live block
 {
-	const stripLive = { label: "EXT-17-1", mode: "parallel", live: true, glyph: "running", entries: [{ kind: "agent", name: "worker", glyph: "running", durationText: "5s" }] };
-	const stripSettled = { label: "EXT-17-1 earlier", mode: "single", live: false, glyph: "done", durationText: "2s", entries: [{ kind: "agent", name: "scout", glyph: "done", durationText: "2s" }] };
+	const stripLive = { label: "EXT-17-1", mode: "parallel", live: true, glyph: "running", settledAt: null, entries: [{ kind: "agent", name: "worker", glyph: "running", durationText: "5s" }] };
+	const stripSettled = { label: "EXT-17-1 earlier", mode: "single", live: false, glyph: "done", settledAt: null, durationText: "2s", entries: [{ kind: "agent", name: "scout", glyph: "done", durationText: "2s" }] };
 	const completedLines = renderStripLines([stripLive, stripSettled], { hint: "hint" });
 	assert.ok(lineContains(completedLines[0], "EXT-17-1"), "the live block still leads");
 	assert.equal(completedLines[2].segments[0].text, "✓", "the settled line opens with the settled view's own glyph");
@@ -374,7 +383,7 @@ assert.equal(emptyView.entries.length, 0);
 
 // >>> EXT-17 S2, adapted by EXT-22: a settled-only strip shows its summary line instead of the placeholder
 {
-	const stripSettled = { label: "only settled", mode: "single", live: false, glyph: "done", durationText: "2s", entries: [{ kind: "agent", name: "scout", glyph: "done", durationText: "2s" }] };
+	const stripSettled = { label: "only settled", mode: "single", live: false, glyph: "done", settledAt: null, durationText: "2s", entries: [{ kind: "agent", name: "scout", glyph: "done", durationText: "2s" }] };
 	const settledOnlyLines = renderStripLines([stripSettled], { hint: "hint" });
 	assert.equal(settledOnlyLines.length, 2, "the settled-only strip is its summary line plus the hint");
 	assert.ok(lineContains(settledOnlyLines[0], "only settled"), "the settled dispatch's summary line replaces the no-dispatch placeholder");
@@ -387,7 +396,7 @@ assert.equal(emptyView.entries.length, 0);
 
 // >>> EXT-17 S3: the no-settled guard (unchanged render)
 {
-	const liveOnly = { label: "EXT-17-1", mode: "single", live: true, glyph: "running", entries: [{ kind: "agent", name: "worker", glyph: "running", durationText: "5s" }] };
+	const liveOnly = { label: "EXT-17-1", mode: "single", live: true, glyph: "running", settledAt: null, entries: [{ kind: "agent", name: "worker", glyph: "running", durationText: "5s" }] };
 	const liveOnlyLines = renderStripLines([liveOnly], { hint: "hint" });
 	assert.equal(liveOnlyLines.length, 3, "header + agent + hint");
 	assert.ok(!liveOnlyLines.some((line) => lineContains(line, "Completed")), "no aggregated Completed line renders when nothing has settled");
@@ -397,8 +406,11 @@ assert.equal(emptyView.entries.length, 0);
 
 // >>> EXT-17 S4, adapted by EXT-22: each settled line carries its own view's glyph, no aggregate
 {
-	const doneView = { label: "settled done", mode: "single", live: false, glyph: "done", durationText: "1s", entries: [] };
-	const failedView = { label: "settled failed", mode: "single", live: false, glyph: "failed", durationText: "3s", entries: [] };
+	// Both settled views carry no finite settle time, so the block also
+// guards views without one keeping their insertion position (green by
+// design at base: insertion order is what base renders).
+	const doneView = { label: "settled done", mode: "single", live: false, glyph: "done", settledAt: null, durationText: "1s", entries: [] };
+	const failedView = { label: "settled failed", mode: "single", live: false, glyph: "failed", settledAt: null, durationText: "3s", entries: [] };
 	const bothLines = renderStripLines([doneView, failedView], { hint: "hint" });
 	assert.equal(bothLines.length, 3, "one summary line per settled dispatch plus the hint");
 	assert.equal(bothLines[0].segments[0].text, "✓", "a done settled view's line carries the done glyph");
@@ -415,15 +427,16 @@ assert.equal(emptyView.entries.length, 0);
 		mode: "single",
 		live: false,
 		glyph: "done",
+		settledAt: index + 1,
 		durationText: "1s",
 		entries: Array.from({ length: 3 }, (_, slot) => ({ kind: "agent", name: `s${index}-${slot}`, glyph: "done", durationText: "1s" })),
 	}));
 	const bulkLines = renderStripLines(settledBulk, { hint: "hint", maxLines: 12 });
 	assert.equal(bulkLines.length, STRIP_MAX_LINES, "15 settled summary lines overflow the 10-line content budget without exceeding it");
-	assert.ok(lineContains(bulkLines[0], "settled 0"), "settled summary lines render in insertion order from the top");
-	assert.ok(lineContains(bulkLines[9], "settled 9"), "the budgeted content holds the first ten settled lines");
+	assert.ok(lineContains(bulkLines[0], "settled 14"), "the settled block renders newest-first: the newest settle time opens it");
+	assert.ok(lineContains(bulkLines[9], "settled 5"), "the budgeted content holds the ten newest settled lines");
 	assert.ok(lineContains(bulkLines[bulkLines.length - 2], "+5 more"), "the overflow summarizes the five omitted settled lines");
-	assert.ok(!bulkLines.some((line) => lineContains(line, "settled 14")), "the omitted settled lines stay below the cut");
+	assert.ok(!bulkLines.some((line) => lineContains(line, "settled 0")), "the tail cut drops the oldest settled lines first: an omitted oldest line stays below the cut");
 	assert.ok(!bulkLines.some((line) => lineContains(line, "Completed")), "no aggregated Completed line renders");
 	assert.equal(bulkLines[bulkLines.length - 1].segments[0].text, "hint", "hint stays last under settled bulk");
 
@@ -432,6 +445,7 @@ assert.equal(emptyView.entries.length, 0);
 		mode: "parallel",
 		live: true,
 		glyph: "running",
+		settledAt: null,
 		entries: Array.from({ length: 12 }, (_, index) => ({ kind: "agent", name: `live-${index}`, glyph: "running", durationText: "1s" })),
 	};
 	const overflowLines = renderStripLines([liveFlood, ...settledBulk.slice(0, 3)], { hint: "hint", maxLines: 12 });
@@ -451,6 +465,7 @@ assert.equal(emptyView.entries.length, 0);
 		mode: "parallel",
 		live: true,
 		glyph: "running",
+		settledAt: null,
 		entries: Array.from({ length: 9 }, (_, index) => ({ kind: "agent", name: `edge-${index}`, glyph: "running", durationText: "1s" })),
 	};
 	const boundaryLines = renderStripLines([boundaryTask, ...settledBulk.slice(0, 1)], { hint: "hint", maxLines: 12 });
@@ -495,5 +510,56 @@ assert.equal(emptyView.entries.length, 0);
 	assert.equal(mixedLines[0].segments[0].color, "warning", "the mixed glyph uses the warning color");
 }
 // <<< EXT-22 F2
+
+// >>> EXT-22 O1: the settled block renders newest-first by settle time
+// (a registry task's latest agent finish, a detached job's finishedAt),
+// stable among ties, a view with no finite settle time keeping its
+// insertion position; the tail cut therefore drops the oldest settled
+// lines first. The fixture drives the reviewer's falsified case: a
+// dispatch registered first whose agents finish last. Reverse insertion
+// order, the rejected alternative, would render that old-registered
+// dispatch last and cut it again under overflow; plain insertion order
+// would still put the second-registered task above the
+// third-registered one below.
+{
+	const ordered = createDispatchRegistry();
+	const lateTask = ordered.startTask({ mode: "single", prompt: "late settling dispatch", now: 1_000 });
+	ordered.startRound(lateTask.id, [{ agent: "slow" }], 1_000);
+	const earliestTask = ordered.startTask({ mode: "single", prompt: "earliest settling dispatch", now: 2_000 });
+	ordered.startRound(earliestTask.id, [{ agent: "first out" }], 2_000);
+	const midTask = ordered.startTask({ mode: "single", prompt: "mid settling dispatch", now: 3_000 });
+	ordered.startRound(midTask.id, [{ agent: "middle" }], 3_000);
+	ordered.updateAgent(lateTask.id, 1, 0, { status: "done", finishedAt: 9_000 });
+	ordered.updateAgent(earliestTask.id, 1, 0, { status: "done", finishedAt: 3_000 });
+	ordered.updateAgent(midTask.id, 1, 0, { status: "done", finishedAt: 5_000 });
+	const orderedViews = buildStripTasks(ordered, [], 10_000);
+	assert.equal(orderedViews[0].settledAt, 9_000, "a settled registry view's settle time is its latest agent finish");
+	assert.equal(orderedViews[1].settledAt, 3_000, "the settle time is the task's own latest finish, not its registration order");
+	assert.equal(orderedViews[2].settledAt, 5_000, "the third-registered task's settle time is its own latest agent finish");
+	const orderedLines = renderStripLines(orderedViews, { hint: "hint" });
+	assert.ok(lineContains(orderedLines[0], "late settling"), "the late-settling old-registered dispatch renders at the top of the settled block");
+	assert.ok(lineContains(orderedLines[1], "mid settling"), "newer settle times render above older ones regardless of registration order");
+	assert.ok(lineContains(orderedLines[2], "earliest settling"), "the earliest settle time closes the settled block");
+
+	// Equal settle times keep insertion order (guard green by design at
+	// base: insertion order is what base renders).
+	const tieFirst = { label: "tie first", mode: "single", live: false, glyph: "done", settledAt: 5_000, durationText: "1s", entries: [] };
+	const tieSecond = { label: "tie second", mode: "single", live: false, glyph: "done", settledAt: 5_000, durationText: "1s", entries: [] };
+	const tieLines = renderStripLines([tieFirst, tieSecond], { hint: "hint" });
+	assert.ok(lineContains(tieLines[0], "tie first"), "equal settle times keep insertion order");
+	assert.ok(lineContains(tieLines[1], "tie second"), "no reorder among equal settle times");
+
+	// A settled view with no finite settle time keeps its insertion
+	// position among timestamped views (guard green by design at base),
+	// and a settled detached job's settle time is its finishedAt.
+	const noStampJob = { id: "job-9", mode: "single", status: "failed", agentNames: ["scout"], taskPreview: "no finish stamp", startedAt: 30_000 };
+	const stampedJob = { id: "job-8", mode: "single", status: "done", agentNames: ["scout"], taskPreview: "stamped job", startedAt: 30_000, finishedAt: 40_000 };
+	const mixedStampViews = buildStripTasks(createDispatchRegistry(), [noStampJob, stampedJob], 50_000);
+	assert.equal(mixedStampViews[0].settledAt, null, "a settled detached job without finishedAt carries no settle time");
+	assert.equal(mixedStampViews[1].settledAt, 40_000, "a settled detached job's settle time is its finishedAt");
+	const mixedStampLines = renderStripLines(mixedStampViews, { hint: "hint" });
+	assert.ok(lineContains(mixedStampLines[0], "no finish stamp"), "a view with no finite settle time keeps its settled insertion position");
+}
+// <<< EXT-22 O1
 
 console.log("agent-viewer-strip-render: all assertions passed");

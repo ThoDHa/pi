@@ -178,8 +178,9 @@ assert.equal(resolveTaskDisplayLabel(""), "(detached)", "an empty resolution ren
 // <<< EXT-22 F1
 
 // >>> EXT-18 L1: dispatchCountText, the Completed surfaces' dispatch-count wording
-// The singular/plural boundary is what the navigator's Completed umbrella detail
-// and the strip's Completed line render.
+// The singular/plural boundary is what the navigator's Completed umbrella
+// detail renders, the one surface carrying the count since the strip's
+// Completed line was replaced by per-dispatch summary lines.
 assert.equal(dispatchCountText(1), "1 dispatch");
 assert.equal(dispatchCountText(2), "2 dispatches");
 assert.equal(dispatchCountText(0), "0 dispatches");
