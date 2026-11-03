@@ -21,6 +21,35 @@ const FLEET_REFERENCE_PATTERN = /\bEXT-\d+(?:-\d+)?\b/i;
 const DATE_SEGMENT_PATTERN = /-\d{8}$/;
 
 /**
+ * Matches a task-file citation's filename: the fleet's dispatch
+ * convention names task files EXT-N[-M]-YYYYMMDD-HHMM-slug.md, cited
+ * from .tasks/current/ or, for report deposits, from
+ * .tasks/reports/<basename>/NN-slug.md, where the basename still
+ * terminates at .md before the following slash. Case insensitive like
+ * the reference primitive.
+ */
+const TASK_FILE_SUMMARY_PATTERN = /\b(EXT-\d+(?:-\d+)?)-\d{8}-\d{4}-([a-z0-9]+(?:-[a-z0-9]+)*)\.md\b/i;
+
+/**
+ * Truncate text to width on a word boundary with a trailing ellipsis,
+ * returning it unchanged when it already fits; a single word longer
+ * than the width is hard-sliced. The truncation contract shared by
+ * the first-words fallback and the summary resolver, so it lives once.
+ */
+function truncateWithEllipsis(text: string, width: number): string {
+	if (text.length <= width) return text;
+	const ellipsis = "…";
+	let filled = "";
+	for (const word of text.split(" ")) {
+		const candidate = filled ? `${filled} ${word}` : word;
+		if (candidate.length > width - ellipsis.length) break;
+		filled = candidate;
+	}
+	if (!filled) filled = text.slice(0, width - ellipsis.length);
+	return `${filled}${ellipsis}`;
+}
+
+/**
  * First fleet task reference in the prompt text, normalized to
  * uppercase ("ext-4-1" -> "EXT-4-1"), or null when the prompt names
  * no EXT-N[-M] task. A trailing eight-digit date segment is stripped
@@ -51,16 +80,26 @@ export function resolveTaskLabel(prompt: string): string {
 
 	const collapsed = prompt.replace(/\s+/g, " ").trim();
 	if (collapsed.length <= TASK_LABEL_MAX_WIDTH) return collapsed;
+	return truncateWithEllipsis(collapsed, TASK_LABEL_MAX_WIDTH);
+}
 
-	const ellipsis = "…";
-	let filled = "";
-	for (const word of collapsed.split(" ")) {
-		const candidate = filled ? `${filled} ${word}` : word;
-		if (candidate.length > TASK_LABEL_MAX_WIDTH - ellipsis.length) break;
-		filled = candidate;
-	}
-	if (!filled) filled = collapsed.slice(0, TASK_LABEL_MAX_WIDTH - ellipsis.length);
-	return `${filled}${ellipsis}`;
+/**
+ * Summary label for a dispatch from its prompt text: the first
+ * task-file citation's id plus its filename slug read as words
+ * ("EXT-24 · fix the strip label truncation"), capped at
+ * TASK_LABEL_MAX_WIDTH by truncating the slug words on a word boundary
+ * with the trailing ellipsis (a single over-long slug word
+ * hard-slices). Null when the prompt cites no task file, so callers
+ * can fall back to resolveTaskLabel; a bare EXT-N reference is not a
+ * citation, since no slug exists without the filename. First citation
+ * wins, matching the fleet convention of naming the dispatched task
+ * before the ones it coordinates with.
+ */
+export function resolveTaskSummary(prompt: string): string | null {
+	const match = TASK_FILE_SUMMARY_PATTERN.exec(prompt);
+	if (!match) return null;
+	const prefix = `${match[1].toUpperCase()} · `;
+	return prefix + truncateWithEllipsis(match[2].replace(/-/g, " "), TASK_LABEL_MAX_WIDTH - prefix.length);
 }
 
 /**

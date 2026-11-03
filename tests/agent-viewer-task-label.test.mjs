@@ -119,10 +119,11 @@ assert.equal(
 	"EXT-24 · fix the strip label truncation",
 	"a report-dir citation matches the same basename shape",
 );
-// Child ids keep their second segment; longer slugs read as words.
+// Child ids keep their second segment; a slug that would overflow the cap
+// truncates on a word boundary like any summary.
 assert.equal(
 	resolveTaskSummary("Read /home/x/.pi/.tasks/current/EXT-19-1-20261030-0918-collapse-completed-jobs-under-a-completed-umbrella.md and follow it"),
-	"EXT-19-1 · collapse completed jobs under a completed umbrella",
+	"EXT-19-1 · collapse completed jobs under a completed…",
 );
 // First citation wins on multi-citation prompts (the id primitive's convention).
 assert.equal(
@@ -144,7 +145,7 @@ assert.equal(resolveTaskSummary(""), null);
 // ellipsis, capped at TASK_LABEL_MAX_WIDTH; a single over-long slug word is
 // hard-sliced.
 {
-	const longSlug = "EXT-24-20261102-2037-" + "word ".repeat(20).trim() + ".md";
+	const longSlug = "EXT-24-20261102-2037-" + "word-".repeat(20).slice(0, -1) + ".md";
 	const summary = resolveTaskSummary(`read .tasks/current/${longSlug} now`);
 	assert.ok(summary.startsWith("EXT-24 · "), `the capped summary keeps its id prefix, got ${JSON.stringify(summary)}`);
 	assert.ok(summary.length <= TASK_LABEL_MAX_WIDTH, `summary ${JSON.stringify(summary)} exceeds ${TASK_LABEL_MAX_WIDTH}`);

@@ -605,8 +605,7 @@ export class NavigatorView implements Focusable {
 				? theme.fg("accent", theme.bold(row.label))
 				: theme.fg("toolTitle", row.kind === "round" ? theme.bold(row.label) : row.label);
 		const detail = row.detail ? theme.fg("muted", ` · ${row.detail}`) : "";
-		const activity = row.activity ? theme.fg("dim", ` · ${row.activity}`) : "";
-		const line = `${indent}${cursor}${glyph} ${label}${detail}${activity}`;
+		const line = `${indent}${cursor}${glyph} ${label}${detail}`;
 		// The row is cut to the pane width itself, so pi-tui's Text never
 		// wraps it into a second pane line and the layout's column slice
 		// never engages: every cut ends in an honest ellipsis.

@@ -1885,9 +1885,11 @@ const stripAnsi = (text) => text.replace(/\x1b(\[[0-9;]*[A-Za-z]|\]8;;\x07|_[^\x
 		assert.ok(headFrame.includes("prompt"), "the section label renders below the header");
 		assert.ok(headFrame.includes("directive marker 02"), "each source line renders as its own pane line");
 		assert.ok(headFrame.includes("\u200b"), "a blank source line renders a zero-width space so the paragraph break survives");
-		// Guard green by design at base: the members tail was already clipped in
-		// the held head window before the activity removal.
-		assert.ok(!headFrame.includes("round 1"), "the held head view clips the members tail below");
+		// Guard green by design at base: the tail sections were already clipped
+		// in the held head window before the activity removal. "mode: single" is
+		// the detail pane's fields line: the tree pane renders the mode bare,
+		// so the substring isolates the tail sections (fields, then members).
+		assert.ok(!headFrame.includes("mode: single"), "the held head view clips the fields-and-members tail below");
 
 		// A held window does not drift while the immutable prompt section re-renders on a poll.
 		registry.updateAgent(task.id, 1, 0, { activity: [{ at: 1_100, kind: "text", text: "worker note" }, { at: 6_000, kind: "text", text: "worker newer note" }] });
@@ -1897,7 +1899,7 @@ const stripAnsi = (text) => text.replace(/\x1b(\[[0-9;]*[A-Za-z]|\]8;;\x07|_[^\x
 		assert.ok(!stableFrame.includes("worker newer note"), "the polled streamed activity stays off the task pane (no derived activity line)");
 		view.handleInput(END);
 		const endRender = view.render(120).join("\n");
-		assert.ok(endRender.includes("round 1"), "end returns the pane to the tail, the members block");
+		assert.ok(endRender.includes("mode: single"), "end returns the pane to the tail, the fields and members block");
 		assert.ok(!endRender.includes("worker newer note"), "the tail holds no derived activity line");
 	});
 }
@@ -1925,9 +1927,10 @@ const stripAnsi = (text) => text.replace(/\x1b(\[[0-9;]*[A-Za-z]|\]8;;\x07|_[^\x
 	await withView({ registry, detachedJobs: [] }, async (view) => {
 		assert.equal(view.selectedId, "t:task-1");
 		const frame = view.render(120).join("\n");
-		// Guard green by design at base: the members block rendered before the
-		// activity removal too.
-		assert.ok(frame.includes("round 1"), "the empty-source task still renders its detail pane (the members block)");
+		// Guard green by design at base: the fields section rendered before the
+		// activity removal too. "mode: single" is detail-pane-only wording (the
+		// tree renders the mode bare), so it proves the pane renders.
+		assert.ok(frame.includes("mode: single"), "the empty-source task still renders its detail pane (the fields and members sections)");
 		assert.ok(!frame.includes("quiet note"), "no derived latest-activity line renders on the task pane");
 		assert.ok(!frame.includes("prompt"), "an empty source text renders no prompt section");
 	});

@@ -15,7 +15,7 @@
  * pin the budget and glyph behavior directly.
  */
 
-import { aggregateSettledGlyph, dispatchCountText, resolveTaskLabel } from "./labels.ts";
+import { resolveTaskLabel, resolveTaskSummary } from "./labels.ts";
 import {
 	type DetachedJobSnapshot,
 	type DispatchAgentNode,
@@ -46,7 +46,6 @@ export interface StripAgentEntry {
 	kind: "agent";
 	name: string;
 	glyph: "running" | "done" | "failed";
-	activity?: string;
 	durationText: string;
 }
 
@@ -64,9 +63,11 @@ export interface StripTaskView {
 	label: string;
 	mode: string;
 	live: boolean;
-	/** The task's own outcome glyph: running while live, the settled aggregation otherwise; the Completed line aggregates this field over the settled views. */
+	/** The task's own outcome glyph: running while live, the settled aggregation otherwise; each settled summary line renders it. */
 	glyph: StatusGlyphName;
-	/** Settled views' entries are a model-level contract only: renderStripLines reads settled views' glyph and length only. */
+	/** Task start to its latest finish (now while live); rendered on the settled summary line. */
+	durationText: string;
+	/** Settled views' entries are a model-level contract only: renderStripLines reads settled views' glyph, label, and durationText only. */
 	entries: StripEntry[];
 }
 
@@ -79,13 +80,13 @@ export const GLYPH_COLORS: Record<StatusGlyphName, StripColor> = {
 };
 
 function agentEntryLine(entry: StripAgentEntry): StripLine {
-	const segments: StripSegment[] = [
-		{ text: statusGlyph(entry.glyph), color: GLYPH_COLORS[entry.glyph] },
-		{ text: ` ${entry.name}`, color: "toolTitle", bold: true },
-	];
-	if (entry.activity) segments.push({ text: ` · ${entry.activity}`, color: "dim" });
-	segments.push({ text: ` · ${entry.durationText}`, color: "muted" });
-	return { segments };
+	return {
+		segments: [
+			{ text: statusGlyph(entry.glyph), color: GLYPH_COLORS[entry.glyph] },
+			{ text: ` ${entry.name}`, color: "toolTitle", bold: true },
+			{ text: ` · ${entry.durationText}`, color: "muted" },
+		],
+	};
 }
 
 function roundEntryLine(entry: StripRoundEntry): StripLine {
@@ -101,12 +102,13 @@ function roundEntryLine(entry: StripRoundEntry): StripLine {
 
 /**
  * Render the strip's lines under the line budget. Live tasks render
- * before the settled group, and the settled views collapse to one
- * Completed line (aggregated glyph, dispatch count) closing the
- * content; the hint line is always last; when content exceeds maxLines
- * minus the overflow and hint reservations, the tail is summarized as
- * one "+N more" line (N = omitted content lines), which cuts finished
- * content first because live content leads.
+ * before the settled group, and each settled dispatch renders one
+ * summary line of its own (its own outcome glyph, its summary label,
+ * its duration) closing the content; the hint line is always last;
+ * when content exceeds maxLines minus the overflow and hint
+ * reservations, the tail is summarized as one "+N more" line
+ * (N = omitted content lines), which cuts finished content first
+ * because live content leads.
  */
 export function renderStripLines(
 	tasks: StripTaskView[],
@@ -131,13 +133,12 @@ export function renderStripLines(
 		}
 	}
 	const settled = tasks.filter((task) => !task.live);
-	if (settled.length > 0) {
-		const glyph = aggregateSettledGlyph(settled);
+	for (const task of settled) {
 		lines.push({
 			segments: [
-				{ text: statusGlyph(glyph), color: GLYPH_COLORS[glyph] },
-				{ text: " Completed", color: "accent", bold: true },
-				{ text: ` · ${dispatchCountText(settled.length)}`, color: "dim" },
+				{ text: statusGlyph(task.glyph), color: GLYPH_COLORS[task.glyph] },
+				{ text: ` ${task.label}`, color: "accent", bold: true },
+				{ text: ` · ${task.durationText}`, color: "muted" },
 			],
 		});
 	}
@@ -177,7 +178,6 @@ function agentEntry(agent: DispatchAgentNode, now: number): StripAgentEntry {
 		kind: "agent",
 		name: agent.agent,
 		glyph: agent.status,
-		activity: agent.lastActivity,
 		durationText: formatDuration((agent.finishedAt ?? now) - agent.startedAt),
 	};
 }
@@ -192,18 +192,22 @@ function aggregateNodeGlyph(nodes: readonly DispatchAgentNode[]): StatusGlyphNam
 /**
  * Assemble the strip's task views from the blocking-path dispatch
  * registry plus the detached jobs registry. Task labels resolve from
- * the prompt at render time, falling back to the detached jobs'
+ * the prompt at render time through the summary chain (the task-file
+ * citation's id plus slug, then the fleet-reference/first-words
+ * heuristic), falling back to the detached jobs'
  * "(detached)" wording when the resolution comes up empty so a task
  * header never renders bare; a finished round of a
  * live task collapses to one round entry; within a task, live rounds'
  * agent entries lead so the budget's tail cut spares live content; a
  * live view carries the running glyph and a settled view the
- * aggregation of its agents' outcomes. A
+ * aggregation of its agents' outcomes, and every view derives its
+ * durationText the way the navigator's task view does (registry tasks
+ * from task start to the latest agent finish, now while live; detached
+ * jobs from start to finishedAt, now while running). A
  * detached job becomes one task view labeled through the same
- * resolveTaskLabel heuristic as blocking tasks, falling back to
- * "(detached)" when the resolution comes up empty. Its per-slot
+ * summary chain as blocking tasks. Its per-slot
  * agent nodes (the EXT-1-3 wiring) stream per-agent
- * glyph, activity, and duration onto the strip when the snapshot
+ * glyph and duration onto the strip when the snapshot
  * carries them (an empty array means nothing has started yet and
  * renders no entries); snapshots without the array fall back to one
  * entry per agent name keyed off job.status.
@@ -223,11 +227,14 @@ export function buildStripTasks(
 			for (const agent of round.agents) entries.push(agentEntry(agent, now));
 		}
 		for (const round of finishedRounds) entries.push(collapsedRoundEntry(round, now));
+		const allAgents = task.rounds.flatMap((round) => round.agents);
+		const finishTimes = allAgents.map((agent) => agent.finishedAt ?? now);
 		views.push({
-			label: resolveTaskLabel(task.prompt) || "(detached)",
+			label: resolveTaskSummary(task.prompt) ?? (resolveTaskLabel(task.prompt) || "(detached)"),
 			mode: task.mode,
 			live,
-			glyph: live ? "running" : aggregateNodeGlyph(task.rounds.flatMap((round) => round.agents)),
+			glyph: live ? "running" : aggregateNodeGlyph(allAgents),
+			durationText: formatDuration((finishTimes.length > 0 ? Math.max(...finishTimes) : now) - task.startedAt),
 			entries,
 		});
 	}
@@ -238,10 +245,11 @@ export function buildStripTasks(
 			? job.agents.map((node) => agentEntry(node, fallbackEnd))
 			: job.agentNames.map((name) => ({ kind: "agent", name, glyph: job.status, durationText: formatDuration(fallbackEnd - job.startedAt) }));
 		views.push({
-			label: resolveTaskLabel(job.taskPreview) || "(detached)",
+			label: resolveTaskSummary(job.taskPreview) ?? (resolveTaskLabel(job.taskPreview) || "(detached)"),
 			mode: job.mode,
 			live: job.status === "running",
 			glyph: job.status,
+			durationText: formatDuration(fallbackEnd - job.startedAt),
 			entries,
 		});
 	}

@@ -439,7 +439,7 @@ assert.equal(emptyView.entries.length, 0);
 	assert.ok(overflowRendered.includes("live-7"), "the live block's lines lead and survive the cut");
 	assert.ok(!overflowRendered.includes("live-11"), "the live block itself is long enough to reach the cut");
 	assert.ok(overflowRendered.includes("+6 more"), "the overflow summarizes the cut content (16 content lines minus the 10-line budget)");
-	assert.ok(overflowRendered.includes("settled 0"), "the settled summary lines follow the live block in insertion order");
+	assert.ok(!overflowRendered.includes("settled 0"), "the settled summary lines follow the live block, so the cut takes them before any live line");
 	assert.ok(!overflowRendered.includes("Completed"), "no aggregated Completed line renders under overflow");
 	assert.equal(overflowLines[overflowLines.length - 1].segments[0].text, "hint", "hint stays last under the live overflow");
 
@@ -471,7 +471,7 @@ assert.equal(emptyView.entries.length, 0);
 	partialRegistry.updateAgent(partialTask.id, 1, 1, { status: "done", finishedAt: 4_000 });
 	const settledLines = renderStripLines(buildStripTasks(partialRegistry, [], 5_000), { hint: "hint" });
 	assert.equal(settledLines.length, 2, "the settled task's summary line plus the hint only");
-	assert.ok(lineContains(settledLines[0], "EXT-17-1 strip partial"), "the task renders its own summary line once every agent completes");
+	assert.ok(lineContains(settledLines[0], "EXT-17-1"), "the task renders its own summary line once every agent completes");
 	assert.equal(settledLines[0].segments[0].text, "✓", "the summary line carries the task's settled glyph");
 	assert.equal(settledLines[0].segments[2].text, " · 3s", "the summary line's duration spans task start to the latest finish");
 }

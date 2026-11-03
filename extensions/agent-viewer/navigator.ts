@@ -13,7 +13,7 @@
  * pin the tree behavior directly.
  */
 
-import { aggregateSettledGlyph, dispatchCountText, resolveTaskLabel } from "./labels.ts";
+import { aggregateSettledGlyph, dispatchCountText, resolveTaskLabel, resolveTaskSummary } from "./labels.ts";
 import {
 	type ActivityMessage,
 	type DetachedJobSnapshot,
@@ -48,7 +48,6 @@ export interface NavigatorAgentView {
 	step?: number;
 	startedAt: number;
 	finishedAt?: number;
-	activity?: string;
 	/** Recent streamed activity for the detail pane, oldest first. */
 	activityLog: DispatchActivityEntry[];
 	/** Recent full-text thinking blocks for the detail pane, oldest first, capped like the activity log. */
@@ -105,7 +104,6 @@ function agentView(node: DispatchAgentNode, ref: NavigatorAgentRef, fallbackEnd:
 		step: node.step,
 		startedAt: node.startedAt,
 		finishedAt: node.finishedAt,
-		activity: node.lastActivity,
 		activityLog: node.activity ?? [],
 		thinkingLog: node.thinkingLog ?? [],
 		model: node.model,
@@ -122,8 +120,9 @@ function agentView(node: DispatchAgentNode, ref: NavigatorAgentRef, fallbackEnd:
  * (task -> rounds -> agents, completed rounds collapsed to summaries,
  * the live round flagged) plus one per detached-job snapshot (the job
  * is the task node, its agents hang directly off it, glyphs keyed off
- * job.status). Labels resolve through the shared EXT-1-2 heuristic at
- * render time. Snapshots predating the per-agent wiring (no `agents`
+ * job.status). Labels resolve at render time through the summary
+ * chain (the task-file citation's id plus slug, then the shared
+ * EXT-1-2 heuristic). Snapshots predating the per-agent wiring (no `agents`
  * array) fall back to agentNames children keyed off job.status; a
  * present-but-empty `agents` array means nothing has started yet
  * (lazy node creation) and renders no agent children. The list is
@@ -157,7 +156,7 @@ export function buildNavigatorTasks(registry: DispatchRegistry, jobs: Iterable<D
 		views.push({
 			id: task.id,
 			source: "registry",
-			label: resolveTaskLabel(task.prompt) || "(detached)",
+			label: resolveTaskSummary(task.prompt) ?? (resolveTaskLabel(task.prompt) || "(detached)"),
 			sourceText: task.prompt,
 			mode: task.mode,
 			live: taskLive,
@@ -184,7 +183,7 @@ export function buildNavigatorTasks(registry: DispatchRegistry, jobs: Iterable<D
 		views.push({
 			id: job.id,
 			source: "detached",
-			label: resolveTaskLabel(job.taskPreview) || "(detached)",
+			label: resolveTaskSummary(job.taskPreview) ?? (resolveTaskLabel(job.taskPreview) || "(detached)"),
 			sourceText: job.taskPreview,
 			mode: job.mode,
 			live: job.status === "running",
@@ -222,34 +221,8 @@ export interface NavigatorRow {
 	glyph: StatusGlyphName;
 	label: string;
 	detail: string;
-	activity?: string;
 	roundIndex?: number;
 	agentRef?: NavigatorAgentRef;
-}
-
-/**
- * The task's latest agent activity entry for the task detail pane:
- * the entry with the greatest `at` across the task's agents (registry
- * rounds flattened, detached agents direct), last-in-order winning on
- * equal timestamps and an entry without a finite timestamp competing
- * as zero. Empty when no agent has streamed activity. A latest entry
- * the tool-noise filter hides renders nothing, the same contract
- * agent detail panes follow.
- */
-function latestAgentActivity(task: NavigatorTaskView): DispatchActivityEntry[] {
-	const agents = task.source === "registry" ? task.rounds.flatMap((round) => round.agents) : task.agents;
-	let latest: DispatchActivityEntry | undefined;
-	let latestAt = 0;
-	for (const agent of agents) {
-		for (const entry of agent.activityLog) {
-			const at = Number.isFinite(entry.at) ? entry.at : 0;
-			if (!latest || at >= latestAt) {
-				latest = entry;
-				latestAt = at;
-			}
-		}
-	}
-	return latest ? [latest] : [];
 }
 
 /**
@@ -312,7 +285,6 @@ export function flattenNavigatorTree(tasks: NavigatorTaskView[], state: Navigato
 						glyph: agent.status,
 						label: agent.name,
 						detail: agent.durationText,
-						activity: agent.activity,
 						roundIndex: round.index,
 						agentRef: agent.ref,
 					});
@@ -331,7 +303,6 @@ export function flattenNavigatorTree(tasks: NavigatorTaskView[], state: Navigato
 					glyph: agent.status,
 					label: agent.name,
 					detail: agent.durationText,
-					activity: agent.activity,
 					agentRef: agent.ref,
 				});
 			});
@@ -537,7 +508,7 @@ export function resolveDetailModel(row: NavigatorRow | null | undefined, tasks: 
 			members: round.agents.map((agent) => ({
 				glyph: agent.status,
 				label: agent.name,
-				detail: agent.activity ? `${agent.activity} · ${agent.durationText}` : agent.durationText,
+				detail: agent.durationText,
 			})),
 			sourceText: "",
 			activity: [],
@@ -569,10 +540,10 @@ export function resolveDetailModel(row: NavigatorRow | null | undefined, tasks: 
 				: task.agents.map((agent) => ({
 						glyph: agent.status,
 						label: agent.name,
-						detail: agent.activity ? `${agent.activity} · ${agent.durationText}` : agent.durationText,
+						detail: agent.durationText,
 					})),
 		sourceText: task.sourceText,
-		activity: latestAgentActivity(task),
+		activity: [],
 		thinking: [],
 		usageText: undefined,
 		resultText: undefined,
