@@ -15,7 +15,7 @@
  * pin the budget and glyph behavior directly.
  */
 
-import { resolveTaskLabel, resolveTaskSummary } from "./labels.ts";
+import { resolveTaskDisplayLabel } from "./labels.ts";
 import {
 	type DetachedJobSnapshot,
 	type DispatchAgentNode,
@@ -230,7 +230,7 @@ export function buildStripTasks(
 		const allAgents = task.rounds.flatMap((round) => round.agents);
 		const finishTimes = allAgents.map((agent) => agent.finishedAt ?? now);
 		views.push({
-			label: resolveTaskSummary(task.prompt) ?? (resolveTaskLabel(task.prompt) || "(detached)"),
+			label: resolveTaskDisplayLabel(task.prompt),
 			mode: task.mode,
 			live,
 			glyph: live ? "running" : aggregateNodeGlyph(allAgents),
@@ -245,7 +245,7 @@ export function buildStripTasks(
 			? job.agents.map((node) => agentEntry(node, fallbackEnd))
 			: job.agentNames.map((name) => ({ kind: "agent", name, glyph: job.status, durationText: formatDuration(fallbackEnd - job.startedAt) }));
 		views.push({
-			label: resolveTaskSummary(job.taskPreview) ?? (resolveTaskLabel(job.taskPreview) || "(detached)"),
+			label: resolveTaskDisplayLabel(job.taskPreview),
 			mode: job.mode,
 			live: job.status === "running",
 			glyph: job.status,

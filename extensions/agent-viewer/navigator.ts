@@ -13,7 +13,7 @@
  * pin the tree behavior directly.
  */
 
-import { aggregateSettledGlyph, dispatchCountText, resolveTaskLabel, resolveTaskSummary } from "./labels.ts";
+import { aggregateSettledGlyph, dispatchCountText, resolveTaskDisplayLabel } from "./labels.ts";
 import {
 	type ActivityMessage,
 	type DetachedJobSnapshot,
@@ -156,7 +156,7 @@ export function buildNavigatorTasks(registry: DispatchRegistry, jobs: Iterable<D
 		views.push({
 			id: task.id,
 			source: "registry",
-			label: resolveTaskSummary(task.prompt) ?? (resolveTaskLabel(task.prompt) || "(detached)"),
+			label: resolveTaskDisplayLabel(task.prompt),
 			sourceText: task.prompt,
 			mode: task.mode,
 			live: taskLive,
@@ -183,7 +183,7 @@ export function buildNavigatorTasks(registry: DispatchRegistry, jobs: Iterable<D
 		views.push({
 			id: job.id,
 			source: "detached",
-			label: resolveTaskSummary(job.taskPreview) ?? (resolveTaskLabel(job.taskPreview) || "(detached)"),
+			label: resolveTaskDisplayLabel(job.taskPreview),
 			sourceText: job.taskPreview,
 			mode: job.mode,
 			live: job.status === "running",

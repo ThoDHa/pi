@@ -103,6 +103,18 @@ export function resolveTaskSummary(prompt: string): string | null {
 }
 
 /**
+ * Display label for a dispatch task from its prompt text, the label
+ * contract both surfaces render: the task-file citation summary when
+ * the prompt cites one, the fleet-reference/first-words label
+ * otherwise, and "(detached)" when both come up empty, so a task
+ * header never renders bare. The chain and the placeholder wording
+ * live here so they are written and pinned once.
+ */
+export function resolveTaskDisplayLabel(prompt: string): string {
+	return resolveTaskSummary(prompt) ?? (resolveTaskLabel(prompt) || "(detached)");
+}
+
+/**
  * Aggregated glyph over settled task views: done when every view's
  * glyph is done, failed when every one is failed, mixed otherwise.
  * The structural parameter serves both the navigator's
