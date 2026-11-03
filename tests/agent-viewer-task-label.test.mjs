@@ -12,9 +12,11 @@
  * ellipsis suffix, hard slice when a single word exceeds the width),
  * the task-file summary composition (resolveTaskSummary: id plus slug
  * from the first task-file citation, hyphens read as words, width-capped
- * with the same ellipsis contract), the empty-prompt edge, and the
- * shared presentation helpers (dispatch-count wording, settled-glyph
- * aggregation).
+ * with the same ellipsis contract), the empty-prompt edge, the
+ * display-label chain both surfaces share (resolveTaskDisplayLabel:
+ * citation summary, then label, then the "(detached)" wording), and
+ * the shared presentation helpers (dispatch-count wording,
+ * settled-glyph aggregation).
  */
 
 import assert from "node:assert/strict";
@@ -22,6 +24,7 @@ import {
 	aggregateSettledGlyph,
 	dispatchCountText,
 	findFleetTaskReference,
+	resolveTaskDisplayLabel,
 	resolveTaskLabel,
 	resolveTaskSummary,
 	TASK_LABEL_MAX_WIDTH,
@@ -157,6 +160,22 @@ assert.equal(resolveTaskSummary(""), null);
 	assert.ok(sliced.endsWith("…"));
 }
 // <<< EXT-22 L1
+
+// >>> EXT-22 F1: resolveTaskDisplayLabel owns the surfaces' label chain
+// The strip and the navigator label every dispatch through one chain:
+// the task-file citation summary wins, the fleet-reference/first-words
+// label is the second fallback, and an empty resolution renders the
+// "(detached)" wording. The resolver owns the chain and the wording so
+// the fallback order is pinned directly instead of incidentally
+// through surface fixtures.
+assert.equal(
+	resolveTaskDisplayLabel("Your contract is /home/x/.pi/.tasks/current/EXT-24-20261102-2037-fix-the-strip-label-truncation.md; read it fully first"),
+	"EXT-24 · fix the strip label truncation",
+	"the citation summary wins over the bare reference the same filename yields",
+);
+assert.equal(resolveTaskDisplayLabel("Task: EXT-9-2 parser fixes"), "EXT-9-2", "the fleet-reference label wins over (detached)");
+assert.equal(resolveTaskDisplayLabel(""), "(detached)", "an empty resolution renders the (detached) wording");
+// <<< EXT-22 F1
 
 // >>> EXT-18 L1: dispatchCountText, the Completed surfaces' dispatch-count wording
 // The singular/plural boundary is what the navigator's Completed umbrella detail

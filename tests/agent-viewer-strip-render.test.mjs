@@ -477,4 +477,23 @@ assert.equal(emptyView.entries.length, 0);
 }
 // <<< EXT-17 S6
 
+// >>> EXT-22 F2: the settled line carries the task's own aggregated mixed
+// glyph (guard green by design at base: the per-task aggregation
+// (aggregateNodeGlyph) feeding each settled line's glyph predates this
+// pin; the fixture drives buildStripTasks through the rendered settled
+// line so the strip's highest-visibility mixed case stays locked, the
+// navigator's analogous aggregation being pinned by its tree suite).
+{
+	const mixedSettled = createDispatchRegistry();
+	const mixedTask = mixedSettled.startTask({ mode: "parallel", prompt: "Task: EXT-22-1 settled mixed", now: 1_000 });
+	mixedSettled.startRound(mixedTask.id, [{ agent: "a" }, { agent: "b" }], 1_000);
+	mixedSettled.updateAgent(mixedTask.id, 1, 0, { status: "done", finishedAt: 2_000 });
+	mixedSettled.updateAgent(mixedTask.id, 1, 1, { status: "failed", finishedAt: 3_000 });
+	const mixedLines = renderStripLines(buildStripTasks(mixedSettled, [], 4_000), { hint: "hint" });
+	assert.equal(mixedLines.length, 2, "the settled mixed task renders its summary line plus the hint");
+	assert.equal(mixedLines[0].segments[0].text, "◐", "the settled line carries the task's aggregated mixed glyph");
+	assert.equal(mixedLines[0].segments[0].color, "warning", "the mixed glyph uses the warning color");
+}
+// <<< EXT-22 F2
+
 console.log("agent-viewer-strip-render: all assertions passed");
