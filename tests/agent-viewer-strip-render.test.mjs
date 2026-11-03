@@ -6,20 +6,22 @@
  *   node tests/agent-viewer-strip-render.test.mjs
  *
  * Covers the line budget the strip owns: the navigator-key hint line
- * always last, live tasks prioritized before the Completed line,
- * finished views collapsed to that one line, the
+ * always last, live tasks prioritized before the settled summary
+ * lines (EXT-22: one summary line per settled dispatch carrying its
+ * own glyph, summary label, and duration, replacing the aggregated
+ * Completed line), the
  * "+N more" overflow summary (content lines are capped at maxLines minus the overflow and hint reservations), the
  * no-dispatch placeholder, the glyph/color conventions shared
  * with the blocking path, and render-time task-label derivation from
- * the prompt. Also covers buildStripTasks assembling
+ * the prompt through the summary chain. Also covers buildStripTasks assembling
  * views from a live registry plus detached jobs: live rounds first,
  * collapsed finished rounds, lazy parallel rounds rendering only
  * picked-up agents and a zero-agent round staying live with no
- * entries, detached labels resolving through the
- * same heuristic as blocking tasks (fleet reference wins, first-words
- * fallback, "(detached)" on an empty preview) and keying glyphs off
+ * entries, labels resolving through the summary chain on both sources
+ * (task-file citation summary, then the fleet-reference/first-words
+ * fallback, "(detached)" on an empty resolution) and keying glyphs off
  * job.status, and detached per-agent nodes (the EXT-1-3 wiring)
- * streaming per-agent activity and status onto the strip with the
+ * streaming per-agent glyph and duration onto the strip with the
  * agentNames fallback for snapshots predating it.
  */
 
@@ -58,7 +60,7 @@ const liveTask = {
 	live: true,
 	glyph: "running",
 	entries: [
-		{ kind: "agent", name: "worker", glyph: "running", activity: "$ rg pattern", durationText: "45s" },
+		{ kind: "agent", name: "worker", glyph: "running", durationText: "45s" },
 		{ kind: "agent", name: "scout", glyph: "done", durationText: "1m2s" },
 	],
 };
@@ -69,7 +71,11 @@ assert.ok(lineContains(lines[0], "parallel"), "header carries the mode");
 assert.equal(lines[0].segments[0].bold, true, "header label is bold");
 assert.ok(lineContains(lines[1], "⏳"), "running agent shows the hourglass glyph");
 assert.ok(lineContains(lines[1], "worker"));
-assert.ok(lineContains(lines[1], "$ rg pattern"), "agent line carries the last activity");
+// EXT-22: the streamed command renders nowhere; agent lines reduce to glyph,
+// name, duration. Guard green by design at base: an entry without an activity
+// already rendered no activity segment.
+assert.ok(!lineContains(lines[1], "$ rg pattern"), "the agent line carries no current-command activity");
+assert.equal(lines[1].segments.length, 3, "agent lines render glyph, name, duration only");
 assert.ok(lineContains(lines[1], "45s"), "agent line carries the duration");
 assert.equal(lines[1].segments[0].color, "warning", "running glyph uses the warning color");
 assert.ok(lineContains(lines[2], "✓"));
@@ -90,20 +96,22 @@ const failedTask = {
 const failedLines = renderStripLines([failedTask], { hint: "hint" });
 assert.equal(failedLines[1].segments[0].color, "error", "failed glyph uses the error color");
 
-// --- live tasks are prioritized before the Completed line ---
+// --- live tasks are prioritized before the settled summary lines ---
 
 const finishedTask = {
 	label: "earlier finished",
 	mode: "single",
 	live: false,
 	glyph: "done",
+	durationText: "9s",
 	entries: [{ kind: "agent", name: "scout", glyph: "done", durationText: "9s" }],
 };
 const laterLive = { ...liveTask, label: "later live" };
 const ordered = renderStripLines([finishedTask, laterLive], { hint: "hint" });
 assert.ok(lineContains(ordered[0], "later live"), "live task header comes first");
-assert.ok(lineContains(ordered[ordered.length - 2], "Completed"), "the Completed line renders after the live block");
-assert.equal(ordered.length, 5, "live block (header + two agents) + Completed line + hint");
+assert.ok(lineContains(ordered[3], "earlier finished"), "the settled task's summary line renders after the live block");
+assert.equal(ordered[3].segments[0].text, "✓", "the settled summary line carries the settled view's own glyph");
+assert.equal(ordered.length, 5, "live block (header + two agents) + settled summary line + hint");
 
 // --- collapsed round entries (a live task holding a finished round) ---
 
@@ -162,11 +170,12 @@ assert.equal(exactLines.length, 11, "header + 9 agents + hint");
 assert.ok(!exactLines.some((line) => lineContains(line, "more")), "no overflow line when everything fits");
 assert.equal(exactLines[exactLines.length - 1].segments[0].text, "hint");
 
-// --- budget: overflow under settled bulk is superseded by S5 below ---
+// --- budget: settled bulk overflows like any content, pinned by S5 below ---
 // (the overflow-cuts-finished fixture was superseded by the EXT-17 S5
-// fixtures: settled bulk collapses to one Completed line and can no
-// longer trigger the overflow, while the +N more machinery stays
-// pinned by the all-live budget fixtures and S5's live-overflow cut.)
+// fixtures, adapted by EXT-22: settled bulk renders one summary line
+// per dispatch and legitimately overflows into "+N more" with live
+// content still leading, while the +N more machinery stays pinned by
+// the all-live budget fixtures and S5's live-overflow cut.)
 
 // --- buildStripTasks: registry rounds (live first, finished collapsed) ---
 
@@ -219,7 +228,7 @@ assert.equal(chainView.entries.length, 2, "one entry per round: live round entry
 assert.equal(chainView.entries[0].kind, "agent");
 assert.equal(chainView.entries[0].name, "planner");
 assert.equal(chainView.entries[0].glyph, "running");
-assert.equal(chainView.entries[0].activity, "read plan.md");
+assert.ok(!("activity" in chainView.entries[0]), "the strip's agent entries carry no activity field; the streamed command stays off the strip");
 assert.equal(chainView.entries[0].durationText, "1m", "live agent duration = now - startedAt");
 assert.equal(chainView.entries[1].kind, "round");
 assert.equal(chainView.entries[1].label, "round 1");
@@ -233,7 +242,7 @@ assert.equal(detachedRunningView.live, true);
 assert.equal(detachedRunningView.entries.length, 2);
 assert.equal(detachedRunningView.entries[0].name, "worker");
 assert.equal(detachedRunningView.entries[0].glyph, "running");
-assert.equal(detachedRunningView.entries[0].activity, "$ rg pattern", "per-agent activity streams onto the strip via the snapshot nodes");
+assert.ok(!("activity" in detachedRunningView.entries[0]), "per-agent snapshot nodes stream glyph and duration onto the strip; the streamed command does not render");
 assert.equal(detachedRunningView.entries[0].durationText, "32s", "node duration = now - node startedAt");
 assert.equal(detachedRunningView.entries[1].glyph, "done", "per-agent glyphs come from the node status, not the job status");
 assert.equal(detachedRunningView.entries[1].durationText, "10s", "finished node duration = finishedAt - startedAt");
@@ -261,7 +270,6 @@ const legacyJob = {
 const legacyView = buildStripTasks(createDispatchRegistry(), [legacyJob], 122_000)[0];
 assert.equal(legacyView.entries.length, 1);
 assert.equal(legacyView.entries[0].glyph, "failed", "the job-status glyph covers snapshots predating the per-agent nodes");
-assert.equal(legacyView.entries[0].activity, undefined);
 assert.equal(legacyView.entries[0].durationText, "30s");
 
 // --- buildStripTasks: empty and partial agents arrays (lazy detached node creation) ---
@@ -332,6 +340,7 @@ assert.equal(lazyView.live, true);
 assert.equal(lazyView.entries.length, 2, "only picked-up agents render; queued slots have no nodes");
 assert.equal(lazyView.entries[0].name, "scout");
 assert.equal(lazyView.entries[0].glyph, "running");
+assert.ok(!("activity" in lazyView.entries[0]), "streamed registry activity never reaches the strip's agent entries");
 assert.equal(lazyView.entries[0].durationText, "21s", "duration runs from the agent's own pickup, not round start");
 assert.equal(lazyView.entries[1].name, "worker");
 assert.equal(lazyView.entries[1].durationText, "1s", "a later pickup's duration starts at its own pickup");
@@ -345,31 +354,34 @@ const emptyView = buildStripTasks(emptyWindow, [], 122_000)[0];
 assert.equal(emptyView.live, true, "a zero-agent round counts as live instead of collapsing to a finished round");
 assert.equal(emptyView.entries.length, 0);
 
-// >>> EXT-17 S1: the Completed line renders after the live block
+// >>> EXT-17 S1, adapted by EXT-22: the settled dispatch's summary line renders after the live block
 {
 	const stripLive = { label: "EXT-17-1", mode: "parallel", live: true, glyph: "running", entries: [{ kind: "agent", name: "worker", glyph: "running", durationText: "5s" }] };
-	const stripSettled = { label: "EXT-17-1 earlier", mode: "single", live: false, glyph: "done", entries: [{ kind: "agent", name: "scout", glyph: "done", durationText: "2s" }] };
+	const stripSettled = { label: "EXT-17-1 earlier", mode: "single", live: false, glyph: "done", durationText: "2s", entries: [{ kind: "agent", name: "scout", glyph: "done", durationText: "2s" }] };
 	const completedLines = renderStripLines([stripLive, stripSettled], { hint: "hint" });
 	assert.ok(lineContains(completedLines[0], "EXT-17-1"), "the live block still leads");
-	assert.equal(completedLines[2].segments[0].text, "✓", "the Completed line opens with the aggregated glyph");
-	assert.equal(completedLines[2].segments[1].text, " Completed");
-	assert.equal(completedLines[2].segments[1].color, "accent", "Completed renders in the task-title styling");
+	assert.equal(completedLines[2].segments[0].text, "✓", "the settled line opens with the settled view's own glyph");
+	assert.equal(completedLines[2].segments[0].color, "success");
+	assert.equal(completedLines[2].segments[1].text, " EXT-17-1 earlier", "the settled line carries the dispatch's own summary label");
+	assert.equal(completedLines[2].segments[1].color, "accent", "the summary renders in the task-title styling");
 	assert.equal(completedLines[2].segments[1].bold, true);
-	assert.equal(completedLines[2].segments[2].text, " · 1 dispatch", "the count uses the singular wording");
-	assert.equal(completedLines[2].segments[2].color, "dim");
-	assert.equal(completedLines.length, 4, "live block + one Completed line + hint");
+	assert.equal(completedLines[2].segments[2].text, " · 2s", "the settled line carries its own duration");
+	assert.equal(completedLines[2].segments[2].color, "muted");
+	assert.equal(completedLines.length, 4, "live block + one settled summary line + hint");
+	assert.ok(!completedLines.some((line) => lineContains(line, "Completed")), "no aggregated Completed line renders");
 }
 // <<< EXT-17 S1
 
-// >>> EXT-17 S2: a settled-only strip shows the Completed line instead of the placeholder
+// >>> EXT-17 S2, adapted by EXT-22: a settled-only strip shows its summary line instead of the placeholder
 {
-	const stripSettled = { label: "only settled", mode: "single", live: false, glyph: "done", entries: [{ kind: "agent", name: "scout", glyph: "done", durationText: "2s" }] };
+	const stripSettled = { label: "only settled", mode: "single", live: false, glyph: "done", durationText: "2s", entries: [{ kind: "agent", name: "scout", glyph: "done", durationText: "2s" }] };
 	const settledOnlyLines = renderStripLines([stripSettled], { hint: "hint" });
-	assert.equal(settledOnlyLines.length, 2, "the settled-only strip is the Completed line plus the hint");
-	assert.ok(lineContains(settledOnlyLines[0], "Completed"), "the Completed line replaces the no-dispatch placeholder");
-	assert.ok(!settledOnlyLines.some((line) => lineContains(line, "No active dispatches")), "the placeholder stays hidden behind the Completed line");
-	assert.ok(!settledOnlyLines.some((line) => lineContains(line, "only settled")), "the settled task header does not render");
-	assert.ok(!settledOnlyLines.some((line) => lineContains(line, "scout")), "the settled task's entries do not render");
+	assert.equal(settledOnlyLines.length, 2, "the settled-only strip is its summary line plus the hint");
+	assert.ok(lineContains(settledOnlyLines[0], "only settled"), "the settled dispatch's summary line replaces the no-dispatch placeholder");
+	assert.equal(settledOnlyLines[0].segments[0].text, "✓", "the summary line opens with the settled glyph");
+	assert.ok(settledOnlyLines[0].segments[2].text.includes("2s"), "the summary line carries the dispatch's duration");
+	assert.ok(!settledOnlyLines.some((line) => lineContains(line, "No active dispatches")), "the placeholder stays hidden behind the summary line");
+	assert.ok(!settledOnlyLines.some((line) => lineContains(line, "scout")), "the settled view's entries render no lines of their own");
 }
 // <<< EXT-17 S2
 
@@ -378,37 +390,42 @@ assert.equal(emptyView.entries.length, 0);
 	const liveOnly = { label: "EXT-17-1", mode: "single", live: true, glyph: "running", entries: [{ kind: "agent", name: "worker", glyph: "running", durationText: "5s" }] };
 	const liveOnlyLines = renderStripLines([liveOnly], { hint: "hint" });
 	assert.equal(liveOnlyLines.length, 3, "header + agent + hint");
-	assert.ok(!liveOnlyLines.some((line) => lineContains(line, "Completed")), "no Completed line renders when nothing has settled");
+	assert.ok(!liveOnlyLines.some((line) => lineContains(line, "Completed")), "no aggregated Completed line renders when nothing has settled");
 	assert.ok(!liveOnlyLines.some((line) => lineContains(line, "No active dispatches")));
 }
 // <<< EXT-17 S3
 
-// >>> EXT-17 S4: the Completed glyph aggregates done, failed, and mixed
+// >>> EXT-17 S4, adapted by EXT-22: each settled line carries its own view's glyph, no aggregate
 {
-	const doneView = { label: "settled done", mode: "single", live: false, glyph: "done", entries: [] };
-	const failedView = { label: "settled failed", mode: "single", live: false, glyph: "failed", entries: [] };
-	assert.equal(renderStripLines([doneView, { ...doneView, label: "settled done 2" }], { hint: "hint" })[0].segments[0].text, "✓", "all-done settles aggregate to the done glyph");
-	assert.equal(renderStripLines([failedView], { hint: "hint" })[0].segments[0].text, "✗", "all-failed settles aggregate to the failed glyph");
-	assert.equal(renderStripLines([doneView, failedView], { hint: "hint" })[0].segments[0].text, "◐", "mixed outcomes aggregate to the mixed glyph");
-	assert.equal(renderStripLines([doneView, failedView], { hint: "hint" })[0].segments[2].text, " · 2 dispatches");
+	const doneView = { label: "settled done", mode: "single", live: false, glyph: "done", durationText: "1s", entries: [] };
+	const failedView = { label: "settled failed", mode: "single", live: false, glyph: "failed", durationText: "3s", entries: [] };
+	const bothLines = renderStripLines([doneView, failedView], { hint: "hint" });
+	assert.equal(bothLines.length, 3, "one summary line per settled dispatch plus the hint");
+	assert.equal(bothLines[0].segments[0].text, "✓", "a done settled view's line carries the done glyph");
+	assert.equal(bothLines[1].segments[0].text, "✗", "a failed settled view's line carries the failed glyph");
+	assert.ok(!bothLines.some((line) => lineContains(line, "dispatch")), "no aggregated dispatch-count line renders");
+	assert.ok(!bothLines.some((line) => lineContains(line, "Completed")));
 }
 // <<< EXT-17 S4
 
-// >>> EXT-17 S5: settled bulk never overflows; live overflow cuts the Completed line into +N more
+// >>> EXT-17 S5, adapted by EXT-22: settled bulk overflows into "+N more" with live content still leading
 {
 	const settledBulk = Array.from({ length: 15 }, (_, index) => ({
 		label: `settled ${index}`,
 		mode: "single",
 		live: false,
 		glyph: "done",
+		durationText: "1s",
 		entries: Array.from({ length: 3 }, (_, slot) => ({ kind: "agent", name: `s${index}-${slot}`, glyph: "done", durationText: "1s" })),
 	}));
 	const bulkLines = renderStripLines(settledBulk, { hint: "hint", maxLines: 12 });
-	assert.equal(bulkLines.length, 2, "15 settled views collapse to one Completed line plus the hint, never overflowing");
-	assert.ok(lineContains(bulkLines[0], "Completed"));
-	assert.ok(lineContains(bulkLines[0], "15 dispatches"));
-	assert.ok(!bulkLines.some((line) => lineContains(line, "more")), "settled bulk never triggers the +N more overflow");
-	assert.ok(!bulkLines.some((line) => lineContains(line, "settled 0")), "the settled views' own headers never render");
+	assert.equal(bulkLines.length, STRIP_MAX_LINES, "15 settled summary lines overflow the 10-line content budget without exceeding it");
+	assert.ok(lineContains(bulkLines[0], "settled 0"), "settled summary lines render in insertion order from the top");
+	assert.ok(lineContains(bulkLines[9], "settled 9"), "the budgeted content holds the first ten settled lines");
+	assert.ok(lineContains(bulkLines[bulkLines.length - 2], "+5 more"), "the overflow summarizes the five omitted settled lines");
+	assert.ok(!bulkLines.some((line) => lineContains(line, "settled 14")), "the omitted settled lines stay below the cut");
+	assert.ok(!bulkLines.some((line) => lineContains(line, "Completed")), "no aggregated Completed line renders");
+	assert.equal(bulkLines[bulkLines.length - 1].segments[0].text, "hint", "hint stays last under settled bulk");
 
 	const liveFlood = {
 		label: "flood",
@@ -421,12 +438,13 @@ assert.equal(emptyView.entries.length, 0);
 	const overflowRendered = overflowLines.map(lineText).join("\n");
 	assert.ok(overflowRendered.includes("live-7"), "the live block's lines lead and survive the cut");
 	assert.ok(!overflowRendered.includes("live-11"), "the live block itself is long enough to reach the cut");
-	assert.ok(overflowRendered.includes("+4 more"), "the overflow summarizes the cut content (14 content lines minus the 10-line budget)");
-	assert.ok(!overflowRendered.includes("Completed"), "the Completed line is cut into the summary like ordinary content when live content alone overflows");
+	assert.ok(overflowRendered.includes("+6 more"), "the overflow summarizes the cut content (16 content lines minus the 10-line budget)");
+	assert.ok(overflowRendered.includes("settled 0"), "the settled summary lines follow the live block in insertion order");
+	assert.ok(!overflowRendered.includes("Completed"), "no aggregated Completed line renders under overflow");
 	assert.equal(overflowLines[overflowLines.length - 1].segments[0].text, "hint", "hint stays last under the live overflow");
 
 	// Live content lands exactly at maxContent (header + 9 agents = 10 content
-	// lines), so the one settled view's Completed line is what trips the
+	// lines), so the one settled view's summary line is what trips the
 	// boundary and is the line cut into +1 more.
 	const boundaryTask = {
 		label: "boundary",
@@ -436,11 +454,11 @@ assert.equal(emptyView.entries.length, 0);
 		entries: Array.from({ length: 9 }, (_, index) => ({ kind: "agent", name: `edge-${index}`, glyph: "running", durationText: "1s" })),
 	};
 	const boundaryLines = renderStripLines([boundaryTask, ...settledBulk.slice(0, 1)], { hint: "hint", maxLines: 12 });
-	assert.ok(boundaryLines.some((line) => lineContains(line, "+1 more")), `live content exactly at maxContent pushes the Completed line into a +1 more summary, got ${boundaryLines.map(lineText).join(" | ")}`);
+	assert.ok(boundaryLines.some((line) => lineContains(line, "+1 more")), `live content exactly at maxContent pushes the settled summary line into a +1 more summary, got ${boundaryLines.map(lineText).join(" | ")}`);
 }
 // <<< EXT-17 S5
 
-// >>> EXT-17 S6: a task joins the Completed line only once every agent completes
+// >>> EXT-17 S6, adapted by EXT-22: a task renders its own summary line only once every agent completes
 {
 	const partialRegistry = createDispatchRegistry();
 	const partialTask = partialRegistry.startTask({ mode: "parallel", prompt: "Task: EXT-17-1 strip partial", now: 1_000 });
@@ -449,12 +467,13 @@ assert.equal(emptyView.entries.length, 0);
 	const partialViews = buildStripTasks(partialRegistry, [], 3_000);
 	assert.equal(partialViews[0].live, true, "a task with a still-running agent is live on the strip too");
 	const partialLines = renderStripLines(partialViews, { hint: "hint" });
-	assert.ok(!partialLines.some((line) => lineContains(line, "Completed")), "the live block renders and nothing joins a Completed line yet");
+	assert.ok(!partialLines.some((line) => lineContains(line, "Completed")), "nothing aggregates while an agent runs");
 	partialRegistry.updateAgent(partialTask.id, 1, 1, { status: "done", finishedAt: 4_000 });
 	const settledLines = renderStripLines(buildStripTasks(partialRegistry, [], 5_000), { hint: "hint" });
-	assert.ok(lineContains(settledLines[0], "Completed"), "the task joins the Completed line once every agent completes");
-	assert.ok(lineContains(settledLines[0], "1 dispatch"));
-	assert.equal(settledLines.length, 2, "Completed line + hint only");
+	assert.equal(settledLines.length, 2, "the settled task's summary line plus the hint only");
+	assert.ok(lineContains(settledLines[0], "EXT-17-1 strip partial"), "the task renders its own summary line once every agent completes");
+	assert.equal(settledLines[0].segments[0].text, "✓", "the summary line carries the task's settled glyph");
+	assert.equal(settledLines[0].segments[2].text, " · 3s", "the summary line's duration spans task start to the latest finish");
 }
 // <<< EXT-17 S6
 

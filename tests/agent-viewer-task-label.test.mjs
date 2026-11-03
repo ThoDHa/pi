@@ -10,8 +10,11 @@
  * longer words), the first-words fallback for unmatched prompts
  * (whitespace collapse, word-boundary fill up to the fixed width,
  * ellipsis suffix, hard slice when a single word exceeds the width),
- * the empty-prompt edge, and the shared presentation helpers
- * (dispatch-count wording, settled-glyph aggregation).
+ * the task-file summary composition (resolveTaskSummary: id plus slug
+ * from the first task-file citation, hyphens read as words, width-capped
+ * with the same ellipsis contract), the empty-prompt edge, and the
+ * shared presentation helpers (dispatch-count wording, settled-glyph
+ * aggregation).
  */
 
 import assert from "node:assert/strict";
@@ -20,6 +23,7 @@ import {
 	dispatchCountText,
 	findFleetTaskReference,
 	resolveTaskLabel,
+	resolveTaskSummary,
 	TASK_LABEL_MAX_WIDTH,
 } from "../extensions/agent-viewer/labels.ts";
 
@@ -99,6 +103,59 @@ assertFleetLabel("sync EXT-5-1234567 with the ledger", "EXT-5-1234567");
 // A bare date-shaped number with no EXT prefix takes the first-words fallback.
 assertFleetLabel("run the 20261030 reconciliation sweep", "run the 20261030 reconciliation sweep");
 // <<< EXT-19 L3
+
+// >>> EXT-22 L1: resolveTaskSummary composes id plus slug from a task-file citation
+// A prompt citing its task file by path (the fleet's dispatch convention,
+// .tasks/current/EXT-N[-M]-YYYYMMDD-HHMM-slug.md) resolves the id plus the
+// filename's slug read as words, hyphens as spaces, first citation winning,
+// width-capped at TASK_LABEL_MAX_WIDTH. A report-dir citation matches the same
+// way: the basename still terminates at .md before the following slash.
+assert.equal(
+	resolveTaskSummary("Your contract is /home/x/.pi/.tasks/current/EXT-24-20261102-2037-fix-the-strip-label-truncation.md; read it fully first"),
+	"EXT-24 · fix the strip label truncation",
+);
+assert.equal(
+	resolveTaskSummary("deposit per .tasks/reports/EXT-24-20261102-2037-fix-the-strip-label-truncation.md/01-plan.md"),
+	"EXT-24 · fix the strip label truncation",
+	"a report-dir citation matches the same basename shape",
+);
+// Child ids keep their second segment; longer slugs read as words.
+assert.equal(
+	resolveTaskSummary("Read /home/x/.pi/.tasks/current/EXT-19-1-20261030-0918-collapse-completed-jobs-under-a-completed-umbrella.md and follow it"),
+	"EXT-19-1 · collapse completed jobs under a completed umbrella",
+);
+// First citation wins on multi-citation prompts (the id primitive's convention).
+assert.equal(
+	resolveTaskSummary("Contract EXT-2-20261101-0900-first-task-file.md; coordinate with EXT-3-20261101-1000-second-task-file.md"),
+	"EXT-2 · first task file",
+);
+// Case-insensitive id, normalized uppercase like the reference primitive.
+assert.equal(
+	resolveTaskSummary("see ext-7-20261030-0918-lowercase-citation.md for the contract"),
+	"EXT-7 · lowercase citation",
+);
+// No citation resolves null; callers fall back to resolveTaskLabel. A bare
+// fleet reference composes no slug and is not a citation.
+assert.equal(resolveTaskSummary("Task: EXT-9-2 parser fixes"), null, "a bare fleet reference is not a citation");
+assert.equal(resolveTaskSummary("Reply ready for the fleet"), null);
+assert.equal(resolveTaskSummary(""), null);
+
+// Width cap: the summary truncates on a word boundary with the trailing
+// ellipsis, capped at TASK_LABEL_MAX_WIDTH; a single over-long slug word is
+// hard-sliced.
+{
+	const longSlug = "EXT-24-20261102-2037-" + "word ".repeat(20).trim() + ".md";
+	const summary = resolveTaskSummary(`read .tasks/current/${longSlug} now`);
+	assert.ok(summary.startsWith("EXT-24 · "), `the capped summary keeps its id prefix, got ${JSON.stringify(summary)}`);
+	assert.ok(summary.length <= TASK_LABEL_MAX_WIDTH, `summary ${JSON.stringify(summary)} exceeds ${TASK_LABEL_MAX_WIDTH}`);
+	assert.ok(summary.endsWith("…"), `the truncated summary ${JSON.stringify(summary)} lacks an ellipsis`);
+
+	const wordSlug = "EXT-24-20261102-2037-" + "x".repeat(TASK_LABEL_MAX_WIDTH + 10) + ".md";
+	const sliced = resolveTaskSummary(`read .tasks/current/${wordSlug} now`);
+	assert.equal(sliced.length, TASK_LABEL_MAX_WIDTH, `the hard-sliced summary is width-capped, got ${JSON.stringify(sliced)}`);
+	assert.ok(sliced.endsWith("…"));
+}
+// <<< EXT-22 L1
 
 // >>> EXT-18 L1: dispatchCountText, the Completed surfaces' dispatch-count wording
 // The singular/plural boundary is what the navigator's Completed umbrella detail

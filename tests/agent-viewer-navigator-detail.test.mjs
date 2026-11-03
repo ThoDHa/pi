@@ -135,12 +135,12 @@ assert.equal(taskModel.kind, "task");
 assert.equal(taskModel.title, "EXT-9-8");
 assert.equal(taskModel.statusText, "done");
 assert.deepEqual(taskModel.thinking, [], "task targets stream no thinking of their own");
-// EXT-19 D8 adaptation of the former "task targets stream no activity of their
-// own" pin (original intent: task targets aggregate their children and stream
-// no raw activity log themselves): D4 supersedes it with exactly one derived
-// entry, the task's agents' latest (greatest at), so the pin still rules out a
-// raw log streaming through while naming the new surface.
-assert.deepEqual(taskModel.activity, [{ at: 3_000, kind: "toolCall", name: "bash", args: { command: "rg alpha" }, text: "$ rg alpha" }], "task targets carry exactly their agents' latest activity entry, not a raw log");
+// EXT-22 adaptation of the former "task targets stream no activity of their
+// own" pin (original intent: task targets aggregate their children and
+// stream no raw log themselves): the EXT-19 D4 derivation is gone with it,
+// so a task model's activity list is empty whatever its agents streamed,
+// and the agent pane's timestamped log is the on-demand drill-down.
+assert.deepEqual(taskModel.activity, [], "task targets carry an empty activity list, not a derived latest entry");
 assert.equal(taskModel.members.length, 1);
 assert.equal(taskModel.members[0].label, "round 1");
 assert.equal(taskModel.members[0].glyph, "done");
@@ -156,6 +156,7 @@ assert.equal(roundModel.title, "round 1");
 assert.equal(roundModel.members.length, 1);
 assert.equal(roundModel.members[0].label, "scout");
 assert.equal(roundModel.members[0].glyph, "done");
+assert.equal(roundModel.members[0].detail, "25s", "round member lines carry duration only, no streamed command");
 
 // --- task target: detached task members are its agents ---
 
@@ -167,6 +168,8 @@ assert.equal(detachedModel.title, "watch the probe");
 assert.equal(detachedModel.members.length, 1);
 assert.equal(detachedModel.members[0].label, "observer");
 assert.equal(detachedModel.members[0].glyph, "running");
+assert.equal(detachedModel.members[0].detail, "16m10s", "detached member lines carry duration only, no streamed command");
+assert.ok(!detachedModel.members[0].detail.includes("read nav.log"));
 assert.deepEqual(detachedModel.thinking, [], "task targets carry an empty thinking log like their activity");
 
 // --- missing and absent selections resolve to the empty model ---
@@ -281,10 +284,14 @@ assert.equal(resolveDetailModel(orphanRow, tasks).kind, "empty", "a row whose ta
 }
 // <<< EXT-19 D3
 
-// >>> EXT-19 D4: the task detail carries one derived latest-activity entry
+// >>> EXT-22 D1: task detail models carry an empty activity list, superseding
+// the EXT-19 D4 derivation (latest-across-agents, tie rule, detached path,
+// silent-task emptiness): the streamed one-line command no longer surfaces on
+// any task pane, and the agent pane's timestamped log is the drill-down. The
+// fixture's agent streams activity so the pin has teeth against a derivation.
 {
 	const registry = createDispatchRegistry();
-	const activityTask = registry.startTask({ mode: "chain", prompt: "Task: EXT-19-4 activity probe", now: 1_000 });
+	const activityTask = registry.startTask({ mode: "chain", prompt: "Task: EXT-22-1 activity probe", now: 1_000 });
 	registry.startRound(activityTask.id, [{ agent: "first", step: 1 }], 1_000);
 	registry.startRound(activityTask.id, [{ agent: "second", step: 2 }], 2_000);
 	registry.updateAgent(activityTask.id, 1, 0, {
@@ -301,47 +308,8 @@ assert.equal(resolveDetailModel(orphanRow, tasks).kind, "empty", "a row whose ta
 	assert.ok(activityRow, "the fixture exposes the activity task row");
 	const activityModel = resolveDetailModel(activityRow, activityViews);
 	assert.equal(activityModel.kind, "task");
-	assert.deepEqual(
-		activityModel.activity,
-		[{ at: 7_000, kind: "text", text: "first agent newer" }],
-		"the greatest-at entry across every round's agents wins, as exactly one entry",
-	);
-
-	// Tie rule: equal timestamps resolve last-in-order across the agents.
-	const tieRegistry = createDispatchRegistry();
-	const tieTask = tieRegistry.startTask({ mode: "single", prompt: "Task: EXT-19-5 tie probe", now: 1_000 });
-	tieRegistry.startRound(tieTask.id, [{ agent: "alpha" }, { agent: "beta" }], 1_000);
-	tieRegistry.updateAgent(tieTask.id, 1, 0, { activity: [{ at: 4_000, kind: "text", text: "alpha entry" }] });
-	tieRegistry.updateAgent(tieTask.id, 1, 1, { activity: [{ at: 4_000, kind: "text", text: "beta entry" }] });
-	const tieViews = buildNavigatorTasks(tieRegistry, [], 5_000);
-	const tieRow = flattenNavigatorTree(tieViews, createExpansionState()).find((row) => row.kind === "task");
-	assert.ok(tieRow, "the fixture exposes the tie task row");
-	assert.deepEqual(resolveDetailModel(tieRow, tieViews).activity, [{ at: 4_000, kind: "text", text: "beta entry" }], "equal timestamps resolve last-in-order");
-
-	// Detached path: the derivation reads the job's agents the same way.
-	const detachedActivity = {
-		id: "job-activity",
-		mode: "single",
-		status: "running",
-		agentNames: ["solo"],
-		taskPreview: "detached activity probe",
-		startedAt: 1_000,
-		agents: [{ agent: "solo", status: "running", startedAt: 1_000, activity: [{ at: 3_500, kind: "thinking", text: "weighing it" }] }],
-	};
-	const detachedViews = buildNavigatorTasks(createDispatchRegistry(), [detachedActivity], 4_000);
-	const detachedRow = flattenNavigatorTree(detachedViews, createExpansionState()).find((row) => row.kind === "task");
-	assert.ok(detachedRow, "the fixture exposes the detached activity row");
-	assert.deepEqual(resolveDetailModel(detachedRow, detachedViews).activity, [{ at: 3_500, kind: "thinking", text: "weighing it" }], "detached agents feed the same derivation");
-
-	// No activity anywhere resolves to no entry, like today.
-	const silentRegistry = createDispatchRegistry();
-	const silentTask = silentRegistry.startTask({ mode: "single", prompt: "Task: EXT-19-6 silence probe", now: 1_000 });
-	silentRegistry.startRound(silentTask.id, [{ agent: "hush" }], 1_000);
-	const silentViews = buildNavigatorTasks(silentRegistry, [], 2_000);
-	const silentRow = flattenNavigatorTree(silentViews, createExpansionState()).find((row) => row.kind === "task");
-	assert.ok(silentRow, "the fixture exposes the silent task row");
-	assert.deepEqual(resolveDetailModel(silentRow, silentViews).activity, [], "a task with no agent activity carries none");
+	assert.deepEqual(activityModel.activity, [], "a task model carries an empty activity list whatever its agents streamed");
 }
-// <<< EXT-19 D4
+// <<< EXT-22 D1
 
 console.log("agent-viewer-navigator-detail: all assertions passed");

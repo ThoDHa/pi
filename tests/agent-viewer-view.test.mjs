@@ -1855,13 +1855,14 @@ await withView({ registry: createDispatchRegistry(), detachedJobs: [] }, async (
 const TREE_W_AT_120 = Math.max(26, Math.floor(120 * 0.44));
 const stripAnsi = (text) => text.replace(/\x1b(\[[0-9;]*[A-Za-z]|\]8;;\x07|_[^\x07]*\x07)/g, "");
 
-// >>> EXT-19 V1: the task detail renders the job's full source text, stable across polls
+// >>> EXT-19 V1, re-anchored by EXT-22: the task detail renders the job's full source text, stable across polls
 {
 	const registry = createDispatchRegistry();
 	// A long assignment: its section alone overflows the body budget, so the
-	// pane pages (the derived activity line is the pane tail under D4). The
-	// first line stays marker-free: the fallback label is built from the
-	// prompt's first words, so head markers must not live inside it.
+	// pane pages (the members block is the pane tail since EXT-22 removed the
+	// derived activity line). The first line stays marker-free: the fallback
+	// label is built from the prompt's first words, so head markers must not
+	// live inside it.
 	const prompt = [
 		"You are the worker for this assignment; read every directive line before touching anything.",
 		"",
@@ -1877,22 +1878,27 @@ const stripAnsi = (text) => text.replace(/\x1b(\[[0-9;]*[A-Za-z]|\]8;;\x07|_[^\x
 		// The pane follows the pane tail by default, so the prompt head above is clipped.
 		const tailFrame = view.render(120).join("\n");
 		assert.ok(!tailFrame.includes("marker 02"), "the tail view clips the prompt section's head");
+		assert.ok(!tailFrame.includes("worker note"), "the task pane renders no derived latest-activity line from its agents");
 
 		view.handleInput(HOME);
 		const headFrame = view.render(120).join("\n");
 		assert.ok(headFrame.includes("prompt"), "the section label renders below the header");
 		assert.ok(headFrame.includes("directive marker 02"), "each source line renders as its own pane line");
 		assert.ok(headFrame.includes("\u200b"), "a blank source line renders a zero-width space so the paragraph break survives");
-		assert.ok(!headFrame.includes("worker note"), "the held head view clips the activity tail below");
+		// Guard green by design at base: the members tail was already clipped in
+		// the held head window before the activity removal.
+		assert.ok(!headFrame.includes("round 1"), "the held head view clips the members tail below");
 
 		// A held window does not drift while the immutable prompt section re-renders on a poll.
 		registry.updateAgent(task.id, 1, 0, { activity: [{ at: 1_100, kind: "text", text: "worker note" }, { at: 6_000, kind: "text", text: "worker newer note" }] });
 		poll();
 		const stableFrame = view.render(120).join("\n");
 		assert.ok(stableFrame.includes("marker 02"), "the held window stays on the prompt section across the poll");
-		assert.ok(!stableFrame.includes("worker newer note"), "the held window stays off the new tail after the poll");
+		assert.ok(!stableFrame.includes("worker newer note"), "the polled streamed activity stays off the task pane (no derived activity line)");
 		view.handleInput(END);
-		assert.ok(view.render(120).join("\n").includes("worker newer note"), "end returns the pane to the tail and the derived activity line");
+		const endRender = view.render(120).join("\n");
+		assert.ok(endRender.includes("round 1"), "end returns the pane to the tail, the members block");
+		assert.ok(!endRender.includes("worker newer note"), "the tail holds no derived activity line");
 	});
 }
 
@@ -1919,7 +1925,10 @@ const stripAnsi = (text) => text.replace(/\x1b(\[[0-9;]*[A-Za-z]|\]8;;\x07|_[^\x
 	await withView({ registry, detachedJobs: [] }, async (view) => {
 		assert.equal(view.selectedId, "t:task-1");
 		const frame = view.render(120).join("\n");
-		assert.ok(frame.includes("quiet note"), "the empty-source task still renders its detail pane");
+		// Guard green by design at base: the members block rendered before the
+		// activity removal too.
+		assert.ok(frame.includes("round 1"), "the empty-source task still renders its detail pane (the members block)");
+		assert.ok(!frame.includes("quiet note"), "no derived latest-activity line renders on the task pane");
 		assert.ok(!frame.includes("prompt"), "an empty source text renders no prompt section");
 	});
 }

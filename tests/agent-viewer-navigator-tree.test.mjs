@@ -9,7 +9,9 @@
  * Covers the tree model the view renders: buildNavigatorTasks
  * assembling task -> dispatch round -> agent views from the dispatch
  * registry plus detached-job snapshots (detached jobs as task nodes
- * with their agents as children, labels from the EXT-1-2 heuristic,
+ * with their agents as children, labels resolved through the
+ * task-summary chain (the EXT-1-2 heuristic as the no-citation
+ * fallback),
  * glyphs keyed off job.status on detached tasks, lazy parallel
  * rounds rendering only picked-up agents, the zero-agent round
  * staying live-empty, and liveness dominating settled task glyphs
@@ -76,7 +78,7 @@ assert.deepEqual(finishedRound.agents[0].ref, { source: "registry", ownerId: cha
 const liveRound = chainView.rounds[1];
 assert.equal(liveRound.live, true);
 assert.equal(liveRound.glyph, "running");
-assert.equal(liveRound.agents[0].activity, "$ rg pattern");
+assert.ok(!("activity" in liveRound.agents[0]), "agent views carry no activity field; the streamed command stays off the tree model");
 assert.deepEqual(liveRound.agents[0].ref, { source: "registry", ownerId: chainTask.id, roundIndex: 2, slot: 0 });
 
 // --- buildNavigatorTasks: detached jobs as task nodes with agent children ---
@@ -91,7 +93,7 @@ assert.equal(detachedView.glyph, "running", "detached task glyphs key off job.st
 assert.equal(detachedView.rounds.length, 0, "detached tasks have no round level");
 assert.equal(detachedView.agents.length, 1, "detached agents hang directly off the task node");
 assert.equal(detachedView.agents[0].name, "observer");
-assert.equal(detachedView.agents[0].activity, "read nav.log");
+assert.ok(!("activity" in detachedView.agents[0]), "detached agent views carry no activity field either");
 assert.equal(detachedView.agents[0].startedAt, 30_000);
 assert.deepEqual(detachedView.agents[0].ref, { source: "detached", ownerId: "job-1", slot: 0 });
 
@@ -366,7 +368,7 @@ const workerRow = rows[3];
 assert.equal(workerRow.kind, "agent");
 assert.equal(workerRow.label, "worker");
 assert.equal(workerRow.detail, "18s", "live agent duration = now - startedAt");
-assert.equal(workerRow.activity, "$ rg pattern");
+assert.ok(!("activity" in workerRow), "tree rows carry no activity suffix");
 assert.ok(workerRow.agentRef, "agent rows carry the detail-pane ref");
 
 // --- flattenNavigatorTree: expand/collapse overrides are sticky ---
