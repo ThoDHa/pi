@@ -24,7 +24,9 @@
  * treeWindowStart's minimal-shift cursor-following window (a fitting
  * tree returns the top, a stale previous start clamps before the
  * cursor shift, walking past the window bottom shifts by one, a far
- * cursor snaps the window to its side, and row 0 restores the top).
+ * cursor snaps the window to its side, row 0 restores the top, and a
+ * collapsed (zero-row) viewport pins the window to the top
+ * idempotently).
  */
 
 import assert from "node:assert/strict";
@@ -473,6 +475,19 @@ assert.equal(treeWindowStart(36, 0, 21, 15), 0, "walking back to row 0 restores 
 assert.equal(treeWindowStart(36, 35, 21, 100), 15, "an out-of-range previous start clamps into range and holds when the cursor is inside");
 assert.equal(treeWindowStart(36, 0, 21, -7), 0, "a negative previous start clamps to the top");
 assert.equal(treeWindowStart(30, 25, 21, 100), 9, "the stale-start clamp precedes the cursor shift");
+
+// The settle-folds composition (rows shrink under a stored start while
+// the cursor clamps to the new tail): a green-by-design guard pinning
+// that the clamp resolves all three moving parts in one call.
+assert.equal(treeWindowStart(30, 29, 21, 15), 9, "a shrunk tree clamps the stored start and holds the clamped cursor's tail-aligned window");
+
+// A collapsed viewport (detailViewportRows floors below one row on
+// tiny terminals) pins the window to the top idempotently: the stored
+// start never oscillates across consecutive frames and the clip then
+// counts every hidden row below honestly.
+assert.equal(treeWindowStart(36, 0, 0, 0), 0, "a zero-row viewport pins the window to the top");
+const viewportZeroFirst = treeWindowStart(36, 0, 0, 0);
+assert.equal(treeWindowStart(36, 0, 0, viewportZeroFirst), viewportZeroFirst, "a zero-row viewport is idempotent across consecutive frames");
 
 // <<< EXT-23-1
 

@@ -54,8 +54,9 @@
  * above-only and below-only degradations, the frame holds its height
  * at the bottom-aligned and shrunk windows, the paging keys and the
  * wheel leave the tree window fixed, a shrink-grow resize re-clamps
- * around the cursor, and row 0 restores the top-aligned window and its
- * one-sided clip); a taller resize while held suppresses the marker once the
+ * around the cursor, row 0 restores the top-aligned window and its
+ * one-sided clip, and a three-row terminal renders an identical clip
+ * across consecutive frames); a taller resize while held suppresses the marker once the
  * tail is actually visible and the following pageDown re-acquires the
  * follow; a shrink resize keeps the frame at exactly the shrunk
  * terminal's height while following and while held; the wheel (stub
@@ -935,6 +936,15 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		const restored = view.render(120);
 		assert.equal(clipText(restored), `… +${treeRows - (BODY_ROWS - 1)} more`, "walking back to row 0 restores the top-aligned window's one-sided clip");
 		assert.ok(treeColumn(restored)[0].includes("EXT-9-1"), "the window is top-aligned again");
+
+		// A three-row terminal collapses the tree viewport to zero rows:
+		// consecutive frames must render an identical clip (the stored
+		// window start stays pinned, never oscillating between claiming a
+		// hidden row above a zero-row window and hiding that claim).
+		tui.terminal.rows = 3;
+		const collapsedClip = clipText(view.render(120));
+		assert.ok(collapsedClip.includes("more"), "the collapsed-viewport frame still clips the overflowing tree");
+		assert.equal(clipText(view.render(120)), collapsedClip, "consecutive renders at a three-row terminal carry identical clip text");
 	}, tui);
 }
 
