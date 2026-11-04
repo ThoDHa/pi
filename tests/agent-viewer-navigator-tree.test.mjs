@@ -20,7 +20,11 @@
  * visible rows (completed rounds collapsed to single glyph lines, the
  * live round auto-expanded, user expand/collapse overrides sticky,
  * task collapse hiding the whole subtree). Also covers the cursor
- * helpers: moveCursor clamping and nextTaskRow wrapping on Tab.
+ * helpers: moveCursor clamping, nextTaskRow wrapping on Tab, and
+ * treeWindowStart's minimal-shift cursor-following window (a fitting
+ * tree returns the top, a stale previous start clamps before the
+ * cursor shift, walking past the window bottom shifts by one, a far
+ * cursor snaps the window to its side, and row 0 restores the top).
  */
 
 import assert from "node:assert/strict";

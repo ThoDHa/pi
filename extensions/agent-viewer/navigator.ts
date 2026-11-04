@@ -375,6 +375,33 @@ export function nextTaskRow(rows: NavigatorRow[], currentIndex: number, directio
 	return previous ?? taskIndices[taskIndices.length - 1];
 }
 
+/**
+ * First row of the tree pane's visible window for one frame: the
+ * minimal-shift window that follows the cursor so the selected row is
+ * never below the fold. Returns 0 while the tree fits the viewport
+ * (rowCount <= viewportRows), top-aligning it. Otherwise previousStart
+ * is clamped into [0, rowCount - viewportRows] (a poll or resize can
+ * leave a stale start) and then shifted minimally so the cursor sits
+ * inside the window: a cursor above the window raises the start to the
+ * cursor, a cursor at or past the window's bottom lowers it to
+ * cursorIndex - viewportRows + 1, so walking past the fold scrolls one
+ * row at a time while a far jump snaps the window to the cursor's
+ * side, and walking back to row 0 restores the top-aligned window.
+ * The caller stores the result back as the next frame's previousStart;
+ * every poll, expansion, and resize re-derives the window through this
+ * one function, so cursor visibility holds by construction. cursorIndex
+ * is expected in range (the cursor helpers clamp it); the clamp-precedes-
+ * shift order is pinned by the tree suite.
+ */
+export function treeWindowStart(rowCount: number, cursorIndex: number, viewportRows: number, previousStart: number): number {
+	if (rowCount <= viewportRows) return 0;
+	const maxStart = rowCount - viewportRows;
+	let start = Math.min(maxStart, Math.max(0, previousStart));
+	if (cursorIndex < start) start = cursorIndex;
+	else if (cursorIndex >= start + viewportRows) start = cursorIndex - viewportRows + 1;
+	return start;
+}
+
 export interface NavigatorDetailField {
 	label: string;
 	value: string;

@@ -97,6 +97,7 @@ import {
 	nextTaskRow,
 	resolveDetailModel,
 	toggleNavigatorRow,
+	treeWindowStart,
 	type NavigatorExpansionState,
 	type NavigatorRow,
 	type NavigatorTaskView,
@@ -309,6 +310,8 @@ export class NavigatorView implements Focusable {
 	private expansion: NavigatorExpansionState = createExpansionState();
 	private selectedId: string | null = null;
 	private selectedIndex = 0;
+	/** First row of the tree pane's visible window, stored back each render as the next frame's previous start; only the cursor can shift it (the paging keys and the wheel never touch it). */
+	private treeScrollTop = 0;
 	private scroll: DetailScrollState = createDetailScrollState();
 	private showToolNoise = false;
 	private transcript: TranscriptThinkingState | null = null;
@@ -575,7 +578,7 @@ export class NavigatorView implements Focusable {
 
 	/**
 	 * Detail-pane viewport rows for the current frame: the body budget
-	 * minus the row the tree's +N more clip occupies while the tree
+	 * minus the row the tree's overflow clip occupies while the tree
 	 * overflows, so the window and its indicator always fit the rows
 	 * the frame actually shows. A scroll computed against a shorter
 	 * tree runs on the stale larger budget until the next render's
@@ -750,8 +753,14 @@ export class NavigatorView implements Focusable {
 		const detailW = bodyWidth - treeW - PANE_GAP;
 
 		const bodyRows = viewBodyRows(this.tui.terminal.rows);
-		const treeRows = this.rows.map((row) => this.renderTreeRow(row, treeW));
-		const omitted = Math.max(0, treeRows.length - bodyRows);
+		const treeViewport = this.detailViewportRows(bodyRows);
+		const treeStart = treeWindowStart(this.rows.length, this.selectedIndex, treeViewport, this.treeScrollTop);
+		this.treeScrollTop = treeStart;
+		const treeRows = this.rows
+			.slice(treeStart, treeStart + treeViewport)
+			.map((row) => this.renderTreeRow(row, treeW));
+		const above = treeStart;
+		const below = this.rows.length - treeStart - treeViewport;
 		const viewport = this.detailViewport();
 		const detailLines = this.renderDetailLines();
 		const keys = detailLines.map((line) => line.key);
@@ -773,7 +782,13 @@ export class NavigatorView implements Focusable {
 		// lines, so blank list entries would not pad a VStack.
 		const clipped = body.slice(0, viewport);
 		while (clipped.length < viewport) clipped.push("");
-		if (omitted > 0) clipped.push(theme.fg("muted", `… +${omitted} more`));
+		if (this.rows.length > treeViewport) {
+			// The clip row stays reserved while the tree overflows even when
+			// the window is bottom-aligned (nothing hides below): dropping it
+			// there would shrink the frame mid-walk.
+			const clip = above > 0 && below > 0 ? `… +${above} above · +${below} more` : above > 0 ? `… +${above} above` : `… +${below} more`;
+			clipped.push(theme.fg("muted", clip));
+		}
 
 		const filterState = this.showToolNoise ? "tools shown" : "tools hidden";
 		const header = `${theme.fg("accent", theme.bold("Periscope"))} ${theme.fg("muted", `· ${filterState} · ctrl+t`)}`;

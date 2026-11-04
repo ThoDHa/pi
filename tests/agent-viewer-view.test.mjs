@@ -48,7 +48,14 @@
  * retention; live tasks render
  * their rows above the Completed umbrella row holding settled ones; tree overflow budgets the window one
  * row short so the newest line and the indicator survive the +N more
- * clip; a taller resize while held suppresses the marker once the
+ * clip; the tree window follows the cursor with the minimal shift (the
+ * selected row renders inside the shifted slice at every depth, the
+ * clip reports both hidden sides `… +N above · +M more` with the
+ * above-only and below-only degradations, the frame holds its height
+ * at the bottom-aligned and shrunk windows, the paging keys and the
+ * wheel leave the tree window fixed, a shrink-grow resize re-clamps
+ * around the cursor, and row 0 restores the top-aligned window and its
+ * one-sided clip); a taller resize while held suppresses the marker once the
  * tail is actually visible and the following pageDown re-acquires the
  * follow; a shrink resize keeps the frame at exactly the shrunk
  * terminal's height while following and while held; the wheel (stub
@@ -125,6 +132,11 @@ const thinkingTheme = {
 };
 
 const stubTui = () => ({ requestRender() {}, terminal: { rows: ROWS, columns: 120 } });
+
+// Pane geometry render(120) composes against, and ANSI stripping for the
+// row-shape pins (EXT-19 V2/V3, EXT-23-1's visible tree column).
+const TREE_W_AT_120 = Math.max(26, Math.floor(120 * 0.44));
+const stripAnsi = (text) => text.replace(/\x1b(\[[0-9;]*[A-Za-z]|\]8;;\x07|_[^\x07]*\x07)/g, "");
 
 const keybindings = new KeybindingsManager({
 	"app.tree.filter.noTools": { defaultKeys: "ctrl+t" },
@@ -923,7 +935,7 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		const restored = view.render(120);
 		assert.equal(clipText(restored), `… +${treeRows - (BODY_ROWS - 1)} more`, "walking back to row 0 restores the top-aligned window's one-sided clip");
 		assert.ok(treeColumn(restored)[0].includes("EXT-9-1"), "the window is top-aligned again");
-	});
+	}, tui);
 }
 
 // <<< EXT-23-1
@@ -1946,10 +1958,6 @@ await withView({ registry: createDispatchRegistry(), detachedJobs: [] }, async (
 	});
 }
 // <<< EXT-17 V2
-
-// >>> EXT-19 V2 helpers: the pane geometry render(120) composes against, and ANSI stripping for row-shape pins
-const TREE_W_AT_120 = Math.max(26, Math.floor(120 * 0.44));
-const stripAnsi = (text) => text.replace(/\x1b(\[[0-9;]*[A-Za-z]|\]8;;\x07|_[^\x07]*\x07)/g, "");
 
 // >>> EXT-19 V1, re-anchored by EXT-22: the task detail renders the job's full source text, stable across polls
 {
