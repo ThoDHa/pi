@@ -19,7 +19,12 @@
  * flattenNavigatorTree turning views plus expansion state into
  * visible rows (completed rounds collapsed to single glyph lines, the
  * live round auto-expanded, user expand/collapse overrides sticky,
- * task collapse hiding the whole subtree). Also covers the cursor
+ * task collapse hiding the whole subtree, and the EXT-24-1
+ * partition-keyed default: under an expanded umbrella a settled task
+ * renders its task row alone until expanded while a live task keeps
+ * the expanded default, the task toggle writing by the row's
+ * partition and clearing the non-governing set so the latest intent
+ * carries across live/settled flips). Also covers the cursor
  * helpers: moveCursor clamping, nextTaskRow wrapping on Tab, and
  * treeWindowStart's minimal-shift cursor-following window (a fitting
  * tree returns the top, a stale previous start clamps before the
@@ -835,5 +840,172 @@ assert.equal(treeWindowStart(36, 0, 0, viewportZeroFirst), viewportZeroFirst, "a
 	assert.equal(step(-1), "t:task-1", "up from the first row stays clamped on it");
 }
 // <<< EXT-21 T1
+
+// >>> EXT-24-1: the settled default shape under the expanded umbrella
+{
+	const shapeRegistry = createDispatchRegistry();
+	const shapeTask = shapeRegistry.startTask({ mode: "single", prompt: "Task: EXT-24-1 shape probe", now: 1_000 });
+	shapeRegistry.startRound(shapeTask.id, [{ agent: "early" }], 1_000);
+	shapeRegistry.updateAgent(shapeTask.id, 1, 0, { status: "done", finishedAt: 2_000 });
+	const shapeJob = {
+		id: "job-shape",
+		mode: "parallel",
+		status: "done",
+		agents: [
+			{ agent: "left", status: "done", startedAt: 1_000, finishedAt: 2_000 },
+			{ agent: "right", status: "done", startedAt: 1_000, finishedAt: 3_000 },
+		],
+		agentNames: ["left", "right"],
+		taskPreview: "Task: EXT-24-1 shape job",
+		startedAt: 1_000,
+		finishedAt: 3_000,
+	};
+	const shapeViews = buildNavigatorTasks(shapeRegistry, [shapeJob], 4_000);
+	const shapeState = createExpansionState();
+	toggleNavigatorRow(shapeState, flattenNavigatorTree(shapeViews, shapeState).find((row) => row.kind === "umbrella"), true);
+	const foldedRows = flattenNavigatorTree(shapeViews, shapeState);
+	assert.deepEqual(
+		foldedRows.filter((row) => row.taskId === shapeTask.id).map((row) => row.id),
+		[`t:${shapeTask.id}`],
+		"a settled registry task renders its task row alone under the expanded umbrella",
+	);
+	assert.deepEqual(
+		foldedRows.filter((row) => row.taskId === "job-shape").map((row) => row.id),
+		["t:job-shape"],
+		"a settled detached job renders its task row alone under the expanded umbrella",
+	);
+	assert.ok(
+		foldedRows.filter((row) => !row.live && row.kind === "task").every((row) => row.depth === 1),
+		"the folded settled task rows sit at the umbrella's child depth",
+	);
+
+	// Right reveals the rounds through the existing defaults: the settled
+	// round renders its summary line, its agents still gated by the round
+	// default; a settled detached job reveals its agents directly.
+	toggleNavigatorRow(shapeState, foldedRows.find((row) => row.id === `t:${shapeTask.id}`), true);
+	const revealedTaskRows = flattenNavigatorTree(shapeViews, shapeState);
+	assert.deepEqual(
+		revealedTaskRows.filter((row) => row.taskId === shapeTask.id).map((row) => row.id),
+		[`t:${shapeTask.id}`, `t:${shapeTask.id}:r1`],
+		"expanding the settled task reveals its round summary line alone",
+	);
+	toggleNavigatorRow(shapeState, revealedTaskRows.find((row) => row.id === `t:${shapeTask.id}:r1`), true);
+	assert.deepEqual(
+		flattenNavigatorTree(shapeViews, shapeState).filter((row) => row.taskId === shapeTask.id).map((row) => row.id),
+		[`t:${shapeTask.id}`, `t:${shapeTask.id}:r1`, `t:${shapeTask.id}:r1:a0`],
+		"the round override still gates the settled agent rows behind the revealed round",
+	);
+	toggleNavigatorRow(shapeState, revealedTaskRows.find((row) => row.id === "t:job-shape"), true);
+	assert.deepEqual(
+		flattenNavigatorTree(shapeViews, shapeState).filter((row) => row.taskId === "job-shape").map((row) => row.id),
+		["t:job-shape", "t:job-shape:a0", "t:job-shape:a1"],
+		"expanding the settled detached job reveals its agent rows",
+	);
+
+	// Left re-folds both.
+	const expandedShapes = flattenNavigatorTree(shapeViews, shapeState);
+	toggleNavigatorRow(shapeState, expandedShapes.find((row) => row.id === `t:${shapeTask.id}`), false);
+	toggleNavigatorRow(shapeState, expandedShapes.find((row) => row.id === "t:job-shape"), false);
+	const refoldedRows = flattenNavigatorTree(shapeViews, shapeState);
+	assert.deepEqual(
+		refoldedRows.filter((row) => row.taskId === shapeTask.id).map((row) => row.id),
+		[`t:${shapeTask.id}`],
+		"left re-folds the expanded settled task",
+	);
+	assert.deepEqual(
+		refoldedRows.filter((row) => row.taskId === "job-shape").map((row) => row.id),
+		["t:job-shape"],
+		"left re-folds the expanded settled job",
+	);
+}
+// <<< EXT-24-1 (default shape)
+
+// >>> EXT-24-1: partition flips carry the user's latest intent
+{
+	const flipRegistry = createDispatchRegistry();
+	const flipTask = flipRegistry.startTask({ mode: "single", prompt: "Task: EXT-24-1 flip probe", now: 1_000 });
+	flipRegistry.startRound(flipTask.id, [{ agent: "early" }], 1_000);
+	flipRegistry.updateAgent(flipTask.id, 1, 0, { status: "done", finishedAt: 2_000 });
+	const settledViews = buildNavigatorTasks(flipRegistry, [], 3_000);
+	const flipState = createExpansionState();
+	toggleNavigatorRow(flipState, flattenNavigatorTree(settledViews, flipState).find((row) => row.kind === "umbrella"), true);
+	toggleNavigatorRow(flipState, flattenNavigatorTree(settledViews, flipState).find((row) => row.id === `t:${flipTask.id}`), true);
+	assert.ok(
+		flattenNavigatorTree(settledViews, flipState).some((row) => row.id === `t:${flipTask.id}:r1`),
+		"an explicitly expanded settled task renders its round rows",
+	);
+
+	// Re-livening through a new round flips the partition: the live rule
+	// governs again and the task renders expanded because the expand-while-
+	// settled toggle cleared the live set (the user's latest intent was
+	// expanded).
+	flipRegistry.startRound(flipTask.id, [{ agent: "again" }], 4_000);
+	const relivenedViews = buildNavigatorTasks(flipRegistry, [], 5_000);
+	assert.equal(relivenedViews[0].live, true, "the new round re-livens the task");
+	assert.deepEqual(
+		flattenNavigatorTree(relivenedViews, flipState).filter((row) => row.taskId === flipTask.id).map((row) => row.kind),
+		["task", "round", "round", "agent"],
+		"a task expanded while settled renders expanded once it re-livens",
+	);
+
+	// Collapse while live, then settle: the task stays folded under the
+	// expanded umbrella (guard: the live collapse carries over and the
+	// settled default folds regardless).
+	const liveCollapseRows = flattenNavigatorTree(relivenedViews, flipState);
+	toggleNavigatorRow(flipState, liveCollapseRows.find((row) => row.id === `t:${flipTask.id}`), false);
+	assert.deepEqual(
+		flattenNavigatorTree(relivenedViews, flipState).filter((row) => row.taskId === flipTask.id).map((row) => row.id),
+		[`t:${flipTask.id}`],
+		"collapsing the re-livened task folds its subtree again",
+	);
+	flipRegistry.updateAgent(flipTask.id, 2, 0, { status: "done", finishedAt: 6_000 });
+	const resettledViews = buildNavigatorTasks(flipRegistry, [], 7_000);
+	assert.deepEqual(
+		flattenNavigatorTree(resettledViews, flipState).filter((row) => row.taskId === flipTask.id).map((row) => row.id),
+		[`t:${flipTask.id}`],
+		"a task collapsed while live stays folded once it settles",
+	);
+}
+// <<< EXT-24-1 (partition flips)
+
+// >>> EXT-24-1: the task toggle writes by the row's partition and clears the non-governing set
+{
+	const writeSettledRegistry = createDispatchRegistry();
+	const writeSettledTask = writeSettledRegistry.startTask({ mode: "single", prompt: "Task: EXT-24-1 write probe", now: 1_000 });
+	writeSettledRegistry.startRound(writeSettledTask.id, [{ agent: "early" }], 1_000);
+	writeSettledRegistry.updateAgent(writeSettledTask.id, 1, 0, { status: "done", finishedAt: 2_000 });
+	const writeLiveRegistry = createDispatchRegistry();
+	const writeLiveTask = writeLiveRegistry.startTask({ mode: "single", prompt: "Task: EXT-24-1 live write probe", now: 3_000 });
+	writeLiveRegistry.startRound(writeLiveTask.id, [{ agent: "runner" }], 3_000);
+	const settledDiscovery = createExpansionState();
+	toggleNavigatorRow(settledDiscovery, flattenNavigatorTree(buildNavigatorTasks(writeSettledRegistry, [], 4_000), settledDiscovery).find((row) => row.kind === "umbrella"), true);
+	const settledRow = flattenNavigatorTree(buildNavigatorTasks(writeSettledRegistry, [], 4_000), settledDiscovery).find((row) => row.kind === "task");
+	const liveRow = flattenNavigatorTree(buildNavigatorTasks(writeLiveRegistry, [], 4_000), createExpansionState()).find((row) => row.kind === "task");
+	const writeState = createExpansionState();
+
+	toggleNavigatorRow(writeState, settledRow, true);
+	assert.ok(writeState.settledExpandedTasks.has(writeSettledTask.id), "expanding a settled task writes settledExpandedTasks");
+	assert.ok(!writeState.collapsedTasks.has(writeSettledTask.id), "expanding a settled task leaves collapsedTasks alone");
+	toggleNavigatorRow(writeState, settledRow, false);
+	assert.ok(!writeState.settledExpandedTasks.has(writeSettledTask.id), "collapsing a settled task clears its settledExpandedTasks entry");
+
+	toggleNavigatorRow(writeState, liveRow, false);
+	assert.ok(writeState.collapsedTasks.has(writeLiveTask.id), "collapsing a live task writes collapsedTasks");
+	assert.ok(!writeState.settledExpandedTasks.has(writeLiveTask.id), "collapsing a live task leaves settledExpandedTasks alone");
+	toggleNavigatorRow(writeState, liveRow, true);
+	assert.ok(!writeState.collapsedTasks.has(writeLiveTask.id), "expanding a live task clears its collapsedTasks entry");
+
+	// A stale entry in the non-governing set never survives a toggle: the
+	// partition flip would otherwise invert the user's latest intent.
+	writeState.collapsedTasks.add(writeSettledTask.id);
+	toggleNavigatorRow(writeState, settledRow, true);
+	assert.ok(writeState.settledExpandedTasks.has(writeSettledTask.id), "the settled expansion carries the latest intent");
+	assert.ok(!writeState.collapsedTasks.has(writeSettledTask.id), "expanding a settled task clears a stale collapsedTasks entry");
+	writeState.settledExpandedTasks.add(writeLiveTask.id);
+	toggleNavigatorRow(writeState, liveRow, false);
+	assert.ok(writeState.collapsedTasks.has(writeLiveTask.id), "the live collapse carries the latest intent");
+	assert.ok(!writeState.settledExpandedTasks.has(writeLiveTask.id), "collapsing a live task clears a stale settledExpandedTasks entry");
+}
+// <<< EXT-24-1 (toggle writes)
 
 console.log("agent-viewer-navigator-tree: all assertions passed");

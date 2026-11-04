@@ -46,7 +46,11 @@
  * matching record holding no thinking renders the found-but-empty
  * note instead of denying the record, with the same live-buffer
  * retention; live tasks render
- * their rows above the Completed umbrella row holding settled ones; tree overflow budgets the window one
+ * their rows above the Completed umbrella row holding settled ones;
+ * under the expanded umbrella a settled task renders its row alone
+ * and an expanded live task folds to its row alone when it settles,
+ * the folded row's detail keeping the prompt section and member
+ * lines; tree overflow budgets the window one
  * row short so the newest line and the indicator survive the +N more
  * clip; the tree window follows the cursor with the minimal shift (the
  * selected row renders inside the shifted slice at every depth, the
@@ -1972,6 +1976,53 @@ await withView({ registry: createDispatchRegistry(), detachedJobs: [] }, async (
 	});
 }
 // <<< EXT-17 V2
+
+// >>> EXT-24-1: an expanded live task folds to its row under the expanded umbrella when it settles; the folded row's detail keeps the prompt and member lines
+{
+	const registry = createDispatchRegistry();
+	const liveTask = registry.startTask({ mode: "single", prompt: "Task: EXT-24-1 fold on settle probe\n\nsecond prompt line", now: 1_000 });
+	registry.startRound(liveTask.id, [{ agent: "runner" }], 1_000);
+	registry.updateAgent(liveTask.id, 1, 0, { activity: [{ at: 1_100, kind: "text", text: "runner note" }] });
+	const settledTask = registry.startTask({ mode: "single", prompt: "Task: EXT-24-1 already settled probe", now: 500 });
+	registry.startRound(settledTask.id, [{ agent: "prior" }], 500);
+	registry.updateAgent(settledTask.id, 1, 0, { status: "done", finishedAt: 800 });
+	await withView({ registry, detachedJobs: [] }, async (view) => {
+		assert.deepEqual(
+			view.rows.map((row) => row.id),
+			[`t:${liveTask.id}`, `t:${liveTask.id}:r1`, `t:${liveTask.id}:r1:a0`, "u:completed"],
+			"the fixture opens live-expanded above the collapsed umbrella",
+		);
+		view.handleInput(DOWN);
+		view.handleInput(DOWN);
+		view.handleInput(DOWN);
+		assert.equal(view.selectedId, "u:completed");
+		view.handleInput(RIGHT);
+		assert.deepEqual(
+			view.rows.map((row) => row.id),
+			[`t:${liveTask.id}`, `t:${liveTask.id}:r1`, `t:${liveTask.id}:r1:a0`, "u:completed", `t:${settledTask.id}`],
+			"the expanded umbrella reveals the already-settled task as its row alone",
+		);
+
+		registry.updateAgent(liveTask.id, 1, 0, { status: "done", finishedAt: 2_000 });
+		view.refresh();
+		assert.deepEqual(
+			view.rows.map((row) => row.id),
+			["u:completed", `t:${liveTask.id}`, `t:${settledTask.id}`],
+			"the settled live task folds to its task row alone under the expanded umbrella",
+		);
+
+		// The fold hides rows, not information: selecting the folded row
+		// still renders the prompt section and the round member line
+		// (guard: the detail model reads task views, never rendered rows).
+		view.handleInput(DOWN);
+		assert.equal(view.selectedId, `t:${liveTask.id}`);
+		const frame = view.render(120).join("\n");
+		assert.ok(frame.includes("prompt"), "the folded task row's detail renders the prompt section");
+		assert.ok(frame.includes("second prompt line"), "the folded task row's detail renders the assignment's source text");
+		assert.ok(frame.includes("round 1"), "the folded task row's detail still lists its rounds as member lines");
+	});
+}
+// <<< EXT-24-1 (fold on settle)
 
 // >>> EXT-19 V1, re-anchored by EXT-22: the task detail renders the job's full source text, stable across polls
 {
