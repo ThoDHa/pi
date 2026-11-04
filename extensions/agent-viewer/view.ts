@@ -761,7 +761,7 @@ export class NavigatorView implements Focusable {
 			.map((row) => this.renderTreeRow(row, treeW));
 		const above = treeStart;
 		const below = this.rows.length - treeStart - treeViewport;
-		const viewport = this.detailViewport();
+		const viewport = treeViewport;
 		const detailLines = this.renderDetailLines();
 		const keys = detailLines.map((line) => line.key);
 		stabilizeDetailScroll(this.scroll, keys, viewport);

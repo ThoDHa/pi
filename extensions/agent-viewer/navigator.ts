@@ -389,11 +389,17 @@ export function nextTaskRow(rows: NavigatorRow[], currentIndex: number, directio
  * side, and walking back to row 0 restores the top-aligned window.
  * The caller stores the result back as the next frame's previousStart;
  * every poll, expansion, and resize re-derives the window through this
- * one function, so cursor visibility holds by construction. cursorIndex
+ * one function, so cursor visibility holds by construction for
+ * at least one row. A collapsed viewport (viewportRows < 1, reachable
+ * on tiny terminals) also returns 0, top-aligned and idempotently: the
+ * minimal-shift branches assume at least one visible row, so with none
+ * the stored start would oscillate across frames, while the caller's
+ * clip row counts every hidden row below honestly. cursorIndex
  * is expected in range (the cursor helpers clamp it); the clamp-precedes-
  * shift order is pinned by the tree suite.
  */
 export function treeWindowStart(rowCount: number, cursorIndex: number, viewportRows: number, previousStart: number): number {
+	if (viewportRows < 1) return 0;
 	if (rowCount <= viewportRows) return 0;
 	const maxStart = rowCount - viewportRows;
 	let start = Math.min(maxStart, Math.max(0, previousStart));
