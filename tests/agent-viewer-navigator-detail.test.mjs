@@ -18,7 +18,7 @@
 
 import assert from "node:assert/strict";
 import { createDispatchRegistry } from "../extensions/subagent/registry.ts";
-import { buildNavigatorTasks, createExpansionState, flattenNavigatorTree, resolveDetailModel } from "../extensions/agent-viewer/navigator.ts";
+import { buildNavigatorTasks, createExpansionState, flattenNavigatorTree, resolveDetailModel, toggleNavigatorRow } from "../extensions/agent-viewer/navigator.ts";
 
 const NOW = 1_000_000;
 
@@ -71,11 +71,16 @@ const detached = {
 const tasks = buildNavigatorTasks(registry, [detached], NOW);
 // The fixture's settled rounds default to collapsed (completed rounds
 // collapse to their glyph line), and the settled tasks fold under the
-// Completed umbrella (collapsed by default); expand the round overrides
-// and the umbrella so the settled task, round, and agent rows are
+// Completed umbrella (collapsed by default) and then to their task rows
+// under it (the EXT-24-1 settled default); expand the umbrella,
+// pre-expand both settled task rows through the real toggle, and set
+// the round overrides so the settled task, round, and agent rows are
 // visible for the target assertions below.
 const expandedState = createExpansionState();
 expandedState.completedExpanded = true;
+const detailPreRows = flattenNavigatorTree(tasks, expandedState);
+toggleNavigatorRow(expandedState, detailPreRows.find((row) => row.id === "t:task-1"), true);
+toggleNavigatorRow(expandedState, detailPreRows.find((row) => row.id === "t:task-2"), true);
 expandedState.roundOverrides.set("t:task-1:r1", true);
 expandedState.roundOverrides.set("t:task-2:r1", true);
 const rows = flattenNavigatorTree(tasks, expandedState);
@@ -265,11 +270,15 @@ assert.equal(resolveDetailModel(orphanRow, tasks).kind, "empty", "a row whose ta
 	assert.equal(resolveDetailModel(blankRow, blankViews).sourceText, "", "an empty prompt resolves an empty source text, so the section is omitted");
 	// Agent, round, and umbrella selections render no prompt section. The
 	// mutations below are load-bearing: completedExpanded flattens the
-	// settled subtrees so the round find resolves a round row, and the
+	// settled subtrees and the settled task rows are pre-expanded through
+	// the real toggle (the EXT-24-1 settled default collapses them even
+	// under the umbrella) so the round find resolves a round row, and the
 	// round override exposes the settled registry agent row the agent
-	// find selects, so either mutation missing fails the kind pins.
+	// find selects, so any mutation missing fails the kind pins.
 	const state = createExpansionState();
 	state.completedExpanded = true;
+	const d3PreRows = flattenNavigatorTree(tasks, state);
+	toggleNavigatorRow(state, d3PreRows.find((row) => row.id === "t:task-1"), true);
 	state.roundOverrides.set("t:task-1:r1", true);
 	const allRows = flattenNavigatorTree(tasks, state);
 	const agentModel = resolveDetailModel(allRows.find((row) => row.agentRef?.source === "registry"), tasks);

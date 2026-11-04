@@ -204,10 +204,12 @@ export interface NavigatorExpansionState {
 	roundOverrides: Map<string, boolean>;
 	/** The Completed umbrella defaults collapsed; left/right on its row flips this. */
 	completedExpanded: boolean;
+	/** Explicitly expanded settled task ids: a settled task renders its task row alone until expanded, so the umbrella reads as a compact index of finished dispatches. */
+	settledExpandedTasks: Set<string>;
 }
 
 export function createExpansionState(): NavigatorExpansionState {
-	return { collapsedTasks: new Set(), roundOverrides: new Map(), completedExpanded: false };
+	return { collapsedTasks: new Set(), roundOverrides: new Map(), completedExpanded: false, settledExpandedTasks: new Set() };
 }
 
 export interface NavigatorRow {
@@ -228,7 +230,11 @@ export interface NavigatorRow {
 /**
  * Flatten task views into the visible rows the view renders.
  * Tasks render as header rows and hide their whole subtree when
- * collapsed. Rounds render as single glyph-line rows: a round is
+ * collapsed. The expansion default is partition-keyed: a live task is
+ * expanded unless collapsedTasks holds its id, a settled task is
+ * expanded only when settledExpandedTasks holds it, so settled tasks
+ * render their task row alone under the umbrella until expanded. Rounds
+ * render as single glyph-line rows: a round is
  * expanded only while live or when the user overrode it, so completed
  * rounds collapse to their summary line and the live round
  * auto-expands; agent rows render under an expanded round. Detached
@@ -253,7 +259,8 @@ export function flattenNavigatorTree(tasks: NavigatorTaskView[], state: Navigato
 			label: task.label,
 			detail: task.mode,
 		});
-		if (state.collapsedTasks.has(task.id)) return;
+		const expanded = task.live ? !state.collapsedTasks.has(task.id) : state.settledExpandedTasks.has(task.id);
+		if (!expanded) return;
 
 		if (task.source === "registry") {
 			const roundDepth: 1 | 2 = base === 0 ? 1 : 2;
@@ -335,17 +342,29 @@ export function flattenNavigatorTree(tasks: NavigatorTaskView[], state: Navigato
 }
 
 /**
- * Apply the left/right key semantics for a row: collapsing a task
- * adds its raw id to collapsedTasks and expanding deletes it (the
- * flatten contract keys that set on raw task ids); a round toggle
- * stores the override under the row's namespaced id, overriding the
- * live-expanded/completed-collapsed default; the umbrella toggle
+ * Apply the left/right key semantics for a row: a task toggle writes
+ * the set its partition governs and deletes the id from the
+ * non-governing set, so a partition flip carries the user's latest
+ * intent instead of a stale opposite entry (the flatten contract keys
+ * both sets on raw task ids). The sets hold opposite exceptions: a
+ * live row adds its raw id to collapsedTasks on collapse and deletes
+ * it on expand (exceptions to the live expanded default), a settled
+ * row adds its raw id to settledExpandedTasks on expand and deletes it
+ * on collapse (exceptions to the settled collapsed default); a round
+ * toggle stores the override under the row's namespaced id, overriding
+ * the live-expanded/completed-collapsed default; the umbrella toggle
  * writes completedExpanded; agent rows are leaves and a no-op.
  */
 export function toggleNavigatorRow(state: NavigatorExpansionState, row: NavigatorRow, expand: boolean): void {
 	if (row.kind === "task") {
-		if (expand) state.collapsedTasks.delete(row.taskId);
-		else state.collapsedTasks.add(row.taskId);
+		if (row.live) {
+			if (expand) state.collapsedTasks.delete(row.taskId);
+			else state.collapsedTasks.add(row.taskId);
+		} else {
+			if (expand) state.settledExpandedTasks.add(row.taskId);
+			else state.settledExpandedTasks.delete(row.taskId);
+		}
+		(row.live ? state.settledExpandedTasks : state.collapsedTasks).delete(row.taskId);
 	} else if (row.kind === "round") {
 		state.roundOverrides.set(row.id, expand);
 	} else if (row.kind === "umbrella") {

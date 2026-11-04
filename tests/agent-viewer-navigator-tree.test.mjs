@@ -178,6 +178,11 @@ assert.equal(brokenView.agents[0].status, "failed");
 assert.equal(brokenView.agents[0].finishedAt, 4_000, "the started step keeps its own finish, not the job's");
 const brokenUmbrellaExpanded = createExpansionState();
 brokenUmbrellaExpanded.completedExpanded = true;
+// EXT-24-1 adaptation, assertion intent unchanged: the settled default
+// collapsed, so the fixture pre-expands job-5 through the real toggle
+// to keep pinning the never-started steps' row shape.
+const brokenPreRows = flattenNavigatorTree(brokenTasks, brokenUmbrellaExpanded);
+toggleNavigatorRow(brokenUmbrellaExpanded, brokenPreRows.find((row) => row.id === "t:job-5"), true);
 const brokenRows = flattenNavigatorTree(brokenTasks, brokenUmbrellaExpanded);
 assert.deepEqual(
 	brokenRows.filter((row) => row.taskId === "job-5").map((row) => row.kind),
@@ -557,6 +562,12 @@ assert.equal(treeWindowStart(36, 0, 0, viewportZeroFirst), viewportZeroFirst, "a
 	const expandedState = createExpansionState();
 	expandedState.completedExpanded = true;
 	expandedState.roundOverrides.set(`t:${doneTask.id}:r1`, true);
+	// EXT-24-1 adaptation, assertion intent unchanged: the settled default
+	// collapsed, so the fixture pre-expands both settled task rows through
+	// the real toggle to keep pinning the fully expanded shapes.
+	const t2PreRows = flattenNavigatorTree(umbrellaTasks, expandedState);
+	toggleNavigatorRow(expandedState, t2PreRows.find((row) => row.id === `t:${doneTask.id}`), true);
+	toggleNavigatorRow(expandedState, t2PreRows.find((row) => row.id === "t:job-failed"), true);
 	const expandedRows = flattenNavigatorTree(umbrellaTasks, expandedState);
 	assert.deepEqual(
 		expandedRows.map((row) => row.id),
@@ -669,6 +680,12 @@ assert.equal(treeWindowStart(36, 0, 0, viewportZeroFirst), viewportZeroFirst, "a
 	const expandedState = createExpansionState();
 	expandedState.completedExpanded = true;
 	expandedState.roundOverrides.set(`t:${settledTask.id}:r1`, true);
+	// EXT-24-1 adaptation, assertion intent unchanged: both settled task
+	// rows pre-expanded through the real toggle, so the all-settled shape
+	// pins the same fully expanded tree.
+	const t5PreRows = flattenNavigatorTree(settledViews, expandedState);
+	toggleNavigatorRow(expandedState, t5PreRows.find((row) => row.id === `t:${settledTask.id}`), true);
+	toggleNavigatorRow(expandedState, t5PreRows.find((row) => row.id === "t:job-settled"), true);
 	assert.deepEqual(
 		flattenNavigatorTree(settledViews, expandedState).map((row) => row.id),
 		["u:completed", `t:${settledTask.id}`, `t:${settledTask.id}:r1`, `t:${settledTask.id}:r1:a0`, "t:job-settled", "t:job-settled:a0"],
@@ -694,6 +711,11 @@ assert.equal(treeWindowStart(36, 0, 0, viewportZeroFirst), viewportZeroFirst, "a
 	assert.equal(nextTaskRow(collapsedRows, umbrellaIndex, -1), liveTaskIndex, "shift+tab from the umbrella reaches the live task header");
 	const expandedState = createExpansionState();
 	expandedState.completedExpanded = true;
+	// EXT-24-1 adaptation, assertion intent unchanged: the settled task
+	// row pre-expanded through the real toggle, so the tab-jump set is
+	// pinned against the fully expanded tree as before.
+	const t6PreRows = flattenNavigatorTree(views, expandedState);
+	toggleNavigatorRow(expandedState, t6PreRows.find((row) => row.id === `t:${settledTask.id}`), true);
 	const expandedRows = flattenNavigatorTree(views, expandedState);
 	const expandedUmbrellaIndex = expandedRows.findIndex((row) => row.kind === "umbrella");
 	const settledTaskIndex = expandedRows.findIndex((row) => row.kind === "task" && row.taskId === settledTask.id);
@@ -800,6 +822,12 @@ assert.equal(treeWindowStart(36, 0, 0, viewportZeroFirst), viewportZeroFirst, "a
 	const expandedState = createExpansionState();
 	expandedState.completedExpanded = true;
 	expandedState.roundOverrides.set(`t:${doneTask.id}:r1`, true);
+	// EXT-24-1 adaptation, assertion intent unchanged: both settled task
+	// rows pre-expanded through the real toggle, so the cursor-path
+	// landings stay pinned across the fully expanded tree.
+	const t1PreRows = flattenNavigatorTree(umbrellaTasks, expandedState);
+	toggleNavigatorRow(expandedState, t1PreRows.find((row) => row.id === `t:${doneTask.id}`), true);
+	toggleNavigatorRow(expandedState, t1PreRows.find((row) => row.id === "t:job-failed"), true);
 	const expandedRows = flattenNavigatorTree(umbrellaTasks, expandedState);
 	assert.deepEqual(
 		expandedRows.map((row) => row.id),

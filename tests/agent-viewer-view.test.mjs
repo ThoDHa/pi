@@ -407,8 +407,12 @@ const writeRealTranscriptFile = (dir, ownThinking, fillerCount) => {
 
 	const view = capturedFactory(stubTui(), themeStub, keybindings, () => {});
 	assert.ok(view instanceof NavigatorView, "the custom factory builds the navigator view");
+	// The seeded task is settled: under the EXT-24-1 settled default the
+	// walk expands the settled task row (a no-op before that change),
+	// keeping the arrival assertion unchanged.
 	view.handleInput(RIGHT);
 	view.handleInput(DOWN);
+	view.handleInput(RIGHT);
 	view.handleInput(DOWN);
 	view.handleInput(RIGHT);
 	view.handleInput(DOWN);
@@ -801,6 +805,7 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		async (view, done) => {
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
+			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
@@ -1194,6 +1199,7 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		const poll = () => view.refresh();
 		view.handleInput(RIGHT);
 		view.handleInput(DOWN);
+		view.handleInput(RIGHT);
 		view.handleInput(DOWN);
 		view.handleInput(RIGHT);
 		view.handleInput(DOWN);
@@ -1243,11 +1249,12 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		registry.updateAgent(chain.id, 1, 0, { status: "failed", finishedAt: 21_000, result: { exitCode: 1, stopReason: "error" } });
 		await withView(sources, async (view) => {
 			// Both settled tasks fold under the Completed umbrella: expand it,
-			// walk past scout and the task-2 header, then expand r2 to reach
-			// the failed agent.
+			// expand each settled task row (the EXT-24-1 settled default), then
+			// expand the rounds to reach the failed agent.
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
 			assert.equal(view.selectedId, "t:task-1");
+			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
 			assert.equal(view.selectedId, "t:task-1:r1");
 			view.handleInput(RIGHT);
@@ -1255,6 +1262,7 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 			assert.equal(view.selectedId, "t:task-1:r1:a0");
 			view.handleInput(DOWN);
 			assert.equal(view.selectedId, "t:task-2");
+			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
 			assert.equal(view.selectedId, "t:task-2:r1");
 			view.handleInput(RIGHT);
@@ -1304,11 +1312,12 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		registry.updateAgent(task.id, 2, 0, { status: "done", finishedAt: 12_000 });
 
 		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
-			// The settled task folds under the Completed umbrella: expand it
-			// and walk to r1's scout.
+			// The settled task folds under the Completed umbrella: expand it,
+			// expand the settled task row, and walk to r1's scout.
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
 			assert.equal(view.selectedId, "t:task-1");
+			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
 			assert.equal(view.selectedId, "t:task-1:r1");
 			view.handleInput(RIGHT);
@@ -1436,6 +1445,7 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
+			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
@@ -1452,6 +1462,7 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
+			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
@@ -1470,6 +1481,7 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
+			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
@@ -1489,6 +1501,7 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
+			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
@@ -1571,6 +1584,7 @@ function deferredTranscriptReader() {
 	const selectScout = (view) => {
 		view.handleInput(RIGHT);
 		view.handleInput(DOWN);
+		view.handleInput(RIGHT);
 		view.handleInput(DOWN);
 		view.handleInput(RIGHT);
 		view.handleInput(DOWN);
@@ -1722,6 +1736,7 @@ function deferredTranscriptReader() {
 		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
+			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
@@ -1769,6 +1784,7 @@ function deferredTranscriptReader() {
 		await withView({ registry, detachedJobs: [], sessionFile: () => sessionFile }, async (view) => {
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
+			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
@@ -1834,6 +1850,7 @@ function deferredTranscriptReader() {
 		);
 		view.handleInput(RIGHT);
 		view.handleInput(DOWN);
+		view.handleInput(RIGHT);
 		view.handleInput(DOWN);
 		view.handleInput(RIGHT);
 		view.handleInput(DOWN);
@@ -1926,10 +1943,13 @@ await withView({ registry: createDispatchRegistry(), detachedJobs: [] }, async (
 			view.handleInput(LEFT);
 			assert.deepEqual(view.rows.map((row) => row.id), ["u:completed"], "left collapses the umbrella again");
 
-			// The t affordance survives the fold: expand, walk to the finished agent, stream its transcript.
+			// The t affordance survives the fold: expand, expand the settled
+			// task row (the EXT-24-1 settled default), walk to the finished
+			// agent, stream its transcript.
 			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
 			assert.equal(view.selectedId, `t:${settledTask.id}`);
+			view.handleInput(RIGHT);
 			view.handleInput(DOWN);
 			assert.equal(view.selectedId, `t:${settledTask.id}:r1`);
 			view.handleInput(RIGHT);
