@@ -32,6 +32,7 @@ import {
 	moveCursor,
 	nextTaskRow,
 	toggleNavigatorRow,
+	treeWindowStart,
 } from "../extensions/agent-viewer/navigator.ts";
 
 // --- buildNavigatorTasks: registry task -> rounds -> agents ---
@@ -451,6 +452,25 @@ assert.equal(toggleState.roundOverrides.size, 1, "agent rows are a no-op on expa
 // --- moveCursor: the empty-tree clamp branch ---
 
 assert.equal(moveCursor([], 0, 1), 0, "moving on an empty tree stays at index 0");
+
+// >>> EXT-23-1: treeWindowStart, the cursor-following visible window the tree pane renders
+
+assert.equal(treeWindowStart(10, 9, 21, 0), 0, "a tree that fits the viewport window at the top");
+assert.equal(treeWindowStart(10, 9, 21, 8), 0, "a tree that fits ignores the previous start");
+assert.equal(treeWindowStart(0, 0, 21, 0), 0, "an empty tree fits");
+assert.equal(treeWindowStart(21, 20, 21, 0), 0, "a tree exactly the viewport's height fits");
+
+assert.equal(treeWindowStart(36, 5, 21, 3), 3, "a cursor inside the window holds the window still");
+assert.equal(treeWindowStart(36, 21, 21, 0), 1, "a cursor stepping past the window's bottom shifts the window by one");
+assert.equal(treeWindowStart(36, 2, 21, 10), 2, "a cursor stepping above the window's top raises the window to the cursor");
+assert.equal(treeWindowStart(36, 30, 21, 0), 10, "a far cursor (the tab jump) snaps the window to the cursor's side");
+assert.equal(treeWindowStart(36, 35, 21, 0), 15, "the last row bottom-aligns the window at the maximum start");
+assert.equal(treeWindowStart(36, 0, 21, 15), 0, "walking back to row 0 restores the top-aligned window");
+assert.equal(treeWindowStart(36, 35, 21, 100), 15, "an out-of-range previous start clamps into range and holds when the cursor is inside");
+assert.equal(treeWindowStart(36, 0, 21, -7), 0, "a negative previous start clamps to the top");
+assert.equal(treeWindowStart(30, 25, 21, 100), 9, "the stale-start clamp precedes the cursor shift");
+
+// <<< EXT-23-1
 
 // >>> EXT-17 T1: the umbrella row over settled views, settled rows hidden
 {

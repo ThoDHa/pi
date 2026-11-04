@@ -818,7 +818,7 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 
 		const tailRender = view.render(120).join("\n");
 		assert.ok(tailRender.includes("log line 29"), "while following the newest line survives the tree clip");
-		assert.ok(tailRender.includes(`… +${treeRows - BODY_ROWS} more`), "tree overflow still renders the +N more clip");
+		assert.ok(tailRender.includes(`… +${treeRows - (BODY_ROWS - 1)} more`), "tree overflow still renders the +N more clip");
 		assert.equal(view.render(120).length, BODY_ROWS + 2, "the clip keeps the frame within its budget");
 
 		view.handleInput(PAGE_UP);
@@ -826,11 +826,107 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		poll();
 		const indicatorRender = view.render(120).join("\n");
 		assert.ok(indicatorRender.includes(SCROLL_NEW_INDICATOR), "the indicator renders inside the clipped budget when it fires");
-		assert.ok(indicatorRender.includes(`… +${treeRows - BODY_ROWS} more`), "the indicator and the tree clip share the body budget");
+		assert.ok(indicatorRender.includes(`… +${treeRows - (BODY_ROWS - 1)} more`), "the indicator and the tree clip share the body budget");
 		assert.ok(!indicatorRender.includes("log line 30"), "the unseen tail stays below the held window");
 		assert.equal(view.render(120).length, BODY_ROWS + 2, "the frame still fits its budget with the indicator up");
 	});
 }
+
+// >>> EXT-23-1: the tree window follows the cursor with a two-sided clip
+
+{
+	const registry = createDispatchRegistry();
+	for (let index = 1; index <= 12; index++) {
+		const task = registry.startTask({ mode: "single", prompt: `Task: EXT-9-${index} overflow probe`, now: 1_000 });
+		registry.startRound(task.id, [{ agent: `agent-${index}` }], 1_000);
+	}
+	const treeRows = flattenNavigatorTree(buildNavigatorTasks(registry, [], Date.now()), createExpansionState()).length;
+	assert.equal(treeRows, 36, "the fixture overflows the body budget from the tree side");
+	const tui = stubTui();
+	await withView({ registry, detachedJobs: [] }, async (view) => {
+		// The visible tree column of a frame: the body region's rows (the
+		// frame minus its header and hints lines, minus the clip row when
+		// the tree overflows), read down the left pane.
+		const treeColumn = (frame) => {
+			const rows = frame.slice(1, frame.length - 1);
+			const body = rows[rows.length - 1].trimStart().startsWith("…") ? rows.slice(0, -1) : rows;
+			return body.map((line) => stripAnsi(sliceByColumn(line, 0, TREE_W_AT_120)).trimEnd());
+		};
+		const clipText = (frame) => stripAnsi(sliceByColumn(frame[frame.length - 2], 0, TREE_W_AT_120)).trim();
+
+		// Walking down past the fold shifts the window minimally: the
+		// selected row renders inside the visible slice and the clip
+		// reports what hides on both sides.
+		for (let step = 0; step < 21; step++) view.handleInput(DOWN);
+		assert.equal(view.selectedIndex, 21, "the cursor walks past the fold");
+		const shifted = view.render(120);
+		const shiftedTree = treeColumn(shifted);
+		assert.equal(shiftedTree.filter((row) => row.includes("▸")).length, 1, "exactly the selected row carries the cursor after the shift");
+		assert.ok(shiftedTree.some((row) => row.includes("▸") && row.includes("EXT-9-8")), "the selected row renders inside the shifted window");
+		assert.ok(shiftedTree[0].includes("round 1"), "the window shifted minimally, its top row the first hidden row's successor");
+		assert.equal(clipText(shifted), "… +1 above · +14 more", "the clip reports hidden rows on both sides of the window");
+		assert.equal(shifted.length, BODY_ROWS + 2, "the frame keeps its budget with the window shifted");
+
+		// Walking to the last row bottom-aligns the window: the clip flips
+		// to the above-only text and the frame height holds.
+		for (let step = 0; step < 14; step++) view.handleInput(DOWN);
+		assert.equal(view.selectedIndex, 35, "the cursor reaches the last tree row");
+		const bottom = view.render(120);
+		const bottomTree = treeColumn(bottom);
+		assert.equal(bottomTree.filter((row) => row.includes("▸")).length, 1, "exactly the selected row carries the cursor at the bottom-aligned window");
+		assert.ok(bottomTree[bottomTree.length - 1].includes("▸"), "the cursor row is the window's last row");
+		assert.equal(clipText(bottom), "… +15 above", "the clip flips to the above-only text at the bottom-aligned window");
+		assert.equal(bottom.length, BODY_ROWS + 2, "the frame holds its height at the bottom-aligned window");
+
+		// The paging keys and the wheel page the detail pane only: the tree
+		// window and its clip stay fixed. The selected agent carries a long
+		// log, so the detail pane has somewhere to page.
+		registry.updateAgent("task-12", 1, 0, { activity: mapperLog(30) });
+		view.refresh();
+		const beforeTree = treeColumn(view.render(120));
+		const beforeClip = clipText(view.render(120));
+		view.handleInput(PAGE_UP);
+		const held = view.render(120);
+		assert.ok(held.join("\n").includes("log line 0"), "pageUp pages the detail pane while the tree overflows");
+		assert.deepEqual(treeColumn(held), beforeTree, "pageUp leaves the tree window fixed");
+		assert.equal(clipText(held), beforeClip, "pageUp leaves the tree clip fixed");
+		view.handleInput(PAGE_DOWN);
+		assert.ok(view.render(120).join("\n").includes("log line 29"), "pageDown returns the detail pane to the tail");
+		view.handleInput(END);
+		assert.deepEqual(treeColumn(view.render(120)), beforeTree, "end leaves the tree window fixed");
+		const wheel = view.handleMouse(wheelEvent(-15));
+		assert.ok(wheel?.handled, "the wheel is claimed");
+		assert.ok(view.render(120).join("\n").includes("log line 0"), "the wheel pages the detail pane while the tree overflows");
+		assert.deepEqual(treeColumn(view.render(120)), beforeTree, "the wheel leaves the tree window fixed");
+
+		// A shrink resize re-clamps the window around the deep cursor, and
+		// growing back re-widens it, both keeping the cursor visible and
+		// the frame at the terminal's height.
+		tui.terminal.rows = 12;
+		const shrunk = view.render(120);
+		assert.equal(shrunk.length, 12, "the shrunk frame is exactly the shrunk terminal's height");
+		assert.equal(clipText(shrunk), "… +27 above", "the shrunk window re-clamps around the cursor with the above-only clip");
+		const shrunkTree = treeColumn(shrunk);
+		assert.equal(shrunkTree.length, 9, "the shrunk tree window holds the shrunk viewport's rows");
+		assert.equal(shrunkTree.filter((row) => row.includes("▸")).length, 1, "exactly the selected row carries the cursor after the shrink");
+		assert.ok(shrunkTree[shrunkTree.length - 1].includes("▸"), "the deep cursor stays visible at the window's shrunk bottom");
+		tui.terminal.rows = ROWS;
+		const regrown = view.render(120);
+		assert.equal(regrown.length, BODY_ROWS + 2, "the regrown frame is exactly the restored terminal's height");
+		assert.equal(clipText(regrown), "… +15 above", "the regrown window re-clamps with the above-only clip");
+		assert.ok(treeColumn(regrown).some((row) => row.includes("▸") && row.includes("agent-12")), "the cursor row stays visible through the grow");
+
+		// Walking back to the top restores the top-aligned window and the
+		// one-sided clip.
+		for (let step = 0; step < 35; step++) view.handleInput(UP);
+		assert.equal(view.selectedIndex, 0, "the cursor walks back to the first row");
+		const restored = view.render(120);
+		assert.equal(clipText(restored), `… +${treeRows - (BODY_ROWS - 1)} more`, "walking back to row 0 restores the top-aligned window's one-sided clip");
+		assert.ok(treeColumn(restored)[0].includes("EXT-9-1"), "the window is top-aligned again");
+	});
+}
+
+// <<< EXT-23-1
 
 // --- a taller resize while held: the window grows over the tail, the marker yields, the hold stays ---
 
