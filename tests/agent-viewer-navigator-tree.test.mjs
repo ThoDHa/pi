@@ -996,6 +996,40 @@ assert.equal(treeWindowStart(36, 0, 0, viewportZeroFirst), viewportZeroFirst, "a
 }
 // <<< EXT-24-1 (partition flips)
 
+// >>> EXT-24-1: ruled intent carry for an explicit expand while live
+{
+	// The Decision Log's ruled outcome for the unit review's advisory
+	// design challenge 1 (asymmetric intent carry): an explicit expand
+	// while live does NOT carry into settledExpandedTasks, so the task
+	// folds on settle. The fold serves the compact-index purpose of the
+	// collapse-by-default request and re-expansion is one keypress; the
+	// mirrored collapse direction persists via collapsedTasks surviving
+	// the flip (pinned in the partition-flips block above).
+	const intentRegistry = createDispatchRegistry();
+	const intentTask = intentRegistry.startTask({ mode: "single", prompt: "Task: EXT-24-1 intent-carry probe", now: 1_000 });
+	intentRegistry.startRound(intentTask.id, [{ agent: "runner" }], 1_000);
+	const intentState = createExpansionState();
+	const liveIntentRows = flattenNavigatorTree(buildNavigatorTasks(intentRegistry, [], 2_000), intentState);
+	toggleNavigatorRow(intentState, liveIntentRows.find((row) => row.id === `t:${intentTask.id}`), false);
+	toggleNavigatorRow(intentState, liveIntentRows.find((row) => row.id === `t:${intentTask.id}`), true);
+	assert.deepEqual(
+		flattenNavigatorTree(buildNavigatorTasks(intentRegistry, [], 2_000), intentState).filter((row) => row.taskId === intentTask.id).map((row) => row.kind),
+		["task", "round", "agent"],
+		"the explicit expand while live renders the task expanded again",
+	);
+	intentRegistry.updateAgent(intentTask.id, 1, 0, { status: "done", finishedAt: 3_000 });
+	const settledIntentViews = buildNavigatorTasks(intentRegistry, [], 4_000);
+	assert.equal(settledIntentViews[0].live, false, "the task settles once its last agent finishes");
+	assert.ok(!intentState.settledExpandedTasks.has(intentTask.id), "the explicit expand while live writes no settledExpandedTasks entry");
+	toggleNavigatorRow(intentState, flattenNavigatorTree(settledIntentViews, intentState).find((row) => row.kind === "umbrella"), true);
+	assert.deepEqual(
+		flattenNavigatorTree(settledIntentViews, intentState).filter((row) => row.taskId === intentTask.id).map((row) => row.id),
+		[`t:${intentTask.id}`],
+		"a task explicitly expanded while live renders folded (its task row alone) once it settles",
+	);
+}
+// <<< EXT-24-1 (ruled intent carry)
+
 // >>> EXT-24-1: the task toggle writes by the row's partition and clears the non-governing set
 {
 	const writeSettledRegistry = createDispatchRegistry();
