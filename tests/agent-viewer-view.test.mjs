@@ -963,6 +963,83 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 
 // <<< EXT-23-1
 
+// >>> EXT-25-1: expanding under the overflow seam keeps the cursor visible
+
+{
+	// Guard green by design: the safety is structural, verified by the
+	// EXT-24 seam review (every expansion inserts rows strictly after the
+	// cursor row and treeWindowStart's clamp-then-minimal-shift keeps the
+	// cursor inside the window through any growth), so this pin holds at
+	// head and exists to make a future refactor of treeWindowStart or the
+	// flatten order fail loudly instead of breaking
+	// expansion-below-the-fold invisibly.
+	const registry = createDispatchRegistry();
+	for (let live = 1; live <= 8; live++) {
+		const task = registry.startTask({ mode: "single", prompt: `Task: EXT-25-${live} live overflow probe`, now: 1_000 });
+		registry.startRound(task.id, [{ agent: `live-agent-${live}` }], 1_000);
+	}
+	for (let settled = 9; settled <= 20; settled++) {
+		const task = registry.startTask({ mode: "single", prompt: `Task: EXT-25-${settled} settled overflow probe`, now: 1_000 });
+		registry.startRound(task.id, [{ agent: `settled-agent-${settled}` }], 1_000);
+		registry.updateAgent(task.id, 1, 0, { status: "done", finishedAt: 2_000 });
+	}
+	const treeRows = flattenNavigatorTree(buildNavigatorTasks(registry, [], Date.now()), createExpansionState()).length;
+	assert.equal(treeRows, 25, "the fixture overflows the window with the umbrella collapsed: the eight live subtrees plus the umbrella row");
+	await withView({ registry, detachedJobs: [] }, async (view) => {
+		const treeColumn = (frame) => {
+			const rows = frame.slice(1, frame.length - 1);
+			const body = rows[rows.length - 1].trimStart().startsWith("…") ? rows.slice(0, -1) : rows;
+			return body.map((line) => stripAnsi(sliceByColumn(line, 0, TREE_W_AT_120)).trimEnd());
+		};
+		const clipText = (frame) => stripAnsi(sliceByColumn(frame[frame.length - 2], 0, TREE_W_AT_120)).trim();
+
+		// Walking to the umbrella row scrolls the window past the fold.
+		for (let step = 0; step < 24; step++) view.handleInput(DOWN);
+		assert.equal(view.selectedId, "u:completed");
+		assert.equal(clipText(view.render(120)), "… +4 above", "walking to the umbrella scrolls the window deep, the umbrella row at the window's bottom");
+
+		// Expanding the umbrella while scrolled deep grows the row list
+		// below the cursor: the umbrella stays visible and the clip counts
+		// match the grown row list.
+		view.handleInput(RIGHT);
+		assert.equal(view.rows.length, 37, "expanding the umbrella grows the row list by the twelve settled task rows");
+		const expandedTree = treeColumn(view.render(120));
+		assert.equal(expandedTree.filter((row) => row.includes("▸")).length, 1, "exactly the umbrella row carries the cursor after the expansion");
+		assert.ok(expandedTree.some((row) => row.includes("▸") && row.includes("Completed")), "the umbrella row stays visible inside the window its expansion grew");
+		assert.equal(clipText(view.render(120)), "… +4 above · +12 more", "the clip reports the grown row list on both sides of the window");
+		assert.equal(expandedTree.length + 4 + 12, view.rows.length, "the two-sided clip counts plus the viewport sum to the grown row list");
+
+		// Walking onto the settled rows parks the cursor at the window's
+		// bottom; the render pins the scrolled window there, and two ups
+		// then lift the target settled task row strictly inside it with
+		// room beneath.
+		for (let step = 0; step < 5; step++) view.handleInput(DOWN);
+		assert.equal(view.selectedId, "t:task-13");
+		assert.equal(clipText(view.render(120)), "… +9 above · +7 more", "walking onto the settled rows keeps the window scrolled deep, the settled row at the window's bottom");
+		for (let step = 0; step < 2; step++) view.handleInput(UP);
+		assert.equal(view.selectedId, "t:task-11");
+		assert.equal(clipText(view.render(120)), "… +9 above · +7 more", "the window stays put while the cursor moves within it, the settled task row near its bottom");
+
+		// RIGHT on the settled task row inserts its round row strictly
+		// after the cursor: the cursor stays visible inside the window, the
+		// insertion renders directly beneath it, and the clip counts match
+		// the grown row list.
+		view.handleInput(RIGHT);
+		assert.equal(view.rows.length, 38, "expanding the settled task grows the row list by its round row");
+		const grownTree = treeColumn(view.render(120));
+		assert.equal(grownTree.filter((row) => row.includes("▸")).length, 1, "exactly the settled task row carries the cursor after its expansion");
+		const cursorPosition = grownTree.findIndex((row) => row.includes("▸"));
+		assert.ok(cursorPosition > 0 && cursorPosition < grownTree.length - 1, "the cursor stays visible strictly inside the window");
+		assert.ok(grownTree[cursorPosition].includes("EXT-25-11"), "the selected settled task row renders inside the window");
+		assert.ok(grownTree[cursorPosition + 1].includes("round 1"), "the expansion's round row renders directly beneath the cursor row, the insertion strictly after it");
+		assert.equal(clipText(view.render(120)), "… +9 above · +8 more", "the two-sided clip counts match the grown row list after the settled expansion");
+		assert.equal(grownTree.length + 9 + 8, view.rows.length, "the clip counts plus the viewport sum to the grown row list after the settled expansion");
+		assert.equal(view.render(120).length, BODY_ROWS + 2, "the frame holds its height across the expansion");
+	});
+}
+
+// <<< EXT-25-1
+
 // --- a taller resize while held: the window grows over the tail, the marker yields, the hold stays ---
 
 {
