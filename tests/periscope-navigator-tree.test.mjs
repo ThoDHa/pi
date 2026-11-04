@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
  * Unit suite for the navigator view's pure tree layer
- * (extensions/agent-viewer/navigator.ts). Plain node, no test
+ * (extensions/periscope/navigator.ts). Plain node, no test
  * framework:
  *
- *   node tests/agent-viewer-navigator-tree.test.mjs
+ *   node tests/periscope-navigator-tree.test.mjs
  *
  * Covers the tree model the view renders: buildNavigatorTasks
  * assembling task -> dispatch round -> agent views from the dispatch
@@ -44,7 +44,7 @@ import {
 	nextTaskRow,
 	toggleNavigatorRow,
 	treeWindowStart,
-} from "../extensions/agent-viewer/navigator.ts";
+} from "../extensions/periscope/navigator.ts";
 
 // --- buildNavigatorTasks: registry task -> rounds -> agents ---
 
@@ -1070,4 +1070,4 @@ assert.equal(treeWindowStart(36, 0, 0, viewportZeroFirst), viewportZeroFirst, "a
 }
 // <<< EXT-24-1 (toggle writes)
 
-console.log("agent-viewer-navigator-tree: all assertions passed");
+console.log("periscope-navigator-tree: all assertions passed");

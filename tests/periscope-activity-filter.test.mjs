@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
  * Unit suite for the navigator's pure tool-noise filter
- * (extensions/agent-viewer/activity-filter.ts). Plain node, no test
+ * (extensions/periscope/activity-filter.ts). Plain node, no test
  * framework:
  *
- *   node tests/agent-viewer-activity-filter.test.mjs
+ *   node tests/periscope-activity-filter.test.mjs
  *
  * Covers the default-hidden noise set (read/grep/find/ls tool calls),
  * everything else staying visible (write/edit/bash/powershell, unknown
@@ -14,7 +14,7 @@
  */
 
 import assert from "node:assert/strict";
-import { filterActivityEntries, isNoisyToolCall } from "../extensions/agent-viewer/activity-filter.ts";
+import { filterActivityEntries, isNoisyToolCall } from "../extensions/periscope/activity-filter.ts";
 
 const toolCall = (name, text = `${name} target`) => ({ at: 1_000, kind: "toolCall", name, text });
 const textEntry = (text) => ({ at: 1_100, kind: "text", text });
@@ -88,4 +88,4 @@ const thinkingEntry = (text) => ({ at: 1_200, kind: "thinking", text });
 	assert.deepEqual(filterActivityEntries([], true), []);
 }
 
-console.log("agent-viewer-activity-filter: all assertions passed");
+console.log("periscope-activity-filter: all assertions passed");

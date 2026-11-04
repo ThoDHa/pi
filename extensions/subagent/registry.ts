@@ -5,7 +5,7 @@
  * subagent tool, shaped task -> dispatch round -> agent node, plus
  * replace-by-id snapshots of detached jobs published alongside it.
  * This module is the shared contract between the subagent extension
- * (which publishes both) and the agent-viewer extension (which renders
+ * (which publishes both) and the periscope extension (which renders
  * them): pi evaluates each entrypoint's modules in a fresh instance,
  * so module-level state would exist twice — the one state object both
  * sides read converges on globalThis via getSharedDispatchState(),
@@ -302,7 +302,7 @@ export interface DetachedJobSnapshot {
 	agents?: DispatchAgentNode[];
 }
 
-/** The one cross-extension channel: live dispatch state shared by the subagent and agent-viewer extensions. */
+/** The one cross-extension channel: live dispatch state shared by the subagent and periscope extensions. */
 export interface SharedDispatchState {
 	registry: DispatchRegistry;
 	detachedJobs: DetachedJobSnapshot[];

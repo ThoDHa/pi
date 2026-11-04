@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
  * Headless smoke suite for the navigator view component
- * (extensions/agent-viewer/view.ts). Plain node, no test framework:
+ * (extensions/periscope/view.ts). Plain node, no test framework:
  *
- *   node tests/agent-viewer-view.test.mjs
+ *   node tests/periscope-view.test.mjs
  *
  * Drives the real NavigatorView with a stub TUI (requestRender plus
  * terminal rows/columns), a pass-through theme, and a real
@@ -90,14 +90,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { importPiTui } from "./provision-pi-tui.mjs";
 import { createDispatchRegistry, getSharedDispatchState } from "../extensions/subagent/registry.ts";
-import { SCROLL_NEW_INDICATOR, viewBodyRows } from "../extensions/agent-viewer/detail-scroll.ts";
-import { buildNavigatorTasks, createExpansionState, flattenNavigatorTree, resolveDetailModel } from "../extensions/agent-viewer/navigator.ts";
+import { SCROLL_NEW_INDICATOR, viewBodyRows } from "../extensions/periscope/detail-scroll.ts";
+import { buildNavigatorTasks, createExpansionState, flattenNavigatorTree, resolveDetailModel } from "../extensions/periscope/navigator.ts";
 
 // view.ts statically imports @earendil-works/pi-tui, so both its import
 // and the suite's own specifier bindings must wait for the shim provisioning
 // that importPiTui performs.
 const { KeybindingsManager, CURSOR_MARKER, sliceByColumn, truncateToWidth, visibleWidth } = await importPiTui();
-const { NavigatorView, WHEEL_MAX_DELTA_LINES } = await import("../extensions/agent-viewer/view.ts");
+const { NavigatorView, WHEEL_MAX_DELTA_LINES } = await import("../extensions/periscope/view.ts");
 
 const ROWS = 24;
 const BODY_ROWS = viewBodyRows(ROWS);
@@ -326,7 +326,7 @@ const writeRealTranscriptFile = (dir, ownThinking, fillerCount) => {
 			if (event === "session_start") sessionStart = handler;
 		},
 	};
-	const { default: extensionMain } = await import("../extensions/agent-viewer/index.ts");
+	const { default: extensionMain } = await import("../extensions/periscope/index.ts");
 	await extensionMain(piStub);
 	await sessionStart();
 	assert.equal(shortcuts["alt+n"].description, "Toggle the subagent navigator view");
@@ -443,7 +443,7 @@ const writeRealTranscriptFile = (dir, ownThinking, fillerCount) => {
 			if (event === "session_start") sessionStart = handler;
 		},
 	};
-	const { default: extensionMain } = await import("../extensions/agent-viewer/index.ts");
+	const { default: extensionMain } = await import("../extensions/periscope/index.ts");
 	await extensionMain(piStub);
 	await sessionStart();
 	assert.ok(shortcuts["alt+v"], "the remapped navigator key registers as the open shortcut");
@@ -2267,4 +2267,4 @@ await withView({ registry: createDispatchRegistry(), detachedJobs: [] }, async (
 }
 // <<< EXT-19 V3 (exactly fit)
 
-console.log("agent-viewer-view: all assertions passed");
+console.log("periscope-view: all assertions passed");

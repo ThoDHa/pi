@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
  * Unit suite for the ambient strip's pure rendering layer
- * (extensions/agent-viewer/strip.ts). Plain node, no test framework:
+ * (extensions/periscope/strip.ts). Plain node, no test framework:
  *
- *   node tests/agent-viewer-strip-render.test.mjs
+ *   node tests/periscope-strip-render.test.mjs
  *
  * Covers the line budget the strip owns: the navigator-key hint line
  * always last, live tasks prioritized before the settled summary
@@ -29,7 +29,7 @@
 
 import assert from "node:assert/strict";
 import { createDispatchRegistry, formatDuration, statusGlyph } from "../extensions/subagent/registry.ts";
-import { buildStripTasks, renderStripLines, STRIP_MAX_LINES } from "../extensions/agent-viewer/strip.ts";
+import { buildStripTasks, renderStripLines, STRIP_MAX_LINES } from "../extensions/periscope/strip.ts";
 
 /** Join a strip line's segment texts into the plain line string. */
 function lineText(line) {
@@ -574,4 +574,4 @@ assert.equal(emptyView.entries.length, 0);
 }
 // <<< EXT-22 O1
 
-console.log("agent-viewer-strip-render: all assertions passed");
+console.log("periscope-strip-render: all assertions passed");

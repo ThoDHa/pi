@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
  * Unit suite for the navigator view's pure detail-pane scroll
- * model (extensions/agent-viewer/detail-scroll.ts). Plain node, no
+ * model (extensions/periscope/detail-scroll.ts). Plain node, no
  * test framework:
  *
- *   node tests/agent-viewer-detail-scroll.test.mjs
+ *   node tests/periscope-detail-scroll.test.mjs
  *
  * Covers the follow-end anchor semantics: a fresh state windows the
  * tail; an upward page releases the follow and arms the new-output
@@ -40,7 +40,7 @@ import {
 	scrollDetailTo,
 	stabilizeDetailScroll,
 	viewBodyRows,
-} from "../extensions/agent-viewer/detail-scroll.ts";
+} from "../extensions/periscope/detail-scroll.ts";
 
 const VIEWPORT = 10;
 
@@ -311,4 +311,4 @@ function heldState(keys, viewport) {
 	assert.equal(viewBodyRows(VIEW_CHROME_ROWS - 1), 1, "a terminal smaller than the frame clamps to one body row");
 }
 
-console.log("agent-viewer-detail-scroll: all assertions passed");
+console.log("periscope-detail-scroll: all assertions passed");

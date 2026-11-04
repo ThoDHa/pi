@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
  * Unit suite for the navigator view's pure detail-pane model
- * (extensions/agent-viewer/navigator.ts). Plain node, no test
+ * (extensions/periscope/navigator.ts). Plain node, no test
  * framework:
  *
- *   node tests/agent-viewer-navigator-detail.test.mjs
+ *   node tests/periscope-navigator-detail.test.mjs
  *
  * Covers resolveDetailModel, which turns the selected tree row plus
  * the current task views into the model the view's right pane
@@ -18,7 +18,7 @@
 
 import assert from "node:assert/strict";
 import { createDispatchRegistry } from "../extensions/subagent/registry.ts";
-import { buildNavigatorTasks, createExpansionState, flattenNavigatorTree, resolveDetailModel, toggleNavigatorRow } from "../extensions/agent-viewer/navigator.ts";
+import { buildNavigatorTasks, createExpansionState, flattenNavigatorTree, resolveDetailModel, toggleNavigatorRow } from "../extensions/periscope/navigator.ts";
 
 const NOW = 1_000_000;
 
@@ -321,4 +321,4 @@ assert.equal(resolveDetailModel(orphanRow, tasks).kind, "empty", "a row whose ta
 }
 // <<< EXT-22 D1
 
-console.log("agent-viewer-navigator-detail: all assertions passed");
+console.log("periscope-navigator-detail: all assertions passed");

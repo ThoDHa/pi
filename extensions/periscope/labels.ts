@@ -1,5 +1,5 @@
 /**
- * Shared agent-viewer presentation helpers
+ * Shared periscope presentation helpers
  *
  * A dispatch carries no task-ID field, only its prompt text, so the
  * label for a task node is parsed from that text through the

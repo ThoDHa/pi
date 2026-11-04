@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
  * Unit suite for the navigator's session-transcript thinking reader
- * (extensions/agent-viewer/navigator.ts, extractTranscriptThinking).
+ * (extensions/periscope/navigator.ts, extractTranscriptThinking).
  * Plain node, no test framework:
  *
- *   node tests/agent-viewer-transcript-thinking.test.mjs
+ *   node tests/periscope-transcript-thinking.test.mjs
  *
  * The reader backs the navigator's t keybinding: on a finished agent
  * it scans the parent session .jsonl for the latest subagent
@@ -35,7 +35,7 @@
  */
 
 import assert from "node:assert/strict";
-import { TRANSCRIPT_WINDOW_TOLERANCE_MS, createTranscriptThinkingScanner, extractTranscriptThinking } from "../extensions/agent-viewer/navigator.ts";
+import { TRANSCRIPT_WINDOW_TOLERANCE_MS, createTranscriptThinkingScanner, extractTranscriptThinking } from "../extensions/periscope/navigator.ts";
 
 const thinkingMessage = (timestamp, thoughts) => ({
 	role: "assistant",
@@ -616,4 +616,4 @@ for (const [variantName, variant] of boundaryVariants) {
 	);
 }
 
-console.log("agent-viewer-transcript-thinking: all assertions passed");
+console.log("periscope-transcript-thinking: all assertions passed");

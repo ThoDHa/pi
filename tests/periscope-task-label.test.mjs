@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
  * Unit suite for the dispatch task-label heuristic
- * (extensions/agent-viewer/labels.ts). Plain node, no test framework:
+ * (extensions/periscope/labels.ts). Plain node, no test framework:
  *
- *   node tests/agent-viewer-task-label.test.mjs
+ *   node tests/periscope-task-label.test.mjs
  *
  * Covers the fleet-reference match (EXT-N and EXT-N-M, case-insensitive,
  * first reference wins on multi-reference prompts, no match inside
@@ -28,7 +28,7 @@ import {
 	resolveTaskLabel,
 	resolveTaskSummary,
 	TASK_LABEL_MAX_WIDTH,
-} from "../extensions/agent-viewer/labels.ts";
+} from "../extensions/periscope/labels.ts";
 
 /** Assert the label is a fleet reference with the expected value. */
 function assertFleetLabel(prompt, expected) {
@@ -197,4 +197,4 @@ assert.equal(aggregateSettledGlyph([{ glyph: "done" }, { glyph: "failed" }]), "m
 assert.equal(aggregateSettledGlyph([]), "done");
 // <<< EXT-18 L2
 
-console.log(`agent-viewer-task-label: all assertions passed`);
+console.log(`periscope-task-label: all assertions passed`);

@@ -13,7 +13,7 @@ Delegate tasks to specialized subagents with isolated context windows.
 - **Markdown rendering**: Final output rendered with proper formatting (expanded view)
 - **Usage tracking**: Shows turns, tokens, cost, and context usage per agent
 - **Abort support**: Ctrl+C propagates to kill subagent processes
-- **Observation surfaces**: the dispatch strip and its hotkeys live in the companion `extensions/agent-viewer/` extension, which reads this extension's published live dispatch state
+- **Observation surfaces**: the dispatch strip and its hotkeys live in the companion `extensions/periscope/` extension, which reads this extension's published live dispatch state
 
 ## Structure
 
@@ -121,7 +121,7 @@ The `jobs` tool inspects and collects detached jobs:
 
 Omitting `id` selects every job in the session. A second `wait` for an already-collected job reports `collected earlier; output not repeated` in its text instead of re-printing the results, and the completion wake never re-delivers them; the wait's result details still carry the job's outputs, so a result lost to a failed delivery stays recoverable with one wait. A job whose child process is killed mid-run (including jobs still running when the session shuts down) is marked `failed` with the abort reason. At most 4 detached jobs run at once; a detach call that would exceed the cap is rejected until earlier jobs finish.
 
-Detached jobs carry the fleet status glyphs across their surfaces: ⏳ while running, ✓ when done, ✗ when failed, in `jobs status` lines, `jobs wait` output, and the completion wake message, keyed off the live `job.status`. Detached jobs are also published as replace-by-id snapshots into the shared dispatch state (`extensions/subagent/registry.ts`), which the agent-viewer extension renders.
+Detached jobs carry the fleet status glyphs across their surfaces: ⏳ while running, ✓ when done, ✗ when failed, in `jobs status` lines, `jobs wait` output, and the completion wake message, keyed off the live `job.status`. Detached jobs are also published as replace-by-id snapshots into the shared dispatch state (`extensions/subagent/registry.ts`), which the periscope extension renders.
 
 **Wake on completion**: when a detached job finishes (done, failed, or hard timeout), the extension sends its final outputs as a custom message with a turn trigger. An idle session wakes immediately with exactly one turn; while a run is active, the message is queued into it. Each job's results are delivered at most once. A `jobs wait` already blocked on the job when it finishes collects the outputs itself and suppresses the wake, and settlement keeps a fallback that delivers finished-but-uncollected results with one continuation if completion races settlement, so no result can fall through.
 
