@@ -121,12 +121,12 @@ export function resolveTaskDisplayLabel(prompt: string): string {
 /**
  * Aggregated glyph over settled task views: done when every view's
  * glyph is done, failed when every one is failed, mixed otherwise.
- * The structural parameter serves both the navigator's
- * NavigatorTaskView and the strip's StripTaskView without coupling
- * this module to either; the flatten and strip callers guard a
- * non-empty list, while the detail caller receives the umbrella row
- * only when the settled partition is non-empty (an empty list
- * vacuously yields "done").
+ * The structural parameter serves the navigator's NavigatorTaskView
+ * and the strip's mapped agent-node status views without coupling
+ * this module to either; the flatten caller guards a non-empty list,
+ * the strip caller may pass an agent-less task's empty list, and the
+ * detail caller receives the umbrella row only when the settled
+ * partition is non-empty (an empty list vacuously yields "done").
  */
 export function aggregateSettledGlyph(views: readonly { glyph: StatusGlyphName }[]): StatusGlyphName {
 	if (views.every((view) => view.glyph === "done")) return "done";

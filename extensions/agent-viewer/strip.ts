@@ -15,7 +15,7 @@
  * pin the budget and glyph behavior directly.
  */
 
-import { resolveTaskDisplayLabel } from "./labels.ts";
+import { aggregateSettledGlyph, resolveTaskDisplayLabel } from "./labels.ts";
 import {
 	type DetachedJobSnapshot,
 	type DispatchAgentNode,
@@ -212,13 +212,6 @@ function agentEntry(agent: DispatchAgentNode, now: number): StripAgentEntry {
 	};
 }
 
-/** A settled task's outcome glyph over its rounds' agent nodes: done when none failed, failed when all failed, mixed otherwise. */
-function aggregateNodeGlyph(nodes: readonly DispatchAgentNode[]): StatusGlyphName {
-	const failed = nodes.filter((node) => node.status === "failed").length;
-	if (failed === 0) return "done";
-	return failed === nodes.length ? "failed" : "mixed";
-}
-
 /**
  * Assemble the strip's task views from the blocking-path dispatch
  * registry plus the detached jobs registry. Task labels resolve from
@@ -269,7 +262,7 @@ export function buildStripTasks(
 			label: resolveTaskDisplayLabel(task.prompt),
 			mode: task.mode,
 			live,
-			glyph: live ? "running" : aggregateNodeGlyph(allAgents),
+			glyph: live ? "running" : aggregateSettledGlyph(allAgents.map((agent) => ({ glyph: agent.status }))),
 			settledAt: finishStamps.length > 0 ? Math.max(...finishStamps) : null,
 			durationText: formatDuration((finishTimes.length > 0 ? Math.max(...finishTimes) : now) - task.startedAt),
 			entries,
