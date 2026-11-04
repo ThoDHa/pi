@@ -942,6 +942,10 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		// window start stays pinned, never oscillating between claiming a
 		// hidden row above a zero-row window and hiding that claim).
 		tui.terminal.rows = 3;
+		// Guard green by design at head: the frame-height invariant holds at
+		// the degenerate surface — the collapsed terminal renders exactly 3
+		// rows, header + clip + hints.
+		assert.equal(view.render(120).length, 3, "the collapsed-terminal frame renders exactly header, clip, and hints");
 		const collapsedClip = clipText(view.render(120));
 		assert.ok(collapsedClip.includes("more"), "the collapsed-viewport frame still clips the overflowing tree");
 		assert.equal(clipText(view.render(120)), collapsedClip, "consecutive renders at a three-row terminal carry identical clip text");
