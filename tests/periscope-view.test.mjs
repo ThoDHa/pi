@@ -17,7 +17,13 @@
  * reads the transcript through the real shortcut handler; the frame
  * fills the full terminal height (the viewBodyRows body budget plus
  * the view's own header and hints lines) and stays fixed across short
- * content and agent switches; the scroll keys
+ * content and agent switches; expandable tree rows render ▸/▾ chevrons
+ * by kind and expansion state with agent leaves keeping a blank column,
+ * the selected row carries a ❯ cursor and a full-line selectedBg
+ * highlight (degrading to the plain row on themes without bg), enter
+ * toggles the selected row's expansion through the umbrella's fold
+ * while leaves stay a no-op, and the focused-row cursor marker recut
+ * still parks one column inside the pane; the scroll keys
  * move only the detail window while selectedId/selectedIndex stay
  * fixed; the pane shows the newest output by default and re-anchors
  * on selection changes; the indicator appears for output arriving
@@ -109,6 +115,7 @@ const UP = "\x1b[A";
 const DOWN = "\x1b[B";
 const LEFT = "\x1b[D";
 const RIGHT = "\x1b[C";
+const ENTER = "\r";
 const ESC = "\x1b";
 const ALT_N = "\x1bn";
 const ALT_V = "\x1bv";
@@ -768,6 +775,131 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 	assert.ok(expandedRender.includes("mapper"));
 });
 
+// --- expand/collapse chevrons per kind and state, and the ❯ selection cursor ---
+
+// A chain fixture exposing every expandable kind at once: a live task
+// holding a completed round (collapsed by default) and a live round
+// (expanded by default) with one agent leaf.
+function chevronFixture() {
+	const registry = createDispatchRegistry();
+	const task = registry.startTask({ mode: "chain", prompt: "Task: EXT-9-9 chevron probe", now: 1_000 });
+	registry.startRound(task.id, [{ agent: "scout" }], 1_000);
+	registry.updateAgent(task.id, 1, 0, { status: "done", finishedAt: 21_000 });
+	registry.startRound(task.id, [{ agent: "worker" }], 22_000);
+	registry.updateAgent(task.id, 2, 0, { lastActivity: "$ rg pattern" });
+	return registry;
+}
+
+await withView({ registry: chevronFixture(), detachedJobs: [] }, async (view) => {
+	const stripped = view.render(120).map(stripAnsi);
+	const cursorRows = stripped.filter((line) => line.includes("❯"));
+	assert.equal(cursorRows.length, 1, "exactly the selected row carries the ❯ cursor");
+	assert.ok(cursorRows[0].includes("▾ ⏳ EXT-9-9"), "the selected live task renders the expanded chevron between cursor and status glyph");
+	assert.ok(stripped.some((line) => line.includes("▸ ✓ round 1")), "the completed round renders the collapsed chevron before its glyph");
+	assert.ok(stripped.some((line) => line.includes("▾ ⏳ round 2")), "the live round renders the expanded chevron");
+	const workerLine = stripped.find((line) => line.includes("worker"));
+	assert.ok(workerLine && !workerLine.includes("▸") && !workerLine.includes("▾"), "the agent leaf renders no chevron");
+	assert.ok(workerLine.startsWith("        ⏳"), "the leaf keeps the chevron column as blank width, its glyph aligned under the rows above");
+});
+
+// --- enter toggles the selected row's expansion; agent leaves are a no-op ---
+
+await withView({ registry: chevronFixture(), detachedJobs: [] }, async (view) => {
+	const stripped = () => view.render(120).map(stripAnsi);
+
+	assert.ok(stripped().some((line) => line.includes("worker")), "the fixture starts with the live task expanded");
+	view.handleInput(ENTER);
+	assert.ok(!stripped().some((line) => line.includes("worker")), "enter collapses the selected task row");
+	assert.ok(stripped().some((line) => line.includes("▸ ⏳ EXT-9-9")), "the collapsed task row renders the collapsed chevron");
+
+	view.handleInput(ENTER);
+	assert.ok(stripped().some((line) => line.includes("worker")), "enter re-expands the collapsed task row");
+	assert.ok(stripped().some((line) => line.includes("▾ ⏳ EXT-9-9")), "the re-expanded task row renders the expanded chevron");
+
+	view.handleInput(DOWN);
+	assert.equal(view.selectedId, "t:task-1:r1", "the cursor reaches the completed round row");
+	view.handleInput(ENTER);
+	assert.ok(stripped().some((line) => line.includes("▾ ✓ round 1")), "enter expands the collapsed round row");
+
+	view.handleInput(DOWN);
+	assert.equal(view.selectedId, "t:task-1:r1:a0", "the cursor reaches the revealed agent leaf");
+	const before = stripped();
+	view.handleInput(ENTER);
+	const after = stripped();
+	assert.equal(view.selectedId, "t:task-1:r1:a0", "enter on a leaf keeps the selection");
+	assert.equal(after.length, before.length, "enter on a leaf changes no row count");
+	assert.ok(after.some((line) => line.includes("▾ ✓ round 1")), "enter on a leaf leaves the round expanded");
+
+	view.handleInput(UP);
+	assert.equal(view.selectedId, "t:task-1:r1", "the cursor returns to the round row");
+	view.handleInput(LEFT);
+	assert.ok(stripped().some((line) => line.includes("▸ ✓ round 1")), "left still collapses the round after enter expanded it");
+});
+
+// --- enter toggles the umbrella row's fold through its collapsed default ---
+
+{
+	const registry = createDispatchRegistry();
+	const task = registry.startTask({ mode: "single", prompt: "Task: EXT-9-2 umbrella probe", now: 1_000 });
+	registry.startRound(task.id, [{ agent: "scout" }], 1_000);
+	registry.updateAgent(task.id, 1, 0, { status: "done", finishedAt: 2_000 });
+	await withView({ registry, detachedJobs: [] }, async (view) => {
+		assert.equal(view.selectedId, "u:completed", "the all-settled tree selects the umbrella row");
+		assert.ok(view.render(120).map(stripAnsi).some((line) => line.includes("❯ ▸ ✓ Completed")), "the umbrella row renders its collapsed chevron under the cursor");
+		assert.ok(!view.render(120).map(stripAnsi).some((line) => line.includes("scout")), "the umbrella starts folded");
+		view.handleInput(ENTER);
+		const expanded = view.render(120).map(stripAnsi);
+		assert.ok(expanded.some((line) => line.includes("▾ ✓ Completed")), "enter unfolds the umbrella row");
+		assert.ok(expanded.some((line) => line.includes("▸ ✓ EXT-9-2")), "the settled task under the umbrella renders its own collapsed chevron");
+		view.handleInput(ENTER);
+		assert.ok(!view.render(120).map(stripAnsi).some((line) => line.includes("scout")), "a second enter folds the umbrella again");
+	});
+}
+
+// --- the selected tree row renders a full-line highlight through the theme ---
+
+// The suites' minimal fg/bold theme stubs carry no bg, where the
+// highlight degrades to the plain padded row; this ANSI-tagging theme
+// pins the real selectedBg path and its full-line pad.
+const selectedBgTheme = {
+	fg: (_color, text) => text,
+	bold: (text) => text,
+	bg: (color, text) => (color === "selectedBg" ? `\x1b[47m${text}\x1b[49m` : text),
+};
+
+await withView({ registry: chevronFixture(), detachedJobs: [] }, async (view) => {
+	const frame = view.render(120);
+	const selectedLine = frame.find((line) => line.includes("\x1b[47m"));
+	assert.ok(selectedLine, "the selected row renders through the theme's selectedBg background");
+	const bare = stripAnsi(sliceByColumn(selectedLine, 0, TREE_W_AT_120));
+	assert.ok(bare.includes("❯"), "the highlighted row is the selected row");
+	assert.equal(visibleWidth(bare), TREE_W_AT_120, "the highlight pads across the tree pane's full width");
+	assert.ok(frame.every((line) => line.includes("\x1b[47m") === stripAnsi(line).includes("❯")), "exactly the selected row carries the highlight");
+}, stubTui(), selectedBgTheme);
+
+// The focused-row cursor-marker recut still parks the marker one column
+// inside the pane over the new chevron column.
+await withView({ registry: chevronFixture(), detachedJobs: [] }, async (view) => {
+	view.focused = true;
+	const selectedLine = view.render(120).find((line) => line.includes(CURSOR_MARKER));
+	assert.ok(selectedLine, "the focused selected row renders the cursor marker");
+	const sliced = sliceByColumn(selectedLine, 0, TREE_W_AT_120);
+	assert.ok(sliced.includes(CURSOR_MARKER), "the recut parks the marker strictly inside the pane, so it survives the column slice");
+	assert.equal(visibleWidth(stripAnsi(sliced)), TREE_W_AT_120, "the pane column stays honestly filled to its width");
+});
+
+// Over a bg-capable theme the focused row parks its cursor marker inside
+// the selectedBg wrap, so the background runs through the marker's cell
+// instead of ending one column short of the pane.
+await withView({ registry: chevronFixture(), detachedJobs: [] }, async (view) => {
+	view.focused = true;
+	const selectedLine = view.render(120).find((line) => line.includes(CURSOR_MARKER));
+	assert.ok(selectedLine, "the focused selected row renders the cursor marker");
+	assert.ok(selectedLine.includes("\x1b[47m"), "the focused selected row still renders through the theme's selectedBg background");
+	const markerAt = selectedLine.indexOf(CURSOR_MARKER);
+	assert.ok(markerAt > selectedLine.indexOf("\x1b[47m") && markerAt < selectedLine.indexOf("\x1b[49m"), "the marker rides inside the bg wrap, so the background spans the row's last column");
+}, stubTui(), selectedBgTheme);
+
 // --- escape resolves the done callback ---
 
 await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (view, done) => {
@@ -883,8 +1015,8 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		assert.equal(view.selectedIndex, 21, "the cursor walks past the fold");
 		const shifted = view.render(120);
 		const shiftedTree = treeColumn(shifted);
-		assert.equal(shiftedTree.filter((row) => row.includes("▸")).length, 1, "exactly the selected row carries the cursor after the shift");
-		assert.ok(shiftedTree.some((row) => row.includes("▸") && row.includes("EXT-9-8")), "the selected row renders inside the shifted window");
+		assert.equal(shiftedTree.filter((row) => row.includes("❯")).length, 1, "exactly the selected row carries the cursor after the shift");
+		assert.ok(shiftedTree.some((row) => row.includes("❯") && row.includes("EXT-9-8")), "the selected row renders inside the shifted window");
 		assert.ok(shiftedTree[0].includes("round 1"), "the window shifted minimally, its top row the first hidden row's successor");
 		assert.equal(clipText(shifted), "… +1 above · +14 more", "the clip reports hidden rows on both sides of the window");
 		assert.equal(shifted.length, BODY_ROWS + 2, "the frame keeps its budget with the window shifted");
@@ -895,8 +1027,8 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		assert.equal(view.selectedIndex, 35, "the cursor reaches the last tree row");
 		const bottom = view.render(120);
 		const bottomTree = treeColumn(bottom);
-		assert.equal(bottomTree.filter((row) => row.includes("▸")).length, 1, "exactly the selected row carries the cursor at the bottom-aligned window");
-		assert.ok(bottomTree[bottomTree.length - 1].includes("▸"), "the cursor row is the window's last row");
+		assert.equal(bottomTree.filter((row) => row.includes("❯")).length, 1, "exactly the selected row carries the cursor at the bottom-aligned window");
+		assert.ok(bottomTree[bottomTree.length - 1].includes("❯"), "the cursor row is the window's last row");
 		assert.equal(clipText(bottom), "… +15 above", "the clip flips to the above-only text at the bottom-aligned window");
 		assert.equal(bottom.length, BODY_ROWS + 2, "the frame holds its height at the bottom-aligned window");
 
@@ -930,13 +1062,13 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		assert.equal(clipText(shrunk), "… +27 above", "the shrunk window re-clamps around the cursor with the above-only clip");
 		const shrunkTree = treeColumn(shrunk);
 		assert.equal(shrunkTree.length, 9, "the shrunk tree window holds the shrunk viewport's rows");
-		assert.equal(shrunkTree.filter((row) => row.includes("▸")).length, 1, "exactly the selected row carries the cursor after the shrink");
-		assert.ok(shrunkTree[shrunkTree.length - 1].includes("▸"), "the deep cursor stays visible at the window's shrunk bottom");
+		assert.equal(shrunkTree.filter((row) => row.includes("❯")).length, 1, "exactly the selected row carries the cursor after the shrink");
+		assert.ok(shrunkTree[shrunkTree.length - 1].includes("❯"), "the deep cursor stays visible at the window's shrunk bottom");
 		tui.terminal.rows = ROWS;
 		const regrown = view.render(120);
 		assert.equal(regrown.length, BODY_ROWS + 2, "the regrown frame is exactly the restored terminal's height");
 		assert.equal(clipText(regrown), "… +15 above", "the regrown window re-clamps with the above-only clip");
-		assert.ok(treeColumn(regrown).some((row) => row.includes("▸") && row.includes("agent-12")), "the cursor row stays visible through the grow");
+		assert.ok(treeColumn(regrown).some((row) => row.includes("❯") && row.includes("agent-12")), "the cursor row stays visible through the grow");
 
 		// Walking back to the top restores the top-aligned window and the
 		// one-sided clip.
@@ -1004,8 +1136,8 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		view.handleInput(RIGHT);
 		assert.equal(view.rows.length, 37, "expanding the umbrella grows the row list by the twelve settled task rows");
 		const expandedTree = treeColumn(view.render(120));
-		assert.equal(expandedTree.filter((row) => row.includes("▸")).length, 1, "exactly the umbrella row carries the cursor after the expansion");
-		assert.ok(expandedTree.some((row) => row.includes("▸") && row.includes("Completed")), "the umbrella row stays visible inside the window its expansion grew");
+		assert.equal(expandedTree.filter((row) => row.includes("❯")).length, 1, "exactly the umbrella row carries the cursor after the expansion");
+		assert.ok(expandedTree.some((row) => row.includes("❯") && row.includes("Completed")), "the umbrella row stays visible inside the window its expansion grew");
 		assert.equal(clipText(view.render(120)), "… +4 above · +12 more", "the clip reports the grown row list on both sides of the window");
 		assert.equal(expandedTree.length + 4 + 12, view.rows.length, "the two-sided clip counts plus the viewport sum to the grown row list");
 
@@ -1027,8 +1159,8 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 		view.handleInput(RIGHT);
 		assert.equal(view.rows.length, 38, "expanding the settled task grows the row list by its round row");
 		const grownTree = treeColumn(view.render(120));
-		assert.equal(grownTree.filter((row) => row.includes("▸")).length, 1, "exactly the settled task row carries the cursor after its expansion");
-		const cursorPosition = grownTree.findIndex((row) => row.includes("▸"));
+		assert.equal(grownTree.filter((row) => row.includes("❯")).length, 1, "exactly the settled task row carries the cursor after its expansion");
+		const cursorPosition = grownTree.findIndex((row) => row.includes("❯"));
 		assert.ok(cursorPosition > 0 && cursorPosition < grownTree.length - 1, "the cursor stays visible strictly inside the window");
 		assert.ok(grownTree[cursorPosition].includes("EXT-25-11"), "the selected settled task row renders inside the window");
 		assert.ok(grownTree[cursorPosition + 1].includes("round 1"), "the expansion's round row renders directly beneath the cursor row, the insertion strictly after it");
@@ -1952,7 +2084,7 @@ function deferredTranscriptReader() {
 // --- hints line: the longer hints line truncates inside a narrow width ---
 
 await withView({ registry: createDispatchRegistry(), detachedJobs: [] }, async (view) => {
-	const HINTS = "↑/↓ move · ←/→ collapse/expand · tab next task · pgup/pgdn scroll · ctrl+t tools · t thinking · esc close";
+	const HINTS = "↑/↓ move · ←/→ collapse/expand · enter toggle · tab next task · pgup/pgdn scroll · ctrl+t tools · t thinking · esc close";
 	const lines = view.render(30);
 	assert.ok(visibleWidth(HINTS) > 30, "the hints line actually exceeds the narrow width");
 	assert.equal(lines[lines.length - 1], truncateToWidth(HINTS, 30), "the hints line truncates, not overflows");
@@ -2247,11 +2379,11 @@ await withView({ registry: createDispatchRegistry(), detachedJobs: [] }, async (
 // >>> EXT-19 V3 (exactly fit): a focused row whose natural width equals the pane width recuts without a false ellipsis
 {
 	const registry = createDispatchRegistry();
-	// A single-mode task row composes as cursor (2 columns) + glyph (the
-	// running ⏳ measures 2) + separator (1) + label + " · single" (9), so
-	// a 38-character label lands the composed row at exactly treeW (52 at
-	// 120 columns).
-	registry.startTask({ mode: "single", prompt: "focused row exactly fits".padEnd(38, "x"), now: 1_000 });
+	// A single-mode task row composes as cursor (2 columns) + chevron (1)
+	// + separator (1) + glyph (the running ⏳ measures 2) + separator (1)
+	// + label + " · single" (9), so a 36-character label lands the
+	// composed row at exactly treeW (52 at 120 columns).
+	registry.startTask({ mode: "single", prompt: "focused row exactly fits".padEnd(36, "x"), now: 1_000 });
 	registry.startRound(registry.getTask("task-1").id, [{ agent: "worker" }], 1_000);
 	await withView({ registry, detachedJobs: [] }, async (view) => {
 		view.focused = true;

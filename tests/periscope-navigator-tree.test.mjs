@@ -17,7 +17,8 @@
  * staying live-empty, and liveness dominating settled task glyphs
  * while the task has an unfinished round), and
  * flattenNavigatorTree turning views plus expansion state into
- * visible rows (completed rounds collapsed to single glyph lines, the
+ * visible rows carrying each row's current expansion state as the
+ * chevron's expanded input (completed rounds collapsed to single glyph lines, the
  * live round auto-expanded, user expand/collapse overrides sticky,
  * task collapse hiding the whole subtree, and the EXT-24-1
  * partition-keyed default: under an expanded umbrella a settled task
@@ -387,6 +388,10 @@ assert.equal(workerRow.label, "worker");
 assert.equal(workerRow.detail, "18s", "live agent duration = now - startedAt");
 assert.ok(!("activity" in workerRow), "tree rows carry no activity suffix");
 assert.ok(workerRow.agentRef, "agent rows carry the detail-pane ref");
+assert.equal(taskRow.expanded, true, "a live task row carries its expanded-by-default state");
+assert.equal(round1Row.expanded, false, "a completed round row carries its collapsed-by-default state");
+assert.equal(round2Row.expanded, true, "a live round row carries its expanded-by-default state");
+assert.equal(workerRow.expanded, false, "agent rows are leaves and carry expanded false");
 
 // --- flattenNavigatorTree: expand/collapse overrides are sticky ---
 
@@ -398,6 +403,7 @@ assert.deepEqual(
 	"expanding a completed round reveals its agents",
 );
 assert.equal(expandedRows[2].label, "scout");
+assert.equal(expandedRows[1].expanded, true, "an override-expanded round carries expanded true");
 
 state.roundOverrides.set(round1Row.id, false);
 state.roundOverrides.set(round2Row.id, false);
@@ -407,6 +413,7 @@ assert.deepEqual(
 	["task", "round", "round", "task", "agent"],
 	"collapsing the live round hides its agents and completed rounds stay collapsed by default",
 );
+assert.equal(collapsedLiveRows[1].expanded, false, "an override-collapsed round carries expanded false");
 
 // --- flattenNavigatorTree: collapsing a task hides its whole subtree ---
 
@@ -418,6 +425,7 @@ assert.deepEqual(
 	[`t:${chainTask.id}`, "t:job-1", "t:job-1:a0"],
 	"a collapsed task renders only its header row; the detached task stays expanded",
 );
+assert.equal(collapsedTaskRows[0].expanded, false, "a collapsed task row carries expanded false");
 
 // --- moveCursor: clamped movement over visible rows ---
 
@@ -534,6 +542,7 @@ assert.equal(treeWindowStart(36, 0, 0, viewportZeroFirst), viewportZeroFirst, "a
 	assert.equal(umbrellaRow.detail, "2 dispatches");
 	assert.equal(umbrellaRow.live, false);
 	assert.equal(umbrellaRow.glyph, "mixed", "the umbrella glyph aggregates over the settled views (done + failed)");
+	assert.equal(umbrellaRow.expanded, false, "the umbrella row carries its collapsed default");
 	assert.ok(
 		!collapsedRows.some((row) => row.taskId === doneTask.id || row.taskId === "job-failed"),
 		"no settled task, round, or agent row renders outside the umbrella",
@@ -604,6 +613,8 @@ assert.equal(treeWindowStart(36, 0, 0, viewportZeroFirst), viewportZeroFirst, "a
 	assert.deepEqual(nestedAgent.agentRef, { source: "registry", ownerId: doneTask.id, roundIndex: 1, slot: 0 }, "agent refs are unchanged under the umbrella");
 	assert.equal(nestedAgent.label, "early");
 	assert.equal(nestedAgent.glyph, "done");
+	assert.equal(expandedRows.find((row) => row.kind === "umbrella").expanded, true, "the expanded umbrella row carries expanded true");
+	assert.equal(expandedRows.find((row) => row.id === `t:${doneTask.id}`).expanded, true, "a pre-expanded settled task row carries expanded true");
 }
 // <<< EXT-17 T2
 

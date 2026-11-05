@@ -216,6 +216,8 @@ export interface NavigatorRow {
 	kind: "task" | "round" | "agent" | "umbrella";
 	id: string;
 	depth: 0 | 1 | 2 | 3;
+	/** Whether the row's subtree currently renders beneath it; drives the tree's chevron. Agent rows are leaves and always false. */
+	expanded: boolean;
 	/** Index of the owning task view; informational only (pinned by the tree suite, no production consumer sorts by it), and under an expanded umbrella the umbrella row ties with the first settled view's build index. */
 	taskOrder: number;
 	taskId: string;
@@ -242,16 +244,20 @@ export interface NavigatorRow {
  * one umbrella row (label Completed, glyph aggregated over them) that
  * defaults collapsed and toggles through the same path; beneath an
  * expanded umbrella their subtrees render one depth deeper, ids and
- * refs unchanged.
+ * refs unchanged. Every row carries its current expansion state as
+ * expanded (false on agent leaves), the tree's chevron rendering
+ * input.
  */
 export function flattenNavigatorTree(tasks: NavigatorTaskView[], state: NavigatorExpansionState): NavigatorRow[] {
 	const rows: NavigatorRow[] = [];
 	const emitTaskSubtree = (task: NavigatorTaskView, taskOrder: number, base: 0 | 1) => {
 		const taskRowId = `t:${task.id}`;
+		const taskExpanded = task.live ? !state.collapsedTasks.has(task.id) : state.settledExpandedTasks.has(task.id);
 		rows.push({
 			kind: "task",
 			id: taskRowId,
 			depth: base,
+			expanded: taskExpanded,
 			taskOrder,
 			taskId: task.id,
 			live: task.live,
@@ -259,18 +265,19 @@ export function flattenNavigatorTree(tasks: NavigatorTaskView[], state: Navigato
 			label: task.label,
 			detail: task.mode,
 		});
-		const expanded = task.live ? !state.collapsedTasks.has(task.id) : state.settledExpandedTasks.has(task.id);
-		if (!expanded) return;
+		if (!taskExpanded) return;
 
 		if (task.source === "registry") {
 			const roundDepth: 1 | 2 = base === 0 ? 1 : 2;
 			const agentDepth: 2 | 3 = base === 0 ? 2 : 3;
 			for (const round of task.rounds) {
 				const roundRowId = `${taskRowId}:r${round.index}`;
+				const roundExpanded = state.roundOverrides.get(roundRowId) ?? round.live;
 				rows.push({
 					kind: "round",
 					id: roundRowId,
 					depth: roundDepth,
+					expanded: roundExpanded,
 					taskOrder,
 					taskId: task.id,
 					live: round.live,
@@ -279,13 +286,13 @@ export function flattenNavigatorTree(tasks: NavigatorTaskView[], state: Navigato
 					detail: `${round.summary} · ${round.durationText}`,
 					roundIndex: round.index,
 				});
-				const expanded = state.roundOverrides.get(roundRowId) ?? round.live;
-				if (!expanded) continue;
+				if (!roundExpanded) continue;
 				round.agents.forEach((agent, slot) => {
 					rows.push({
 						kind: "agent",
 						id: `${roundRowId}:a${slot}`,
 						depth: agentDepth,
+						expanded: false,
 						taskOrder,
 						taskId: task.id,
 						live: agent.status === "running",
@@ -304,6 +311,7 @@ export function flattenNavigatorTree(tasks: NavigatorTaskView[], state: Navigato
 					kind: "agent",
 					id: `${taskRowId}:a${slot}`,
 					depth: agentDepth,
+					expanded: false,
 					taskOrder,
 					taskId: task.id,
 					live: agent.status === "running",
@@ -325,6 +333,7 @@ export function flattenNavigatorTree(tasks: NavigatorTaskView[], state: Navigato
 			kind: "umbrella",
 			id: "u:completed",
 			depth: 0,
+			expanded: state.completedExpanded,
 			taskOrder: tasks.length - settled.length,
 			taskId: "completed",
 			live: false,

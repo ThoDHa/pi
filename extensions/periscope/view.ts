@@ -29,7 +29,8 @@
  * interval plus requestRender, cleared in dispose) and renders
  * through the theme with the fleet glyph conventions. Strictly
  * read-only over dispatches: the fixed v1 keys move the cursor,
- * collapse or expand, page the detail pane, toggle tool-noise
+ * collapse or expand (left/right, or enter flipping the selected row's
+ * current expansion state), page the detail pane, toggle tool-noise
  * visibility, and open the selected finished agent's full thinking
  * from the session transcript (t, streamed line by line behind a
  * loading note so no press ever blocks on disk), and in fullscreen
@@ -142,7 +143,7 @@ const TREE_PANE_MIN_WIDTH = 26;
 const DETAIL_PANE_MIN_WIDTH = 30;
 const PANE_GAP = 3;
 
-const HINTS_LINE = "↑/↓ move · ←/→ collapse/expand · tab next task · pgup/pgdn scroll · ctrl+t tools · t thinking · esc close";
+const HINTS_LINE = "↑/↓ move · ←/→ collapse/expand · enter toggle · tab next task · pgup/pgdn scroll · ctrl+t tools · t thinking · esc close";
 
 /**
  * Per-event wheel ceiling in detail lines: above the stack's largest
@@ -510,6 +511,10 @@ export class NavigatorView implements Focusable {
 			this.toggleRow(true);
 			return;
 		}
+		if (matchesKey(data, "enter")) {
+			this.toggleSelectedRow();
+			return;
+		}
 		if (matchesKey(data, "pageUp")) {
 			this.pageDetail(-1);
 			return;
@@ -556,12 +561,19 @@ export class NavigatorView implements Focusable {
 		return { handled: true };
 	}
 
-	/** left collapses, right expands; the row semantics live in the pure toggleNavigatorRow (suite-pinned), the component only dispatches keys and re-reads. */
+	/** left collapses, right expands, enter flips the selected row's current state; the row semantics live in the pure toggleNavigatorRow (suite-pinned), the component only dispatches keys and re-reads. */
 	private toggleRow(expand: boolean): void {
 		const row = this.rows[this.selectedIndex];
 		if (!row) return;
 		toggleNavigatorRow(this.expansion, row, expand);
 		this.refresh();
+	}
+
+	/** Enter's toggle: expand a collapsed expandable row, collapse an expanded one, straight off the same expanded state the chevron renders; agent rows are leaves and a no-op. */
+	private toggleSelectedRow(): void {
+		const row = this.rows[this.selectedIndex];
+		if (!row || row.kind === "agent") return;
+		this.toggleRow(!row.expanded);
 	}
 
 	/** Page the detail pane one viewport (minus its overlap line) up or down; the tail-following state lives in the pure DetailScrollState. */
@@ -601,26 +613,42 @@ export class NavigatorView implements Focusable {
 		const theme = this.theme;
 		const selected = row.id === this.selectedId;
 		const indent = "  ".repeat(row.depth);
-		const cursor = selected ? "▸ " : "  ";
+		const cursor = selected ? "❯ " : "  ";
+		const chevron = row.kind === "agent" ? " " : row.expanded ? "▾" : "▸";
 		const glyph = theme.fg(GLYPH_COLORS[row.glyph], statusGlyph(row.glyph));
 		const label =
 			row.kind === "task" || row.kind === "umbrella"
 				? theme.fg("accent", theme.bold(row.label))
 				: theme.fg("toolTitle", row.kind === "round" ? theme.bold(row.label) : row.label);
 		const detail = row.detail ? theme.fg("muted", ` · ${row.detail}`) : "";
-		const line = `${indent}${cursor}${glyph} ${label}${detail}`;
+		const line = `${indent}${cursor}${chevron} ${glyph} ${label}${detail}`;
 		// The row is cut to the pane width itself, so pi-tui's Text never
 		// wraps it into a second pane line and the layout's column slice
 		// never engages: every cut ends in an honest ellipsis.
 		const truncated = truncateToWidth(line, treeW, "…");
-		if (!(selected && this.focused)) return truncated;
+		if (!selected) return truncated;
+		if (!this.focused) return this.highlightSelectedRow(truncated, treeW);
 		// pi-tui's column slice drops a zero-width code parked exactly at the
 		// slice end, so the focused row recuts one column short to park the
 		// marker strictly inside the pane. The branch reads the row's own
 		// width: an overlong row keeps its ellipsis across the recut, while a
 		// row that already fit recuts without one, since an ellipsis on fully
 		// fitted content claims a cut that never happened.
-		return visibleWidth(line) > treeW ? truncateToWidth(line, treeW - 1, "…") + CURSOR_MARKER : truncateToWidth(line, treeW - 1, "") + CURSOR_MARKER;
+		const recut = visibleWidth(line) > treeW ? truncateToWidth(line, treeW - 1, "…") : truncateToWidth(line, treeW - 1, "");
+		return this.highlightSelectedRow(recut, treeW - 1, CURSOR_MARKER);
+	}
+
+	/**
+	 * Full-line highlight for the selected tree row: the cut is padded to
+	 * its width budget so the theme's selectedBg background spans the row's
+	 * whole width, degrading to the plain padded row when the theme offers
+	 * no bg (the suites' minimal fg/bold stubs). The optional suffix is a
+	 * zero-width code parked inside the wrap, so a focused row's cursor
+	 * marker does not end the background one column short of the pane.
+	 */
+	private highlightSelectedRow(cut: string, width: number, inside = ""): string {
+		const padded = cut + " ".repeat(Math.max(0, width - visibleWidth(cut))) + inside;
+		return this.theme.bg?.("selectedBg", padded) ?? padded;
 	}
 
 	/**
