@@ -15,5 +15,6 @@
 !/extensions/permission-gate.ts
 !/extensions/protected-paths.ts
 !/extensions/condensed-footer.ts
+!/extensions/cwd-scope-gate.ts
 !/extensions/subagent/
 !/extensions/periscope/
