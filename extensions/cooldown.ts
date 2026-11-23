@@ -9,7 +9,9 @@
  * persist the pending wait via appendEntry, and at fire time resume the
  * work by sending the configured resume prompt (plain send when idle,
  * `followUp` while busy). While the wait pends, a minute-tick countdown
- * refreshes the footer status with the remaining wait; the tick interval
+ * refreshes the footer status with the remaining wait under the entry's
+ * own `cooldown:<name>` status key, so concurrent waits render
+ * independently; the tick interval
  * shares the fire timer's lifecycle, so every site that clears the timer
  * (fire, cancel, retire, cap, restart drop, shutdown) clears the tick
  * too. A repeat limit error on a resumed turn re-arms
@@ -59,8 +61,13 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 export const ENTRY_TYPE = "cooldown";
-export const STATUS_KEY = "cooldown";
+const STATUS_KEY = "cooldown";
 export const DEFAULT_RESUME_PROMPT = "The provider usage-limit window has reset. Continue the pending work from where it stopped.";
+
+/** Footer status key for one entry's countdown segment; per-entry keys keep concurrent waits from flip-flopping a shared slot. */
+export function statusKeyFor(entryName: string): string {
+	return `${STATUS_KEY}:${entryName}`;
+}
 
 const MINUTE_MS = 60_000;
 const TIMEOUT_CAP_MS = 2 ** 31 - 1;
@@ -492,7 +499,7 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 		const ctx = sessionCtx;
 		const state = states.get(entryName);
 		if (ctx === undefined || state === undefined || config === undefined || !ctx.hasUI) return;
-		ctx.ui.setStatus(STATUS_KEY, `⏳ ${entryName} in ${formatCountdown(state.fireAtMs, Date.now())} · ${state.attempts}/${config.maxResumeAttempts} resumes used`);
+		ctx.ui.setStatus(statusKeyFor(entryName), `⏳ ${entryName} in ${formatCountdown(state.fireAtMs, Date.now())} · ${state.attempts}/${config.maxResumeAttempts} resumes used`);
 	}
 
 	function fireResume(entryName: string): void {
@@ -510,7 +517,7 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 		pi.appendEntry(ENTRY_TYPE, { state: "fired", entryName, resetAtMs: state.resetAtMs, fireAtMs: state.fireAtMs, attempts: state.attempts, resumedAtMs: Date.now() });
 		if (ctx.hasUI) {
 			ctx.ui.notify(`cooldown: ${entryName} limit window reset; resuming automatically (attempt ${state.attempts}/${config.maxResumeAttempts})`, "info");
-			ctx.ui.setStatus(STATUS_KEY, undefined);
+			ctx.ui.setStatus(statusKeyFor(entryName), undefined);
 		}
 	}
 
@@ -548,7 +555,7 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 			disabled.add(entry.name);
 			pi.appendEntry(ENTRY_TYPE, { state: "capped", entryName: entry.name, attempts: decision.attempts, cappedAtMs: Date.now() });
 			if (ctx.hasUI) {
-				ctx.ui.setStatus(STATUS_KEY, undefined);
+				ctx.ui.setStatus(statusKeyFor(entry.name), undefined);
 				ctx.ui.notify(`${prefix}${entry.name} recovery stopped after ${decision.attempts} resume attempts; continue manually (a successful turn re-enables auto-recovery)`, "error");
 			}
 			return;
@@ -577,7 +584,7 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 			disabled.delete(entry.name);
 			pi.appendEntry(ENTRY_TYPE, { state: "resolved", entryName: entry.name, resolvedAtMs: Date.now() });
 			if (ctx.hasUI) {
-				ctx.ui.setStatus(STATUS_KEY, undefined);
+				ctx.ui.setStatus(statusKeyFor(entry.name), undefined);
 				ctx.ui.notify(`cooldown: session is processing again; pending ${entry.name} wait retired`, "info");
 			}
 		}
@@ -633,7 +640,7 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 			// every mode: it is how a headless run still records the drop.
 			persistCancelled(decision.state, decision.gate);
 			if (ctx.hasUI) {
-				ctx.ui.setStatus(STATUS_KEY, undefined);
+				ctx.ui.setStatus(statusKeyFor(decision.state.entryName), undefined);
 				const gateNote = decision.gate === "fork" ? "not auto-resumed into a freshly forked session" : "not auto-resumed (resumeOnRestart: false)";
 				ctx.ui.notify(`cooldown: pending ${decision.state.entryName} wait from the previous session is ${gateNote}; deadline was ${formatResumeClock(decision.state.fireAtMs)}; send a message to continue`, "info");
 			}
@@ -703,10 +710,10 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 		for (const [entryName, state] of states) {
 			clearTimer(entryName);
 			persistCancelled(state);
+			if (ctx.hasUI) ctx.ui.setStatus(statusKeyFor(entryName), undefined);
 		}
 		states.clear();
 		if (ctx.hasUI) {
-			ctx.ui.setStatus(STATUS_KEY, undefined);
 			ctx.ui.notify("cooldown: cancelled the pending usage-limit wait(s)", "info");
 		}
 	}
