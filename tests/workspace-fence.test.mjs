@@ -86,6 +86,8 @@ import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import cwdScopeGate, {
 	EXTRA_ROOTS_ENV,
+	FENCE_CONFIG_FILE,
+	FENCE_LOCAL_CONFIG_FILE,
 	GATED_BASH_TOOLS,
 	GATED_PATH_TOOLS,
 	RELEASE_DIGEST_PINS,
@@ -96,11 +98,15 @@ import cwdScopeGate, {
 	decidePathToolCall,
 	expandTilde,
 	evaluateSealState,
+	fenceExtraRoots,
 	isInsideRoots,
 	kernelStyleResolve,
 	lexicalResolvePath,
+	loadFenceConfigRoots,
 	normalizeToolInputPath,
 	parseExtraRoots,
+	parseFenceConfig,
+	resetFenceExtraRoots,
 	resetSessionSeal,
 	resolveRunningRelease,
 	resolveScopeTarget,
@@ -565,6 +571,229 @@ try {
 		console.warn = originalWarn;
 	}
 
+	// --- fence config: tracked defaults + optional local overlay --------
+	// Three extra-root sources union into the allowed set: the tracked
+	// workspace-fence.config.json beside the module (portable defaults,
+	// tilde-spelled), the optional untracked workspace-fence.local.json
+	// overlay beside it (machine-dependent), and PISCOPE_EXTRA_ROOTS.
+	// Config parsing pins the strict flat shape: unknown keys warn and
+	// are skipped, a malformed document warns and contributes nothing,
+	// entries expand a leading tilde against the suite's fixture home,
+	// and each resolvable entry lands in both its literal and realpath
+	// forms exactly like env entries. Sources only ever add: nothing in
+	// them can remove the cwd or tmp roots from the union.
+	const configDir = path.join(fixtureRoot, "config-fixture");
+	fs.mkdirSync(configDir, { recursive: true });
+	const configSkillDir = path.join(fakeHome, "skills");
+	fs.mkdirSync(configSkillDir, { recursive: true });
+	const configLink = path.join(configDir, "link-root");
+	fs.symlinkSync(outsideDir, configLink, "dir");
+
+	check(
+		"config valid shape parses its roots",
+		JSON.stringify(parseFenceConfig(JSON.stringify({ extraRoots: [outsideDir, outsideSubDir] }), "valid.json", fakeHome)),
+		JSON.stringify([outsideDir, outsideSubDir]),
+	);
+	check(
+		"config without the extraRoots key parses to nothing",
+		parseFenceConfig(JSON.stringify({}), "empty.json", fakeHome).length,
+		0,
+	);
+
+	const originalConfigWarn = console.warn;
+	const configWarnings = [];
+	console.warn = (...args) => {
+		configWarnings.push(args.join(" "));
+	};
+	try {
+		check(
+			"config unknown keys tolerate the known shape",
+			JSON.stringify(parseFenceConfig(JSON.stringify({ extraRoots: [outsideDir], future: 1, another: "x" }), "unknown.json", fakeHome)),
+			JSON.stringify([outsideDir]),
+		);
+		check("config warns once per unknown key", configWarnings.length, 2);
+		checkContains("unknown-key warning names the key", configWarnings.join("\n"), "future");
+
+		configWarnings.length = 0;
+		check(
+			"config invalid JSON parses to nothing",
+			parseFenceConfig("{not json", "broken.json", fakeHome).length,
+			0,
+		);
+		check("config invalid JSON warned", configWarnings.length, 1);
+		check(
+			"config non-object top level parses to nothing",
+			parseFenceConfig(JSON.stringify(["/tmp"]), "array.json", fakeHome).length,
+			0,
+		);
+		check(
+			"config non-array extraRoots parses to nothing",
+			parseFenceConfig(JSON.stringify({ extraRoots: "/tmp" }), "scalar.json", fakeHome).length,
+			0,
+		);
+		check("each malformed document warned", configWarnings.length, 3);
+
+		configWarnings.length = 0;
+		check(
+			"config non-string entries ignored",
+			parseFenceConfig(JSON.stringify({ extraRoots: [7, null] }), "types.json", fakeHome).length,
+			0,
+		);
+		check("each non-string entry warned", configWarnings.length, 2);
+
+		configWarnings.length = 0;
+		check(
+			"config empty-string entries skip quietly",
+			parseFenceConfig(JSON.stringify({ extraRoots: [""] }), "blank.json", fakeHome).length,
+			0,
+		);
+		check("config empty-string entries emit no warning", configWarnings.length, 0);
+		check(
+			"config relative entries ignored",
+			parseFenceConfig(JSON.stringify({ extraRoots: ["rel/without/lead"] }), "relative.json", fakeHome).length,
+			0,
+		);
+		check("config relative entry warned", configWarnings.length, 1);
+		check(
+			"config unresolvable entries ignored",
+			parseFenceConfig(JSON.stringify({ extraRoots: [path.join(fixtureRoot, "missing-cfg")] }), "missing.json", fakeHome).length,
+			0,
+		);
+		check("config unresolvable entry warned", configWarnings.length, 2);
+		checkContains(
+			"config warning names the declaring file",
+			configWarnings.join("\n"),
+			"missing.json",
+		);
+
+		configWarnings.length = 0;
+		check(
+			"loader treats an absent tracked config as empty but warned",
+			loadFenceConfigRoots(path.join(configDir, "no-such.json"), path.join(configDir, "no-overlay.json"), fakeHome).length,
+			0,
+		);
+		check("absent tracked config warned", configWarnings.length, 1);
+		check(
+			"config mid-word tilde stays literal and drops as relative",
+			parseFenceConfig(JSON.stringify({ extraRoots: ["foo~bar"] }), "midword.json", fakeHome).length,
+			0,
+		);
+	} finally {
+		console.warn = originalConfigWarn;
+	}
+
+	check(
+		"config tilde entries expand against home",
+		JSON.stringify(parseFenceConfig(JSON.stringify({ extraRoots: ["~/skills", "~"] }), "tilde.json", fakeHome)),
+		JSON.stringify([configSkillDir, fakeHome]),
+	);
+	check(
+		"config symlinked entry stores literal and realpath forms",
+		JSON.stringify(parseFenceConfig(JSON.stringify({ extraRoots: [configLink] }), "link.json", fakeHome)),
+		JSON.stringify([configLink, outsideDir]),
+	);
+
+	// loader: tracked file + optional overlay union, order-stable
+	const trackedConfigPath = path.join(configDir, "tracked.json");
+	const overlayConfigPath = path.join(configDir, "overlay.json");
+	const absentOverlayPath = path.join(configDir, "no-such-overlay.json");
+	fs.writeFileSync(trackedConfigPath, JSON.stringify({ extraRoots: [outsideDir] }));
+	fs.writeFileSync(overlayConfigPath, JSON.stringify({ extraRoots: [configSkillDir] }));
+	check(
+		"loader unions tracked config and overlay roots",
+		JSON.stringify(loadFenceConfigRoots(trackedConfigPath, overlayConfigPath, fakeHome)),
+		JSON.stringify([outsideDir, configSkillDir]),
+	);
+	check(
+		"loader tolerates an absent overlay silently",
+		JSON.stringify(loadFenceConfigRoots(trackedConfigPath, absentOverlayPath, fakeHome)),
+		JSON.stringify([outsideDir]),
+	);
+	check(
+		"loader dedupes roots the overlay repeats",
+		JSON.stringify(loadFenceConfigRoots(trackedConfigPath, trackedConfigPath, fakeHome)),
+		JSON.stringify([outsideDir]),
+	);
+
+	// config + env union: the composition the factory evaluates lazily
+	const envOnlyDir = path.join(fixtureRoot, "env-only");
+	const envOnlyFile = path.join(envOnlyDir, "target.txt");
+	fs.mkdirSync(envOnlyDir, { recursive: true });
+	fs.writeFileSync(envOnlyFile, "fixture");
+	const previousExtraRoots = process.env[EXTRA_ROOTS_ENV];
+	process.env[EXTRA_ROOTS_ENV] = envOnlyDir;
+	try {
+		const configEnvUnion = buildAllowedRoots(
+			cwdDir,
+			[
+				...loadFenceConfigRoots(trackedConfigPath, absentOverlayPath, fakeHome),
+				...parseExtraRoots(process.env[EXTRA_ROOTS_ENV]),
+			],
+			customTmpDir,
+		);
+		check(
+			"config root allows alongside an env root",
+			resolveScopeTarget(cwdDir, configEnvUnion, outFile).scope,
+			"allow",
+		);
+		check(
+			"env root allows alongside a config root",
+			resolveScopeTarget(cwdDir, configEnvUnion, envOnlyFile).scope,
+			"allow",
+		);
+		check(
+			"target outside every union source still asks",
+			resolveScopeTarget(cwdDir, configEnvUnion, "/etc/passwd").scope,
+			"ask",
+		);
+	} finally {
+		if (previousExtraRoots === undefined) delete process.env[EXTRA_ROOTS_ENV];
+		else process.env[EXTRA_ROOTS_ENV] = previousExtraRoots;
+	}
+
+	// defaults loading: the tracked file beside the module carries
+	// exactly the two portable tilde defaults and they load against the
+	// real home through the loader the factory runs
+	const moduleDir = path.resolve(import.meta.dirname, "..", "extensions");
+	const trackedDefaultsPath = path.join(moduleDir, FENCE_CONFIG_FILE);
+	check(
+		"tracked config declares exactly the two portable tilde defaults",
+		JSON.stringify(JSON.parse(fs.readFileSync(trackedDefaultsPath, "utf-8")).extraRoots),
+		JSON.stringify(["~/.agents/skills", "~/.pi/agent/install"]),
+	);
+	const realDefaults = loadFenceConfigRoots(
+		trackedDefaultsPath,
+		path.join(moduleDir, FENCE_LOCAL_CONFIG_FILE),
+		os.homedir(),
+	);
+	check(
+		"defaults include the tilde-expanded skills root",
+		realDefaults.includes(path.join(os.homedir(), ".agents", "skills")),
+		true,
+	);
+	check(
+		"defaults include the tilde-expanded install root",
+		realDefaults.includes(path.join(os.homedir(), ".pi", "agent", "install")),
+		true,
+	);
+
+	// lazy memo beside the seal: the union evaluates once, later calls
+	// reuse it, reset re-evaluates under changed files or env
+	resetFenceExtraRoots();
+	const firstUnion = fenceExtraRoots();
+	check("fence extra roots memoize to a single evaluation", fenceExtraRoots() === firstUnion, true);
+	check(
+		"memoized union carries the tilde-expanded defaults",
+		firstUnion.includes(path.join(os.homedir(), ".agents", "skills")),
+		true,
+	);
+	check(
+		"memoized union carries the tilde-expanded install root",
+		firstUnion.includes(path.join(os.homedir(), ".pi", "agent", "install")),
+		true,
+	);
+	resetFenceExtraRoots();
+
 	// --- env-integrated roots: PISCOPE_EXTRA_ROOTS set around the case --
 	const envKey = EXTRA_ROOTS_ENV;
 	const previous = process.env[envKey];
@@ -926,6 +1155,8 @@ try {
 	check("handler blocks a refused call", handlerRefusal && handlerRefusal.block, true);
 	checkContains("handler refusal names the tool", handlerRefusal.reason, "read");
 	checkContains("handler refusal names the resolved path", handlerRefusal.reason, "/etc/passwd");
+	checkContains("handler refusal names the workspace-fence", handlerRefusal.reason, "blocked by the workspace-fence");
+	check("handler refusal drops the stale space-spelled gate name", handlerRefusal.reason.includes("cwd-scope gate"), false);
 	const handlerHeadless = await handler(
 		{ toolName: "read", input: { path: "/etc/passwd" } },
 		{ cwd: cwdDir, hasUI: false, ui: { select: async () => "Yes" } },

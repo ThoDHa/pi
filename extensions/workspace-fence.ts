@@ -1,8 +1,10 @@
 /**
- * CWD Scope Gate Extension
+ * workspace-fence extension
  *
  * The user's file-access policy as a pi extension: a session may touch
- * its working-directory subtree, the os.tmpdir() subtree, and the
+ * its working-directory subtree, the os.tmpdir() subtree, and the extra
+ * roots unioned from the tracked workspace-fence.config.json, the
+ * optional untracked workspace-fence.local.json overlay, and the
  * PISCOPE_EXTRA_ROOTS entries without prompting; every other directory
  * requires an interactive permission ASK, never a silent denial. The
  * module carries both halves: resolveScopeTarget and its helpers are
@@ -174,14 +176,29 @@
  * the release's own normalizers on every run, so any pi upgrade that
  * touches the transform surface fails loud and forces a re-pin.
  *
- * Extra roots: PISCOPE_EXTRA_ROOTS is a delimiter-separated (":" on
- * POSIX) list of absolute paths; parseExtraRoots stores each entry in
- * both its literal and realpath forms so a symlinked declaration
- * sanctions access by either name.
- * Malformed entries (relative, unresolvable) are ignored with a console
- * warning, never fatal: an entry the session cannot prove strict drops
- * out, which only ever narrows the allowlist. Children inherit the
- * variable through the normal spawn environment chain.
+ * Extra roots arrive from three sources, and the verdict's allowed set
+ * is their pure union (plus the session cwd and tmpdir, which no source
+ * can remove): the tracked workspace-fence.config.json beside this
+ * module carries the portable defaults; the optional untracked
+ * workspace-fence.local.json beside it carries machine-dependent roots
+ * the user keeps out of version control; and PISCOPE_EXTRA_ROOTS is a
+ * delimiter-separated (":" on POSIX) list of absolute paths children
+ * inherit through the normal spawn environment chain. Config and
+ * overlay share one strict flat shape, an object whose only known key
+ * is "extraRoots", an array of path strings; unknown keys warn and are
+ * skipped, never fatal. Config and overlay entries expand a leading
+ * tilde (bare "~" and "~/" against the home directory, expandTilde)
+ * before the absolute check, so the portable defaults are spelled
+ * "~/.agents/skills" and "~/.pi/agent/install" and resolve per machine.
+ * Every source stores each well-formed entry in BOTH forms, its
+ * literal string and its realpath, so a symlinked declaration sanctions
+ * access by either name. Malformed entries (non-string, relative after
+ * expansion, unresolvable) are ignored with a console warning, never
+ * fatal: an entry the session cannot prove strict drops out, which only
+ * ever narrows the allowlist. The union is read lazily once per
+ * process at the first gated verdict, memoized beside the seal
+ * (fenceExtraRoots, reset by resetFenceExtraRoots), so a config edit or
+ * env change mid-session needs a restart to apply.
  */
 
 import * as fs from "node:fs";
@@ -196,6 +213,18 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
  * absolute paths parsed by parseExtraRoots.
  */
 export const EXTRA_ROOTS_ENV = "PISCOPE_EXTRA_ROOTS";
+
+/**
+ * The tracked config file carrying the portable default extra roots,
+ * read from the directory this module itself sits in.
+ */
+export const FENCE_CONFIG_FILE = "workspace-fence.config.json";
+
+/**
+ * The optional untracked overlay carrying machine-dependent extra
+ * roots; its absence is the normal case and is tolerated silently.
+ */
+export const FENCE_LOCAL_CONFIG_FILE = "workspace-fence.local.json";
 
 /**
  * The unicode-space characters pi's normalizeUnicodeSpaces replaces
@@ -332,14 +361,49 @@ export function isInsideRoots(candidate: string, roots: string[]): boolean {
 }
 
 /**
+ * Resolve one declared root entry to its dual forms: the literal
+ * absolute string plus its realpath, so a symlinked declaration
+ * sanctions access by either name (a non-symlink yields one form).
+ * Malformed entries (relative, unresolvable) return empty with a
+ * console warning naming the declaring source, never fatal: an entry
+ * the session cannot prove strict drops out, narrowing the allowlist
+ * (fail-closed) instead of failing the session.
+ */
+function declaredRootForms(entry: string, origin: string): string[] {
+	if (!path.isAbsolute(entry)) {
+		console.warn(`workspace-fence: ignoring ${origin} entry "${entry}": path is not absolute`);
+		return [];
+	}
+	let resolved: string;
+	try {
+		resolved = fs.realpathSync(entry);
+	} catch {
+		console.warn(`workspace-fence: ignoring ${origin} entry "${entry}": path does not resolve`);
+		return [];
+	}
+	return resolved === entry ? [entry] : [entry, resolved];
+}
+
+/**
+ * Merge incoming roots into existing as one order-stable, deduplicated
+ * union: the only direction any extra-root source acts in.
+ */
+function mergeRoots(existing: string[], incoming: string[]): string[] {
+	const seen = new Set(existing);
+	for (const root of incoming) {
+		if (!seen.has(root)) {
+			seen.add(root);
+			existing.push(root);
+		}
+	}
+	return existing;
+}
+
+/**
  * Parse the PISCOPE_EXTRA_ROOTS value into allowed roots. Each
- * well-formed entry is stored in BOTH forms, its literal absolute
- * string and its realpath: a symlinked declaration sanctions access by
- * either name. Malformed entries are ignored with a console warning
- * rather than fatal: a relative or unresolvable entry drops out,
- * narrowing the allowlist (fail-closed) instead of failing the
- * session. Empty segments (for example from a trailing delimiter) are
- * skipped quietly, matching ordinary PATH-list tolerance.
+ * well-formed entry is stored in BOTH forms via declaredRootForms;
+ * empty segments (for example from a trailing delimiter) are skipped
+ * quietly, matching ordinary PATH-list tolerance.
  */
 export function parseExtraRoots(value: string | undefined): string[] {
 	if (typeof value !== "string" || value.trim().length === 0) return [];
@@ -347,27 +411,113 @@ export function parseExtraRoots(value: string | undefined): string[] {
 	const seen = new Set<string>();
 	for (const entry of value.split(path.delimiter)) {
 		if (entry.length === 0) continue;
-		if (!path.isAbsolute(entry)) {
-			console.warn(`workspace-fence: ignoring ${EXTRA_ROOTS_ENV} entry "${entry}": path is not absolute`);
-			continue;
-		}
-		let resolved: string;
-		try {
-			resolved = fs.realpathSync(entry);
-		} catch {
-			console.warn(`workspace-fence: ignoring ${EXTRA_ROOTS_ENV} entry "${entry}": path does not resolve`);
-			continue;
-		}
-		if (!seen.has(entry)) {
-			seen.add(entry);
-			roots.push(entry);
-		}
-		if (!seen.has(resolved)) {
-			seen.add(resolved);
-			roots.push(resolved);
+		for (const form of declaredRootForms(entry, EXTRA_ROOTS_ENV)) {
+			if (!seen.has(form)) {
+				seen.add(form);
+				roots.push(form);
+			}
 		}
 	}
 	return roots;
+}
+
+/**
+ * Parse one fence config document (the tracked config or the local
+ * overlay): a strict flat JSON object whose only known key is
+ * "extraRoots", an array of path strings. Unknown keys warn and are
+ * skipped, never fatal. Entries expand a leading tilde against home
+ * before the absolute check, then resolve to dual forms like env
+ * entries; empty strings skip quietly (PATH-list tolerance) and every
+ * other malformed shape warns and contributes nothing. An undefined
+ * text (the file was absent) parses to nothing without warning; the
+ * file reader decides absence policy.
+ */
+export function parseFenceConfig(
+	text: string | undefined,
+	origin: string,
+	home: string = os.homedir(),
+): string[] {
+	if (text === undefined) return [];
+	let document: unknown;
+	try {
+		document = JSON.parse(text);
+	} catch {
+		console.warn(`workspace-fence: ignoring ${origin}: not valid JSON`);
+		return [];
+	}
+	if (typeof document !== "object" || document === null || Array.isArray(document)) {
+		console.warn(`workspace-fence: ignoring ${origin}: top level is not a JSON object`);
+		return [];
+	}
+	const roots: string[] = [];
+	const seen = new Set<string>();
+	const record = document as Record<string, unknown>;
+	for (const key of Object.keys(record)) {
+		if (key !== "extraRoots") {
+			console.warn(`workspace-fence: ignoring ${origin} key "${key}": unknown config key`);
+		}
+	}
+	const entries = record["extraRoots"];
+	if (entries === undefined) return roots;
+	if (!Array.isArray(entries)) {
+		console.warn(`workspace-fence: ignoring ${origin}: "extraRoots" is not a JSON array`);
+		return roots;
+	}
+	for (const entry of entries) {
+		if (typeof entry !== "string") {
+			console.warn(`workspace-fence: ignoring ${origin} entry "${String(entry)}": entry is not a string`);
+			continue;
+		}
+		if (entry.length === 0) continue;
+		for (const form of declaredRootForms(expandTilde(entry, home), origin)) {
+			if (!seen.has(form)) {
+				seen.add(form);
+				roots.push(form);
+			}
+		}
+	}
+	return roots;
+}
+
+/**
+ * Read one fence config file and parse it. A missing optional file is
+ * the normal overlay case and stays silent; a missing tracked config
+ * warns because the portable defaults are expected to ship with the
+ * module.
+ */
+function readFenceRootsFile(
+	filePath: string,
+	origin: string,
+	optional: boolean,
+	home: string,
+): string[] {
+	let text: string;
+	try {
+		text = fs.readFileSync(filePath, "utf-8");
+	} catch {
+		if (!optional) {
+			console.warn(`workspace-fence: ${origin} is missing or unreadable; no extra roots load from it`);
+		}
+		return [];
+	}
+	return parseFenceConfig(text, origin, home);
+}
+
+/**
+ * Load the tracked config's roots plus the optional overlay's roots as
+ * one order-stable union. Both files live beside this module in the
+ * repo; the paths are parameters so suites pin against fixtures. Shape
+ * and failure posture are documented in the module header.
+ */
+export function loadFenceConfigRoots(
+	configPath: string,
+	overlayPath: string,
+	home: string = os.homedir(),
+): string[] {
+	return mergeRoots(
+		readFenceRootsFile(configPath, FENCE_CONFIG_FILE, false, home),
+		readFenceRootsFile(overlayPath, FENCE_LOCAL_CONFIG_FILE, true, home),
+	);
 }
 
 /**
@@ -589,6 +739,35 @@ export function resetSessionSeal(): void {
 }
 
 /**
+ * Memoized union of every extra-root source behind the factory's
+ * allowed-root build: the tracked config and the optional local overlay
+ * read from the directory this module sits in (the cooldown.json
+ * precedent), plus PISCOPE_EXTRA_ROOTS. The first call evaluates once
+ * per process and every later call reuses the union, so a config edit
+ * or env change mid-session needs a restart to apply; suites call
+ * resetFenceExtraRoots to re-evaluate under changed conditions.
+ */
+let cachedFenceExtraRoots: string[] | undefined;
+
+export function fenceExtraRoots(): string[] {
+	if (cachedFenceExtraRoots === undefined) {
+		const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+		cachedFenceExtraRoots = mergeRoots(
+			loadFenceConfigRoots(
+				path.join(moduleDir, FENCE_CONFIG_FILE),
+				path.join(moduleDir, FENCE_LOCAL_CONFIG_FILE),
+			),
+			parseExtraRoots(process.env[EXTRA_ROOTS_ENV]),
+		);
+	}
+	return cachedFenceExtraRoots;
+}
+
+export function resetFenceExtraRoots(): void {
+	cachedFenceExtraRoots = undefined;
+}
+
+/**
  * Bound on the symlink-chain walk in chaseDanglingFinalSymlink,
  * matching the kernel's ELOOP posture: a chain that keeps redirecting
  * past this many hops is a loop the kernel would refuse to traverse.
@@ -799,7 +978,7 @@ export interface PathGateCall {
  * escaping candidate and the widen-PISCOPE_EXTRA_ROOTS remedy).
  */
 function scopeDenyReason(toolName: string, verdict: ScopeVerdict): string {
-	return `${toolName} blocked by the cwd-scope gate: ${verdict.detail}`;
+	return `${toolName} blocked by the workspace-fence: ${verdict.detail}`;
 }
 
 /** Suffix that turns the refusal reason into the headless block reason. */
@@ -1420,17 +1599,20 @@ export function decideBashToolCall(call: BashGateCall): PathGateDecision {
  * other tool to the path decider. Extra roots parse once at factory
  * time; the allowed roots rebuild per call so a moved session cwd is
  * honored; the seal stays omitted so the real release seal evaluates
- * exactly once per session. Prompt answers other than Yes are refusals:
- * the user is never tricked into approval by a stale dialog.
+ * exactly once per session, and the extra-root union evaluates the same
+ * lazy way (fenceExtraRoots: tracked config, optional local overlay,
+ * PISCOPE_EXTRA_ROOTS, once at the first verdict); the allowed roots
+ * rebuild per call so a moved session cwd is honored. Prompt answers
+ * other than Yes are refusals: the user is never tricked into approval
+ * by a stale dialog.
  */
 export default function (pi: ExtensionAPI) {
-	const extraRoots = parseExtraRoots(process.env[EXTRA_ROOTS_ENV]);
 	pi.on("tool_call", async (event, ctx) => {
 		const shared = {
 			toolName: event.toolName,
 			input: event.input as Record<string, unknown>,
 			sessionCwd: ctx.cwd,
-			allowedRoots: buildAllowedRoots(ctx.cwd, extraRoots),
+			allowedRoots: buildAllowedRoots(ctx.cwd, fenceExtraRoots()),
 			hasUI: ctx.hasUI,
 		};
 		const decision = GATED_BASH_TOOLS.has(event.toolName)

@@ -20,3 +20,5 @@
 !/extensions/periscope/
 !/extensions/cooldown.ts
 !/extensions/cooldown.json
+!/extensions/workspace-fence.config.json
+/extensions/workspace-fence.local.json

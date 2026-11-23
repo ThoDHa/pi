@@ -1,0 +1,6 @@
+{
+  "extraRoots": [
+    "~/.agents/skills",
+    "~/.pi/agent/install"
+  ]
+}
