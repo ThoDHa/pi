@@ -418,6 +418,62 @@ export function planRestartResume(persisted: CooldownState | undefined, resumeOn
 	return { action: "resume_now", state: persisted };
 }
 
+/** Parse a persisted cooldown record into a pending wait; undefined for anything that is not a real (non-simulated, well-formed) waiting record. */
+function persistedStateFrom(data: unknown): CooldownState | undefined {
+	if (typeof data !== "object" || data === null) return undefined;
+	const record = data as Record<string, unknown>;
+	if (record.state !== "waiting") return undefined;
+	if (record.simulated === true) return undefined;
+	const { entryName, resetAtMs, fireAtMs, attempts } = record;
+	if (!nonEmptyString(entryName) || !isFiniteNumber(resetAtMs) || !isFiniteNumber(fireAtMs) || !isFiniteNumber(attempts)) return undefined;
+	return { entryName, resetAtMs, fireAtMs, attempts };
+}
+
+function persistedEntryName(data: unknown): string | undefined {
+	if (typeof data !== "object" || data === null) return undefined;
+	const name = (data as Record<string, unknown>).entryName;
+	return nonEmptyString(name) ? name : undefined;
+}
+
+function isCooldownEntry(entry: unknown): entry is { type: string; customType: string; data: unknown } {
+	const record = entry as { type?: string; customType?: string } | undefined;
+	return record !== undefined && record.type === "custom" && record.customType === ENTRY_TYPE;
+}
+
+/**
+ * Scan a persisted branch for still-pending waits, newest-decides per
+ * entry name: the last cooldown record carrying a readable entryName
+ * decides that name, and the name contributes a pending wait only when
+ * that deciding record is a real waiting entry. Tombstones,
+ * fired/capped/resolved records, simulated waits, and malformed records
+ * all decide their own name as no-wait, keeping the single-slot scan's
+ * double-fire and durability guarantees per name; a record with no
+ * readable entryName is unattributable and cannot decide any name.
+ * Returns the waits in branch order so restart adjudication and its
+ * notifies stay deterministic.
+ */
+export function collectPendingWaits(entries: readonly unknown[]): CooldownState[] {
+	const decided = new Map<string, CooldownState | undefined>();
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index];
+		if (!isCooldownEntry(entry)) continue;
+		const name = persistedEntryName(entry.data);
+		if (name === undefined || decided.has(name)) continue;
+		decided.set(name, persistedStateFrom(entry.data));
+	}
+	const waits: CooldownState[] = [];
+	const emitted = new Set<string>();
+	for (const entry of entries) {
+		if (!isCooldownEntry(entry)) continue;
+		const name = persistedEntryName(entry.data);
+		if (name === undefined || emitted.has(name)) continue;
+		emitted.add(name);
+		const state = decided.get(name);
+		if (state !== undefined) waits.push(state);
+	}
+	return waits;
+}
+
 /** Local clock rendering of a deadline for notify messages. */
 export function formatResumeClock(epochMs: number): string {
 	return new Date(epochMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
@@ -590,25 +646,6 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 		}
 	}
 
-	function persistedStateFrom(data: unknown): CooldownState | undefined {
-		if (typeof data !== "object" || data === null) return undefined;
-		const record = data as Record<string, unknown>;
-		if (record.state !== "waiting") return undefined;
-		if (record.simulated === true) return undefined;
-		const { entryName, resetAtMs, fireAtMs, attempts } = record;
-		if (!nonEmptyString(entryName) || !isFiniteNumber(resetAtMs) || !isFiniteNumber(fireAtMs) || !isFiniteNumber(attempts)) return undefined;
-		return { entryName, resetAtMs, fireAtMs, attempts };
-	}
-
-	function newestCooldownState(entries: readonly unknown[]): CooldownState | undefined {
-		for (let index = entries.length - 1; index >= 0; index--) {
-			const entry = entries[index] as { type?: string; customType?: string; data?: unknown } | undefined;
-			if (entry === undefined || entry.type !== "custom" || entry.customType !== ENTRY_TYPE) continue;
-			return persistedStateFrom(entry.data);
-		}
-		return undefined;
-	}
-
 	pi.on("session_start", (event, ctx) => {
 		sessionCtx = ctx;
 		clearAllTimers();
@@ -625,40 +662,42 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 		// visible and cancellable, but an immediate fire into a freshly forked
 		// branch is the surprise the user ruled against; startup, new, and
 		// resume stay fully gated by resumeOnRestart.
-		const decision = planRestartResume(newestCooldownState(ctx.sessionManager.getBranch()), config.resumeOnRestart, Date.now(), event.reason);
-		if (decision.action === "none") return;
-		const entry = entryByName(decision.state.entryName);
-		if (entry === undefined) {
-			persistCancelled(decision.state);
-			if (ctx.hasUI) ctx.ui.notify(`cooldown: persisted wait for "${decision.state.entryName}" matches no configured provider entry; dropping it`, "warning");
-			return;
-		}
-		if (decision.action === "drop") {
-			// The gate's outcome is persisted as a superseding tombstone so a
-			// later /reload cannot re-adjudicate this entry under its bypass and
-			// fire what the gate withheld. The notify path stays available in
-			// every mode: it is how a headless run still records the drop.
-			persistCancelled(decision.state, decision.gate);
-			if (ctx.hasUI) {
-				ctx.ui.setStatus(statusKeyFor(decision.state.entryName), undefined);
-				const gateNote = decision.gate === "fork" ? "not auto-resumed into a freshly forked session" : "not auto-resumed (resumeOnRestart: false)";
-				ctx.ui.notify(`cooldown: pending ${decision.state.entryName} wait from the previous session is ${gateNote}; deadline was ${formatResumeClock(decision.state.fireAtMs)}; send a message to continue`, "info");
+		for (const state of collectPendingWaits(ctx.sessionManager.getBranch())) {
+			const decision = planRestartResume(state, config.resumeOnRestart, Date.now(), event.reason);
+			if (decision.action === "none") continue;
+			const entry = entryByName(decision.state.entryName);
+			if (entry === undefined) {
+				persistCancelled(decision.state);
+				if (ctx.hasUI) ctx.ui.notify(`cooldown: persisted wait for "${decision.state.entryName}" matches no configured provider entry; dropping it`, "warning");
+				continue;
 			}
-			return;
+			if (decision.action === "drop") {
+				// The gate's outcome is persisted as a superseding tombstone so a
+				// later /reload cannot re-adjudicate this entry under its bypass and
+				// fire what the gate withheld. The notify path stays available in
+				// every mode: it is how a headless run still records the drop.
+				persistCancelled(decision.state, decision.gate);
+				if (ctx.hasUI) {
+					ctx.ui.setStatus(statusKeyFor(decision.state.entryName), undefined);
+					const gateNote = decision.gate === "fork" ? "not auto-resumed into a freshly forked session" : "not auto-resumed (resumeOnRestart: false)";
+					ctx.ui.notify(`cooldown: pending ${decision.state.entryName} wait from the previous session is ${gateNote}; deadline was ${formatResumeClock(decision.state.fireAtMs)}; send a message to continue`, "info");
+				}
+				continue;
+			}
+			// Arming or firing on the restart path is guarded to interactive
+			// surfaces (tui, rpc) so an opted-in headless run stays inert, matching
+			// the "wait for me" ruling for one-shot processes; the persisted wait
+			// itself stays untouched.
+			if (ctx.mode !== "tui" && ctx.mode !== "rpc") continue;
+			states.set(entry.name, decision.state);
+			armTimer(entry.name);
+			if (decision.action === "rearm") {
+				updateStatus(entry.name);
+				if (ctx.hasUI) ctx.ui.notify(`cooldown: re-armed pending ${entry.name} wait from the previous session; resuming at ${formatResumeClock(decision.state.fireAtMs)}`, "info");
+				continue;
+			}
+			if (ctx.hasUI) ctx.ui.notify(`cooldown: pending ${entry.name} wait from the previous session is past its deadline; resuming now`, "info");
 		}
-		// Arming or firing on the restart path is guarded to interactive
-		// surfaces (tui, rpc) so an opted-in headless run stays inert, matching
-		// the "wait for me" ruling for one-shot processes; the persisted wait
-		// itself stays untouched.
-		if (ctx.mode !== "tui" && ctx.mode !== "rpc") return;
-		states.set(entry.name, decision.state);
-		armTimer(entry.name);
-		if (decision.action === "rearm") {
-			updateStatus(entry.name);
-			if (ctx.hasUI) ctx.ui.notify(`cooldown: re-armed pending ${entry.name} wait from the previous session; resuming at ${formatResumeClock(decision.state.fireAtMs)}`, "info");
-			return;
-		}
-		if (ctx.hasUI) ctx.ui.notify(`cooldown: pending ${entry.name} wait from the previous session is past its deadline; resuming now`, "info");
 	});
 
 	pi.on("message_end", (event, ctx) => {

@@ -49,7 +49,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-const { default: createCooldownExtension, ENTRY_TYPE, statusKeyFor, loadCooldownConfig, validateCooldownConfig, findCooldownEntry, matchesEntryModel, parseResetEpochMs, planCooldownArm, planRestartResume, formatResumeClock, formatCountdown } = await import("../extensions/cooldown.ts");
+const { default: createCooldownExtension, ENTRY_TYPE, statusKeyFor, collectPendingWaits, loadCooldownConfig, validateCooldownConfig, findCooldownEntry, matchesEntryModel, parseResetEpochMs, planCooldownArm, planRestartResume, formatResumeClock, formatCountdown } = await import("../extensions/cooldown.ts");
 
 const ZAI_OFFSET_MINUTES = 480;
 const VERBATIM_1308 = 'Error: 429: {"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-11-23 06:58:41"}';
@@ -635,6 +635,63 @@ test("startup and resume stay gated by resumeOnRestart and name that gate when d
 	assert.equal(dropped.gate, "resumeOnRestart");
 });
 
+// --- collectPendingWaits (restart scan) ----------------------------------
+
+test("collectPendingWaits collects a newest real waiting entry", () => {
+	const state = { entryName: "zai-glm", resetAtMs: now + 5 * MINUTES, fireAtMs: now + 7 * MINUTES, attempts: 1 };
+	assert.deepEqual(collectPendingWaits([persistedEntry({ state: "waiting", ...state })]), [state]);
+});
+
+test("collectPendingWaits: a newest terminal entry hides only its own name", () => {
+	const waiting = { state: "waiting", entryName: "zai-glm", resetAtMs: now - 5 * MINUTES, fireAtMs: now - 2 * MINUTES, attempts: 1 };
+	const terminals = [
+		{ state: "fired", entryName: "zai-glm", attempts: 2 },
+		{ state: "cancelled", entryName: "zai-glm", gate: "resumeOnRestart" },
+		{ state: "cancelled", entryName: "zai-glm", gate: "fork" },
+		{ state: "capped", entryName: "zai-glm", attempts: 5 },
+		{ state: "resolved", entryName: "zai-glm" },
+	];
+	for (const terminal of terminals) {
+		assert.deepEqual(collectPendingWaits([persistedEntry(waiting), persistedEntry(terminal)]), [], `a newest ${terminal.state} record must decide its name as no-wait`);
+	}
+});
+
+test("collectPendingWaits decides per entry name: one name's tombstone hides only that name", () => {
+	const zaiWait = { entryName: "zai-glm", resetAtMs: now + 5 * MINUTES, fireAtMs: now + 7 * MINUTES, attempts: 0 };
+	assert.deepEqual(
+		collectPendingWaits([
+			persistedEntry({ state: "waiting", ...zaiWait }),
+			persistedEntry({ state: "waiting", entryName: "acme-pro", resetAtMs: now + 10 * MINUTES, fireAtMs: now + 12 * MINUTES, attempts: 0 }),
+			persistedEntry({ state: "resolved", entryName: "acme-pro" }),
+		]),
+		[zaiWait],
+	);
+});
+
+test("collectPendingWaits: a malformed newest entry with a readable name decides it as no-wait", () => {
+	const waiting = persistedEntry({ state: "waiting", entryName: "zai-glm", resetAtMs: now + 5 * MINUTES, fireAtMs: now + 7 * MINUTES, attempts: 0 });
+	const malformed = persistedEntry({ state: "waiting", entryName: "zai-glm", fireAtMs: "not-a-number", attempts: 0 });
+	assert.deepEqual(collectPendingWaits([waiting, malformed]), []);
+});
+
+test("collectPendingWaits: a cooldown record with no readable entryName is unattributable and decides nothing", () => {
+	const state = { entryName: "zai-glm", resetAtMs: now + 5 * MINUTES, fireAtMs: now + 7 * MINUTES, attempts: 0 };
+	assert.deepEqual(collectPendingWaits([{ type: "custom", customType: ENTRY_TYPE, data: { state: "waiting" } }, persistedEntry({ state: "waiting", ...state })]), [state]);
+});
+
+test("collectPendingWaits: a newest simulated waiting entry decides its own name as no-re-arm", () => {
+	const real = { state: "waiting", entryName: "zai-glm", resetAtMs: now - 5 * MINUTES, fireAtMs: now - 2 * MINUTES, attempts: 1 };
+	const simulated = { state: "waiting", entryName: "zai-glm", resetAtMs: now + 5 * MINUTES, fireAtMs: now + 7 * MINUTES, attempts: 0, simulated: true };
+	assert.deepEqual(collectPendingWaits([persistedEntry(real), persistedEntry(simulated)]), []);
+	assert.deepEqual(collectPendingWaits([persistedEntry(simulated), persistedEntry(real)]).length, 1, "a newer real entry decides its name");
+});
+
+test("collectPendingWaits returns waits in branch order for deterministic adjudication", () => {
+	const acmeWait = { entryName: "acme-pro", resetAtMs: now + 10 * MINUTES, fireAtMs: now + 12 * MINUTES, attempts: 0 };
+	const zaiWait = { entryName: "zai-glm", resetAtMs: now + 5 * MINUTES, fireAtMs: now + 7 * MINUTES, attempts: 0 };
+	assert.deepEqual(collectPendingWaits([persistedEntry({ state: "waiting", ...acmeWait }), persistedEntry({ state: "waiting", ...zaiWait })]), [acmeWait, zaiWait]);
+});
+
 // --- wiring: registration and fail-safe ---------------------------------
 
 test("the factory registers the cooldown handlers and both commands", () => {
@@ -1125,6 +1182,53 @@ test("the gated drop path is not mode-guarded: print mode still tombstones and n
 	assert.equal(lastAppend(runtime).data.state, "cancelled", "the drop tombstones in print mode too");
 	assert.ok(runtime.notifies.some((notification) => notification.message.includes("resumeOnRestart")), "the drop notify stays available outside tui/rpc");
 	assert.equal(runtime.sent.length, 0);
+});
+
+// --- wiring: multi-entry restart scan ------------------------------------
+
+test("a waiting entry behind another entry's resolved tombstone re-arms on restart", async () => {
+	const runtime = createRuntime({ config: twoProviderConfig({ resumeOnRestart: true }) });
+	const base = wholeSecond(Date.now());
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "zai-glm", resetAtMs: base + 1500 - 120 * MINUTES, fireAtMs: base + 1500, attempts: 1 }));
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "acme-pro", resetAtMs: base + 1500 - 120 * MINUTES, fireAtMs: base + 1500, attempts: 1 }));
+	runtime.branchEntries.push(persistedEntry({ state: "resolved", entryName: "acme-pro" }));
+	await startRuntime(runtime, "startup");
+	assert.ok(runtime.notifies.some((notification) => notification.message.includes("re-armed") && notification.message.includes("zai-glm")), "the older zai wait re-arms behind acme's resolved tombstone");
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")));
+	assert.equal(runtime.notifies.some((notification) => notification.message.includes("acme-pro")), false, "the resolved acme name stays dead");
+	await sleep(1600);
+	assert.equal(runtime.sent.length, 1, "the re-armed zai wait fires");
+	assert.equal(lastAppend(runtime).data.entryName, "zai-glm");
+	await shutdownRuntime(runtime);
+});
+
+test("a gated-drop tombstone for one name leaves another name's wait adjudicable", async () => {
+	const runtime = createRuntime({ config: twoProviderConfig({ resumeOnRestart: true }) });
+	const base = wholeSecond(Date.now());
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "acme-pro", resetAtMs: now - 5 * MINUTES, fireAtMs: now - 2 * MINUTES, attempts: 1 }));
+	runtime.branchEntries.push(persistedEntry({ state: "cancelled", entryName: "acme-pro", gate: "fork", fireAtMs: now - 2 * MINUTES, attempts: 1 }));
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "zai-glm", resetAtMs: base + 1500 - 120 * MINUTES, fireAtMs: base + 1500, attempts: 0 }));
+	await startRuntime(runtime, "startup");
+	assert.ok(runtime.notifies.some((notification) => notification.message.includes("re-armed") && notification.message.includes("zai-glm")), "the zai wait re-arms beside the acme tombstone");
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")));
+	assert.equal(runtime.notifies.some((notification) => notification.message.includes("forked")), false, "the fork tombstone is not re-adjudicated");
+	assert.equal(runtime.appended.length, 0, "the tombstone name lands no new records");
+	await shutdownRuntime(runtime);
+});
+
+test("a newest simulated waiting entry hides only its own name on reload", async () => {
+	const runtime = createRuntime({ config: twoProviderConfig({ resumeOnRestart: true }) });
+	const base = wholeSecond(Date.now());
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "acme-pro", resetAtMs: base + 1500 - 120 * MINUTES, fireAtMs: base + 1500, attempts: 1 }));
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "zai-glm", resetAtMs: base + 1500 - 120 * MINUTES, fireAtMs: base + 1500, attempts: 0, simulated: true }));
+	await startRuntime(runtime, "reload");
+	assert.ok(runtime.notifies.some((notification) => notification.message.includes("re-armed") && notification.message.includes("acme-pro")), "the real acme wait re-arms behind the simulated zai entry");
+	assert.ok(runtime.statuses.has(statusKeyFor("acme-pro")));
+	assert.equal(runtime.statuses.has(statusKeyFor("zai-glm")), false, "the simulated zai name does not re-arm");
+	await sleep(1600);
+	assert.equal(runtime.sent.length, 1, "the acme timer fires");
+	assert.equal(lastAppend(runtime).data.entryName, "acme-pro");
+	await shutdownRuntime(runtime);
 });
 
 // --- wiring: commands ------------------------------------------------------
