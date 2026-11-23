@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * Verdict-matrix suite for the cwd-scope-gate core
- * (extensions/cwd-scope-gate.ts). Plain node, no test framework:
+ * Verdict-matrix suite for the workspace-fence core
+ * (extensions/workspace-fence.ts). Plain node, no test framework:
  *
- *   node tests/cwd-scope-gate.test.mjs
+ *   node tests/workspace-fence.test.mjs
  *
  * Requires a resolvable release (PI_MANAGED_INSTALL_ROOT or an
  * argv-walk ancestor): from a bare environment the canary reds loudly
@@ -62,6 +62,21 @@
  * seal-omission semantics are pinned: omitting the seal evaluates the
  * REAL seal once per process (memoized), while explicit injection is
  * honored verbatim.
+ *
+ * The bash scope pass (unit 1-3) is exercised the same way:
+ * scanBashCommand pins the recall-limited extraction (tokenizer-based
+ * extraction from the raw command: quoted operands, redirect targets,
+ * and assignment RHS gate; quoted prose splits into pieces;
+ * substitution flags with the single-quote narrowing and escape-
+ * literal semantics; unmodeled-syntax flags in plain and double-quoted
+ * text; executor payload splitting and token-based executor-shape
+ * detection; redirect-target extraction;
+ * cd/pushd target extraction; continuation removal; assignment-prefix
+ * RHS), decideBashToolCall pins its verdict classes
+ * (in-scope pass, out-of-scope ask, substitution bias, unmodeled bail,
+ * tilde-user and glob-traversal overrides, device exemption, degraded-
+ * seal ask, headless block), and the factory handler maps bash events
+ * onto the shared ask/block machinery.
  */
 
 import * as fs from "node:fs";
@@ -71,11 +86,13 @@ import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import cwdScopeGate, {
 	EXTRA_ROOTS_ENV,
+	GATED_BASH_TOOLS,
 	GATED_PATH_TOOLS,
 	RELEASE_DIGEST_PINS,
 	SEAL_DIGEST_FILES,
 	buildAllowedRoots,
 	computeFileDigest,
+	decideBashToolCall,
 	decidePathToolCall,
 	expandTilde,
 	evaluateSealState,
@@ -87,8 +104,9 @@ import cwdScopeGate, {
 	resetSessionSeal,
 	resolveRunningRelease,
 	resolveScopeTarget,
+	scanBashCommand,
 	sessionSealState,
-} from "../extensions/cwd-scope-gate.ts";
+} from "../extensions/workspace-fence.ts";
 
 let failed = 0;
 let total = 0;
@@ -106,7 +124,7 @@ function checkContains(label, haystack, needle) {
 	check(label, haystack.includes(needle) ? "yes" : "no", "yes");
 }
 
-const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cwd-scope-gate-"));
+const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "workspace-fence-"));
 const cwdDir = path.join(fixtureRoot, "project");
 const insideDir = path.join(cwdDir, "inside");
 const outsideDir = path.join(fixtureRoot, "outside");
@@ -941,7 +959,11 @@ try {
 	);
 
 	// pass-through: in-scope verdicts and ungated tools never prompt
-	check("ungated tool passes", gate({ toolName: "bash", input: { command: "cat /etc/passwd" } }).action, "pass");
+	check(
+		"path decider passes non-path tools (bash dispatches to the bash decider)",
+		gate({ toolName: "powershell", input: { command: "cat /etc/passwd" } }).action,
+		"pass",
+	);
 	check("in-scope read passes", gate().action, "pass");
 	check(
 		"in-scope write passes",
@@ -1057,6 +1079,676 @@ try {
 		else process.env.PI_MANAGED_INSTALL_ROOT = previousInstallRoot;
 		resetSessionSeal();
 	}
+
+	// --- unit 1-3: bash scope pass (recall-limited lexical scan) ---------
+	// The tool_call surface extends to bash: path-like operands and cd
+	// targets resolve through the same verdict core as the path tools,
+	// substitution-bearing commands and unmodeled syntax bias toward
+	// asking (the scanner cannot see expansion results or model every
+	// grammar), and in-scope or relative-only commands run unprompted.
+	// The bash pass generalizes permission-gate's scanner conventions
+	// (executor dual-scan, raw payload splitting) but carries its own
+	// single quote walker, and executor detection is token-based over
+	// the walker's segments under lexical path-stripped identity (R4),
+	// with glued -c forms and an interposition floor over
+	// command/env/nohup/nice/timeout (R5; Decision Log "User ruling C");
+	// permission-gate stays untouched.
+	check("bash gated tool set covers exactly bash", [...GATED_BASH_TOOLS].sort().join(","), "bash");
+
+	const bashGate = (overrides = {}) =>
+		decideBashToolCall({
+			toolName: "bash",
+			input: { command: "echo hello" },
+			sessionCwd: cwdDir,
+			allowedRoots: customRoots,
+			hasUI: true,
+			seal: { degraded: false, reasons: [] },
+			...overrides,
+		});
+
+	// pass-through: in-scope and relative-only commands never prompt
+	check("bash decider passes non-bash tools", bashGate({ toolName: "read" }).action, "pass");
+	check(
+		"powershell passes ungated (deferred)",
+		bashGate({ toolName: "powershell", input: { command: "cat /etc/passwd" } }).action,
+		"pass",
+	);
+	check("bare-word-only command passes", bashGate({ input: { command: "echo hello" } }).action, "pass");
+	check("git status passes", bashGate({ input: { command: "git status --short" } }).action, "pass");
+	check("relative-only operand passes", bashGate({ input: { command: "cat inside/file.txt" } }).action, "pass");
+	check("cd within the cwd subtree passes", bashGate({ input: { command: "cd inside" } }).action, "pass");
+	check(
+		"in-scope redirect target passes",
+		bashGate({ input: { command: "echo done > inside/log.txt" } }).action,
+		"pass",
+	);
+	check("absolute command word is not a path operand", bashGate({ input: { command: "/bin/echo hi" } }).action, "pass");
+	check(
+		"assignment-prefix RHS outside asks (the env form's argv access point)",
+		bashGate({ input: { command: "OUT=/etc/capture.txt run" } }).action,
+		"ask",
+	);
+	check(
+		"lone assignment segment passes (bash only sets the variable)",
+		bashGate({ input: { command: "X=/etc/capture.txt" } }).action,
+		"pass",
+	);
+	check("in-scope glob operand passes", bashGate({ input: { command: "cat inside/*.txt" } }).action, "pass");
+	check(
+		"in-scope executor payload passes",
+		bashGate({ input: { command: "bash -c 'cat inside/file.txt'" } }).action,
+		"pass",
+	);
+
+	// ask: out-of-scope operands and cd targets through the verdict core
+	const bashOut = bashGate({ input: { command: "cat /etc/passwd" } });
+	check("out-of-scope absolute operand asks", bashOut.action, "ask");
+	checkContains("bash ask title names the tool", bashOut.title, "bash");
+	checkContains("bash ask title names the resolved path", bashOut.title, "/etc/passwd");
+	checkContains("bash ask title ends in the prompt", bashOut.title, "Allow?");
+	checkContains("bash denial reason names the policy", bashOut.denyReason, EXTRA_ROOTS_ENV);
+	check("cd outside the cwd subtree asks", bashGate({ input: { command: "cd /etc" } }).action, "ask");
+	check("cd to tilde home asks", bashGate({ input: { command: "cd ~" } }).action, "ask");
+	// F2: cd/pushd targets extract regardless of spelling, so bare and
+	// symlinked names route through the core; unresolvable targets ask
+	check(
+		"cd through a bare symlinked name asks",
+		bashGate({ input: { command: "cd link-out" } }).action,
+		"ask",
+	);
+	check(
+		"pushd through a bare symlinked name asks",
+		bashGate({ input: { command: "pushd link-out" } }).action,
+		"ask",
+	);
+	check("bare cd asks (home is not lexically resolvable)", bashGate({ input: { command: "cd" } }).action, "ask");
+	check(
+		"cd - asks (OLDPWD is not lexically resolvable)",
+		bashGate({ input: { command: "cd -" } }).action,
+		"ask",
+	);
+	check("cd .. asks (the parent of the session cwd)", bashGate({ input: { command: "cd .." } }).action, "ask");
+	check("pushd within the cwd subtree passes", bashGate({ input: { command: "pushd inside" } }).action, "pass");
+	check(
+		"cd option-qualified in-scope target passes",
+		bashGate({ input: { command: "cd -L inside" } }).action,
+		"pass",
+	);
+	check(
+		"dotdot escape via relative operand asks",
+		bashGate({ input: { command: "cat ../outside/target.txt" } }).action,
+		"ask",
+	);
+	check(
+		"bash operand through a planted symlink asks (verdict core reuse)",
+		bashGate({ input: { command: "cat link-out/sub/target.txt" } }).action,
+		"ask",
+	);
+	check("absolute option value outside asks", bashGate({ input: { command: "tool --config=/etc/app.conf" } }).action, "ask");
+	check(
+		"env-carried argv value outside asks",
+		bashGate({ input: { command: "env OUT=/etc/capture.txt run" } }).action,
+		"ask",
+	);
+	check("option value in scope passes", bashGate({ input: { command: "tool --config=inside/app.conf" } }).action, "pass");
+	// DC-1: process-internal and data-null devices exempt from bash
+	// operand verdicts only; the path tools still resolve them
+	check(
+		"redirect to /dev/null passes (data-null device, bash-only exemption)",
+		bashGate({ input: { command: "make 2>/dev/null" } }).action,
+		"pass",
+	);
+	check(
+		"write redirect to /dev/null passes",
+		bashGate({ input: { command: "echo done > /dev/null" } }).action,
+		"pass",
+	);
+	check(
+		"reading /dev/null passes (device as source)",
+		bashGate({ input: { command: "cat /dev/null" } }).action,
+		"pass",
+	);
+	check(
+		"fd-device redirect passes",
+		bashGate({ input: { command: "echo done > /dev/fd/3" } }).action,
+		"pass",
+	);
+	check(
+		"/dev/tty stays gated (it reads user input)",
+		bashGate({ input: { command: "cat /dev/tty" } }).action,
+		"ask",
+	);
+	check(
+		"arbitrary device nodes stay gated",
+		bashGate({ input: { command: "cat /dev/sda" } }).action,
+		"ask",
+	);
+	check(
+		"reading /dev/stdin passes (process-internal stream, same class as stdout/stderr)",
+		bashGate({ input: { command: "cat /dev/stdin" } }).action,
+		"pass",
+	);
+	check(
+		"redirect source /dev/stdin passes",
+		bashGate({ input: { command: "tr a b < /dev/stdin" } }).action,
+		"pass",
+	);
+	check(
+		"redirect to an out-of-scope file still asks",
+		bashGate({ input: { command: "> /etc/capture.txt" } }).action,
+		"ask",
+	);
+	check(
+		"device exemption does not reach the path tools",
+		resolveScopeTarget(cwdDir, customRoots, "/dev/null").scope,
+		"ask",
+	);
+
+	// F1: redirect targets extract wherever they sit; a segment-head one
+	// would otherwise read as the executable and pass silently
+	check(
+		"redirect-only command at segment head asks",
+		bashGate({ input: { command: `> ${outFile}` } }).action,
+		"ask",
+	);
+	check(
+		"append redirect at segment head asks",
+		bashGate({ input: { command: `echo ok; >> ${outFile}` } }).action,
+		"ask",
+	);
+	check(
+		"read-write redirect at segment head asks",
+		bashGate({ input: { command: `<> ${outFile}` } }).action,
+		"ask",
+	);
+	check(
+		"background stream redirect after a command asks",
+		bashGate({ input: { command: `make &> ${outFile}` } }).action,
+		"ask",
+	);
+	check(
+		"fd duplication stays inert",
+		bashGate({ input: { command: "echo ok 2>&1" } }).action,
+		"pass",
+	);
+
+	// substitution bias: the scanner cannot see expansion results
+	check(
+		"command substitution biases toward ask",
+		bashGate({ input: { command: "echo $(cat inside/file.txt)" } }).action,
+		"ask",
+	);
+	check("backtick substitution biases toward ask", bashGate({ input: { command: "cat `ls inside`" } }).action, "ask");
+	check("process substitution asks", bashGate({ input: { command: "cat <(cat inside/file.txt)" } }).action, "ask");
+	check("bare variable expansion biases toward ask", bashGate({ input: { command: "cat $HOME/notes" } }).action, "ask");
+	check(
+		"variable inside quotes biases toward ask",
+		bashGate({ input: { command: 'cat "$HOME/notes"' } }).action,
+		"ask",
+	);
+
+	// DC-2: single-quoted spans are inert for the substitution test;
+	// double-quoted and unquoted $ and the ANSI-C form still gate
+	check(
+		"single-quoted awk program passes (bash cannot expand it)",
+		bashGate({ input: { command: "awk '{print $1}' inside/file.txt" } }).action,
+		"pass",
+	);
+	check(
+		"single-quoted literal dollar passes",
+		bashGate({ input: { command: "grep '\\$' inside/file.txt" } }).action,
+		"pass",
+	);
+	check(
+		"single-quoted backticks pass (inert in bash)",
+		bashGate({ input: { command: "echo '`ls inside`'" } }).action,
+		"pass",
+	);
+	check(
+		"ANSI-C quoting still asks (the $ sits outside the stripped span)",
+		bashGate({ input: { command: "grep $'\\t' inside/file.txt" } }).action,
+		"ask",
+	);
+	check(
+		"executor payload dollars still ask (a child shell re-evaluates them)",
+		bashGate({ input: { command: "bash -c 'echo $HOME/notes'" } }).action,
+		"ask",
+	);
+	check(
+		"executor payload bare cd asks",
+		bashGate({ input: { command: "bash -c 'cd'" } }).action,
+		"ask",
+	);
+
+	// R1: the quote walker honors backslash escapes, so an escaped quote
+	// is a literal apostrophe, never a span opener, and the $ behind it
+	// still gates; an escaped dollar is literal and passes
+	check(
+		"escaped-quote substitution bypass asks",
+		bashGate({ input: { command: "echo \\' && cat \"$HOME/secrets\"" } }).action,
+		"ask",
+	);
+	check(
+		"a lone escaped quote passes (literal apostrophe, nothing live)",
+		bashGate({ input: { command: "echo \\'" } }).action,
+		"pass",
+	);
+	check(
+		"escaped dollar is a literal (walker escape handling)",
+		bashGate({ input: { command: "cat \\$HOME/notes" } }).action,
+		"pass",
+	);
+
+	// unmodeled syntax biases toward ask
+	check("grouping parens ask", bashGate({ input: { command: "(cd /etc && cat passwd)" } }).action, "ask");
+	check("brace expansion asks", bashGate({ input: { command: "cat /etc/{passwd,group}" } }).action, "ask");
+	check(
+		"trailing comments ask",
+		bashGate({ input: { command: "cat inside/file.txt # trailing note" } }).action,
+		"ask",
+	);
+	check("heredocs ask", bashGate({ input: { command: "cat << EOF\nbody\nEOF" } }).action, "ask");
+	check("unterminated quotes ask", bashGate({ input: { command: "cat 'inside/file.txt" } }).action, "ask");
+	check("trailing escape asks", bashGate({ input: { command: "cat inside/\\" } }).action, "ask");
+	// F3: backslash-newline continuations remove the way bash removes
+	// them, so the continuation line cannot hide behind the join
+	check(
+		"glued continuation cannot hide an absolute operand",
+		bashGate({ input: { command: "cat \\\n/etc/passwd" } }).action,
+		"ask",
+	);
+	check(
+		"indented continuation cannot hide an absolute operand",
+		bashGate({ input: { command: "cat \\\n   /etc/passwd" } }).action,
+		"ask",
+	);
+	check(
+		"in-scope continuation passes",
+		bashGate({ input: { command: "cat \\\ninside/file.txt" } }).action,
+		"pass",
+	);
+
+	// quoted text gates (R2): the mention exemption was withdrawn by the
+	// recorded policy decision (Decision Log "PAUSE EXTENDED", 2026-11-23:
+	// fix-later remedy (a) semantics, not accepted-bypass) - a quoted path
+	// is the access, not a mention
+	check(
+		"quoted path mentions ask",
+		bashGate({ input: { command: 'echo "see /etc/passwd for details"' } }).action,
+		"ask",
+	);
+	check(
+		"quoted parens in a mention ask (unmodeled syntax gates in double quotes)",
+		bashGate({ input: { command: 'grep "(foo" inside/file.txt' } }).action,
+		"ask",
+	);
+	check(
+		"quoted out-of-scope operand asks",
+		bashGate({ input: { command: 'cat "/etc/passwd"' } }).action,
+		"ask",
+	);
+	check(
+		"quoted redirect target asks",
+		bashGate({ input: { command: 'echo x > "/etc/capture.txt"' } }).action,
+		"ask",
+	);
+	check(
+		"quoted operand as a copy source asks",
+		bashGate({ input: { command: 'cp "/etc/passwd" .' } }).action,
+		"ask",
+	);
+	check(
+		"quoted assignment-prefix RHS asks",
+		bashGate({ input: { command: 'X="/etc/capture.txt" run' } }).action,
+		"ask",
+	);
+
+	// executor shapes gate payload operands inside quotes
+	check("bash -c payload outside asks", bashGate({ input: { command: "bash -c 'cat /etc/passwd'" } }).action, "ask");
+	check("sh -c payload outside asks", bashGate({ input: { command: "sh -c 'ls /etc'" } }).action, "ask");
+	check("eval payload outside asks", bashGate({ input: { command: "eval 'cat /etc/group'" } }).action, "ask");
+	check("su -c payload outside asks", bashGate({ input: { command: "su -c 'cat /etc/shadow'" } }).action, "ask");
+	check("ssh payload outside asks", bashGate({ input: { command: "ssh host 'cat /etc/hosts'" } }).action, "ask");
+	// an escaped quote before an executor shape must not hide it: the
+	// walker reads \' as a literal apostrophe, so the executor tokens
+	// stay visible as tokens
+	check(
+		"an escaped quote cannot hide a bash -c executor payload (the hidden executor asks)",
+		bashGate({ input: { command: "echo \\' ; bash -c 'cat \"$HOME/secrets\"'" } }).action,
+		"ask",
+	);
+	check(
+		"an escaped quote cannot hide an eval executor payload",
+		bashGate({ input: { command: "echo \\' ; eval 'cat $HOME/x'" } }).action,
+		"ask",
+	);
+	check(
+		"an escaped quote cannot hide an executor write payload",
+		bashGate({ input: { command: "echo \\' ; bash -c 'echo x > \"$HOME/.ssh/authorized_keys\"'" } }).action,
+		"ask",
+	);
+	check(
+		"executor word inside a quoted mention does not trigger the raw scan",
+		bashGate({ input: { command: 'echo "never write bash -c in reports"' } }).action,
+		"pass",
+	);
+
+	// R4 (review 27): executor identity survives path-qualified spellings -
+	// the token's directory prefix strips lexically before identity
+	// matching, with no filesystem resolution (a missing /bin/bash still
+	// gates; the ask posture keys on the invocation shape)
+	check(
+		"path-qualified bash executor asks",
+		bashGate({ input: { command: "/bin/bash -c 'cat \"$HOME/s\"'" } }).action,
+		"ask",
+	);
+	check(
+		"relative-path bash executor asks",
+		bashGate({ input: { command: "./bash -c 'cat $HOME/x'" } }).action,
+		"ask",
+	);
+	check(
+		"relative-path sh executor asks",
+		bashGate({ input: { command: "./sh -c 'cat $HOME/x'" } }).action,
+		"ask",
+	);
+	check(
+		"home-anchored bash executor asks",
+		bashGate({ input: { command: "~/bin/bash -c 'cat $HOME/x'" } }).action,
+		"ask",
+	);
+	check(
+		"path-qualified su executor asks",
+		bashGate({ input: { command: "/bin/su -c 'cat $HOME/x'" } }).action,
+		"ask",
+	);
+	check(
+		"path-qualified ssh executor asks",
+		bashGate({ input: { command: "/usr/bin/ssh host 'cat $HOME/x'" } }).action,
+		"ask",
+	);
+	check(
+		"a missing path-qualified executor still gates (the ask posture keys on the shape)",
+		bashGate({ input: { command: "/no/such/dir/bash -c 'cat $HOME/x'" } }).action,
+		"ask",
+	);
+
+	// R5 (review 27): glued -c forms - bash takes a short option's
+	// cluster remainder as the -c value, so -c'payload', -c"payload",
+	// and -cpayload are the executor shape however the value glues
+	check(
+		"single-quote-glued -c payload asks",
+		bashGate({ input: { command: "bash -c'cat $HOME/x'" } }).action,
+		"ask",
+	);
+	check(
+		"double-quote-glued -c payload asks",
+		bashGate({ input: { command: 'bash -c"cat $HOME/x"' } }).action,
+		"ask",
+	);
+	check(
+		"bare glued -c cluster with a quoted payload tail asks",
+		bashGate({ input: { command: "bash -ccat' $HOME/x'" } }).action,
+		"ask",
+	);
+	check(
+		"a bare glued -c payload inside the scope passes (detection alone is not the ask)",
+		bashGate({ input: { command: "bash -cecho hi" } }).action,
+		"pass",
+	);
+
+	// interposition floors (review 27 / Decision Log "User ruling C"):
+	// a command/env/nohup/nice/timeout wrapper before an executor shape
+	// asks without scanning through - the wrapper re-executes its
+	// arguments and the scanner cannot model what it will run
+	check(
+		"command-prefixed executor asks",
+		bashGate({ input: { command: "command bash -c 'cat $X'" } }).action,
+		"ask",
+	);
+	check(
+		"env-prefixed executor with a redirect payload asks",
+		bashGate({ input: { command: "env bash -c 'x > $Y'" } }).action,
+		"ask",
+	);
+	check(
+		"env-prefixed executor asks even on an inert payload (the wrapper is the point)",
+		bashGate({ input: { command: "env bash -c 'echo inside'" } }).action,
+		"ask",
+	);
+	check(
+		"nohup-prefixed executor asks",
+		bashGate({ input: { command: "nohup bash -c 'echo inside'" } }).action,
+		"ask",
+	);
+	check(
+		"nice with its flags before an executor asks",
+		bashGate({ input: { command: "nice -n 5 bash -c 'echo inside'" } }).action,
+		"ask",
+	);
+	check(
+		"timeout with a duration before a path-qualified executor asks",
+		bashGate({ input: { command: "timeout 30 /bin/bash -c 'echo inside'" } }).action,
+		"ask",
+	);
+	check(
+		"path-qualified env before an executor asks",
+		bashGate({ input: { command: "/usr/bin/env bash -c 'echo inside'" } }).action,
+		"ask",
+	);
+	check(
+		"command before an eval shape asks",
+		bashGate({ input: { command: "command eval 'echo inside'" } }).action,
+		"ask",
+	);
+
+	// bash-only operand overrides ahead of the shared core
+	check(
+		"~user operand asks (bash expands it, the core keeps it literal)",
+		bashGate({ input: { command: "cat ~root/.bashrc" } }).action,
+		"ask",
+	);
+	check("glob-plus-dotdot operand asks", bashGate({ input: { command: "cat */../secret" } }).action, "ask");
+
+	// unusable inputs fail closed
+	check("non-string bash command asks", bashGate({ input: { command: 42 } }).action, "ask");
+	check("missing bash command asks", bashGate({ input: {} }).action, "ask");
+	check("empty bash command asks", bashGate({ input: { command: "" } }).action, "ask");
+	check(
+		"unusable session cwd asks",
+		bashGate({ sessionCwd: "", input: { command: "echo hello" } }).action,
+		"ask",
+	);
+
+	// degraded seal asks every bash call
+	const bashDegraded = bashGate({ seal: gateDegradedSeal });
+	check("degraded seal asks even an operand-free command", bashDegraded.action, "ask");
+	checkContains("degraded bash ask names the seal reason", bashDegraded.title, "digest was pinned");
+	check("degraded seal blocks headless bash", bashGate({ hasUI: false, seal: gateDegradedSeal }).action, "block");
+
+	// post-prompt and headless branches
+	check(
+		"approved out-of-scope bash passes",
+		bashGate({ input: { command: "cat /etc/passwd" }, approved: true }).action,
+		"pass",
+	);
+	const bashRefused = bashGate({ input: { command: "cat /etc/passwd" }, approved: false });
+	check("refused out-of-scope bash blocks", bashRefused.action, "block");
+	checkContains("bash refusal reason names the tool", bashRefused.reason, "bash");
+	checkContains("bash refusal reason names the operand", bashRefused.reason, "/etc/passwd");
+	const bashHeadless = bashGate({ input: { command: "cat /etc/passwd" }, hasUI: false });
+	check("out-of-scope bash blocks headless", bashHeadless.action, "block");
+	checkContains("headless bash reason names the operand", bashHeadless.reason, "/etc/passwd");
+	checkContains("headless bash reason names the remedy", bashHeadless.reason, "interactively");
+	check("headless in-scope bash passes", bashGate({ hasUI: false }).action, "pass");
+
+	// DC-R1 through the bash wiring: seal omitted -> the real memoized session seal
+	check(
+		"bash wiring with omitted seal consumes the real session seal",
+		bashGate({ seal: undefined }).action,
+		"pass",
+	);
+
+	// scanner extraction pins
+	const scan = (command) => scanBashCommand(command);
+	check(
+		"scan extracts an absolute operand",
+		JSON.stringify(scan("cat /etc/passwd").operands),
+		JSON.stringify(["/etc/passwd"]),
+	);
+	check(
+		"scan extracts a relative operand",
+		JSON.stringify(scan("cat inside/file.txt").operands),
+		JSON.stringify(["inside/file.txt"]),
+	);
+	check(
+		"scan keeps multiple operands in order",
+		JSON.stringify(scan("cp /etc/passwd inside/copy.txt").operands),
+		JSON.stringify(["/etc/passwd", "inside/copy.txt"]),
+	);
+	check("scan skips bare words and the command word", scan("echo hello").operands.length, 0);
+	check(
+		"scan extracts quoted mention pieces",
+		JSON.stringify(scan('echo "see /etc/passwd"').operands),
+		JSON.stringify(["/etc/passwd"]),
+	);
+	check(
+		"scan extracts a quoted operand",
+		JSON.stringify(scan('cat "/etc/passwd"').operands),
+		JSON.stringify(["/etc/passwd"]),
+	);
+	check(
+		"scan extracts a quoted redirect target",
+		JSON.stringify(scan('echo x > "/etc/capture.txt"').operands),
+		JSON.stringify(["/etc/capture.txt"]),
+	);
+	check(
+		"scan extracts a quoted assignment-prefix RHS",
+		JSON.stringify(scan('X="/etc/capture.txt" run').operands),
+		JSON.stringify(["/etc/capture.txt"]),
+	);
+	check(
+		"scan flags substitution behind an escaped quote",
+		scan("echo \\' && cat \"$HOME/secrets\"").substitution,
+		true,
+	);
+	check("scan treats an escaped dollar as literal", scan("cat \\$HOME/notes").substitution, false);
+	check("scan keeps double-quoted grouping syntax as bail", scan('grep "(foo" f').bail, true);
+	check(
+		"scan honors escaped-space operands",
+		JSON.stringify(scan("cat inside/my\\ file.txt").operands),
+		JSON.stringify(["inside/my file.txt"]),
+	);
+	check(
+		"scan takes the full word and the RHS of option assignments",
+		JSON.stringify(scan("tool --config=/etc/app.conf").operands),
+		JSON.stringify(["--config=/etc/app.conf", "/etc/app.conf"]),
+	);
+	check(
+		"scan takes an assignment-prefix RHS",
+		JSON.stringify(scan("OUT=/etc/capture.txt run").operands),
+		JSON.stringify(["/etc/capture.txt"]),
+	);
+	check("scan keeps a lone assignment inert", scan("X=/etc/capture.txt").operands.length, 0);
+	check(
+		"scan flags a segment-head redirect target",
+		JSON.stringify(scan("> /etc/passwd").operands),
+		JSON.stringify(["/etc/passwd"]),
+	);
+	check(
+		"scan flags a background stream redirect target",
+		JSON.stringify(scan("make &> /etc/log").operands),
+		JSON.stringify(["/etc/log"]),
+	);
+	check(
+		"scan flags a noclobber redirect target",
+		JSON.stringify(scan("cat >| /etc/log").operands),
+		JSON.stringify(["/etc/log"]),
+	);
+	check(
+		"scan extracts a bare cd target",
+		JSON.stringify(scan("cd link-out").operands),
+		JSON.stringify(["link-out"]),
+	);
+	check("scan asks on bare cd", scan("cd").cdAsk !== null, true);
+	checkContains(
+		"scan bare-cd ask names the unresolvable target class",
+		scan("cd").cdAsk ?? "",
+		"cannot resolve",
+	);
+	checkContains("scan cd - ask names OLDPWD", scan("cd -").cdAsk ?? "", "OLDPWD");
+	check("scan cd with an extractable target raises no ask", scan("cd inside").cdAsk, null);
+	check(
+		"scan removes a glued continuation",
+		JSON.stringify(scan("cat \\\n/etc/passwd").operands),
+		JSON.stringify(["/etc/passwd"]),
+	);
+	check(
+		"scan joins a mid-word continuation exactly as bash does",
+		JSON.stringify(scan("cat foo\\\n/etc/passwd").operands),
+		JSON.stringify(["foo/etc/passwd"]),
+	);
+	check("scan treats single-quoted dollars as inert", scan("awk '{print $1}' f").substitution, false);
+	check("scan keeps double-quoted dollars as substitution", scan('cat "$HOME/x"').substitution, true);
+	check("scan keeps ANSI-C dollars as substitution", scan("grep $'\\t' f").substitution, true);
+	check("scan flags executor payload dollars", scan("bash -c 'echo $X'").substitution, true);
+	check("scan raises the cd ask through an executor payload", scan("bash -c 'cd'").cdAsk !== null, true);
+	check(
+		"scan splits executor payloads through quotes",
+		JSON.stringify(scan("bash -c 'cat /etc/passwd'").operands),
+		JSON.stringify(["/etc/passwd"]),
+	);
+	check("scan flags substitution", scan("echo $(x)").substitution, true);
+	check("scan flags executor shapes", scan("bash -c 'ls /'").executor, true);
+	check("scan detects the executor shape behind an escaped quote", scan("echo \\' ; bash -c 'cat /etc/passwd'").executor, true);
+	check("scan keeps a quoted prose mention of the executor shape inert", scan('echo "never write bash -c in reports"').executor, false);
+	check("scan detects executor shapes through option flags and intervening arguments", scan("bash --norc -lc 'ls inside'").executor, true);
+	check("scan detects the bare glued -c cluster", scan("bash -ccat").executor, true);
+	check("scan detects -cu as the -c cluster (the disclosed inert-junk over-ask)", scan("bash -cu x").executor, true);
+	check(
+		"scan floors an interposer-prefixed executor shape and names the wrapper",
+		scan("env bash -c 'echo inside'").interposed,
+		"env",
+	);
+	check(
+		"scan keeps an interposer without an executor shape inert",
+		scan("env FOO=1 ls inside").interposed,
+		null,
+	);
+	check("scan flags unmodeled syntax", scan("ls (x)").bail, true);
+
+	// the factory handler maps bash events onto the shared ask/block machinery
+	check(
+		"handler passes an in-scope bash call",
+		await handler({ toolName: "bash", input: { command: "cat inside/file.txt" } }, ctxWithChoice("Yes")),
+		undefined,
+	);
+	const handlerBashRefusal = await handler(
+		{ toolName: "bash", input: { command: "cat /etc/passwd" } },
+		ctxWithChoice("No"),
+	);
+	check("handler blocks a refused bash call", handlerBashRefusal && handlerBashRefusal.block, true);
+	checkContains("handler bash refusal names the resolved path", handlerBashRefusal.reason, "/etc/passwd");
+	const handlerBashHeadless = await handler(
+		{ toolName: "bash", input: { command: "cat /etc/passwd" } },
+		{ cwd: cwdDir, hasUI: false, ui: { select: async () => "Yes" } },
+	);
+	check("handler blocks headless bash without prompting", handlerBashHeadless && handlerBashHeadless.block, true);
+	checkContains("handler headless bash names the remedy", handlerBashHeadless.reason, "interactively");
+	const handlerRedirectHead = await handler(
+		{ toolName: "bash", input: { command: "> /etc/passwd" } },
+		ctxWithChoice("No"),
+	);
+	check(
+		"handler blocks a segment-head redirect write on refusal",
+		handlerRedirectHead && handlerRedirectHead.block,
+		true,
+	);
+	checkContains(
+		"handler redirect refusal names the resolved path",
+		handlerRedirectHead.reason,
+		"/etc/passwd",
+	);
 } finally {
 	fs.rmSync(fixtureRoot, { recursive: true, force: true });
 }
