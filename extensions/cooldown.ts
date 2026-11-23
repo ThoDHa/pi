@@ -83,6 +83,8 @@ export interface CooldownState {
 	attempts: number;
 	/** The errored model id captured from the arming message; retirement requires this model's success when present, entry-scoped retirement when absent. */
 	model?: string;
+	/** Runtime-only provenance: the wait was armed by the debug simulate path. Never persisted; a wait read from persistence is always real. */
+	simulated?: boolean;
 }
 
 export interface ResolvedProviderEntry {
@@ -631,6 +633,7 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 			return;
 		}
 		states.set(entry.name, decision.state);
+		decision.state.simulated = simulated;
 		armTimer(entry.name);
 		pi.appendEntry(ENTRY_TYPE, {
 			state: "waiting",
@@ -817,6 +820,11 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 			}
 			if (text === "") {
 				if (ctx.hasUI) ctx.ui.notify("cooldown-simulate: pass the provider error text after the entry name", "info");
+				return;
+			}
+			const live = states.get(entry.name);
+			if (live !== undefined && live.simulated !== true) {
+				if (ctx.hasUI) ctx.ui.notify(`cooldown-simulate: ${entry.name} already holds a live usage-limit wait; simulating would move the real deadline, so cancel it first with /cooldown cancel`, "warning");
 				return;
 			}
 			handleLimitError(ctx, { role: "assistant", stopReason: "error", errorMessage: text, provider: entry.match.provider, model: entry.match.model }, true);

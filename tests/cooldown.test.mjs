@@ -1336,6 +1336,33 @@ test("/cooldown-simulate without arguments prints usage", async () => {
 	assert.equal(runtime.statuses.size, 0);
 });
 
+test("simulate refuses against a live real wait and mutates nothing", async () => {
+	const runtime = createRuntime();
+	await startRuntime(runtime);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	const statusBefore = runtime.statuses.get(statusKeyFor("zai-glm"));
+	const appendsBefore = runtime.appended.length;
+	const notifiesBefore = runtime.notifies.length;
+	await runtime.commands.get("cooldown-simulate").handler(`zai-glm ${fixture1308(wholeSecond(now) + 90 * MINUTES)}`, runtime.ctx);
+	assert.ok(runtime.notifies.length > notifiesBefore, "the refusal notifies");
+	assert.ok(runtime.notifies.some((notification) => notification.message.includes("/cooldown cancel")), "the refusal names the cancel path");
+	assert.equal(runtime.appended.length, appendsBefore, "no new persisted record");
+	assert.equal(runtime.statuses.get(statusKeyFor("zai-glm")), statusBefore, "the real deadline is untouched");
+	await sleep(150);
+	assert.equal(runtime.sent.length, 0);
+});
+
+test("simulating over a simulated wait still arms and extends", async () => {
+	const runtime = createRuntime();
+	await startRuntime(runtime);
+	await runtime.commands.get("cooldown-simulate").handler(`zai-glm ${fixture1308(wholeSecond(now) + 30 * MINUTES)}`, runtime.ctx);
+	const appendsAfterFirst = runtime.appended.length;
+	await runtime.commands.get("cooldown-simulate").handler(`zai-glm ${fixture1308(wholeSecond(now) + 90 * MINUTES)}`, runtime.ctx);
+	assert.equal(runtime.appended.length, appendsAfterFirst + 1, "the simulated re-arm persists");
+	assert.equal(lastAppend(runtime).data.simulated, true);
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")));
+});
+
 // --- wiring: live countdown -----------------------------------------------
 
 test("the armed footer status shows the live countdown with the resume budget", async () => {
