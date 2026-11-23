@@ -8,7 +8,11 @@
  * provider's fixed UTC offset, arm an unrefed timer for reset + buffer,
  * persist the pending wait via appendEntry, and at fire time resume the
  * work by sending the configured resume prompt (plain send when idle,
- * `followUp` while busy). A repeat limit error on a resumed turn re-arms
+ * `followUp` while busy). While the wait pends, a minute-tick countdown
+ * refreshes the footer status with the remaining wait; the tick interval
+ * shares the fire timer's lifecycle, so every site that clears the timer
+ * (fire, cancel, retire, cap, restart drop, shutdown) clears the tick
+ * too. A repeat limit error on a resumed turn re-arms
  * from the fresh reset time with carried attempt counts until
  * maxResumeAttempts, then gives up with an error notify and stays
  * stopped until a successful turn re-enables auto-recovery.
@@ -115,6 +119,8 @@ export type RestartDecision =
 
 export interface CooldownExtensionOptions {
 	configPath?: string;
+	/** Countdown refresh period in milliseconds; defaults to one minute. */
+	tickMs?: number;
 }
 
 function isFiniteNumber(value: unknown): value is number {
@@ -405,9 +411,18 @@ export function planRestartResume(persisted: CooldownState | undefined, resumeOn
 	return { action: "resume_now", state: persisted };
 }
 
-/** Local clock rendering of a deadline for status lines and notifies. */
+/** Local clock rendering of a deadline for notify messages. */
 export function formatResumeClock(epochMs: number): string {
 	return new Date(epochMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+/** Remaining-wait rendering for the live countdown footer: hours+minutes above the hour, minutes below, "<1m" inside the final minute. */
+export function formatCountdown(fireAtMs: number, nowMs: number): string {
+	const remainingMinutes = Math.floor((fireAtMs - nowMs) / MINUTE_MS);
+	if (remainingMinutes < 1) return "<1m";
+	const hours = Math.floor(remainingMinutes / 60);
+	const minutes = remainingMinutes % 60;
+	return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
 }
 
 export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExtensionOptions = {}): void {
@@ -415,8 +430,10 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 	const loaded = loadCooldownConfig(configPath);
 	const config: ResolvedConfig | undefined = loaded.ok ? loaded.config : undefined;
 	const problems = loaded.ok ? [] : loaded.problems;
+	const tickMs = options.tickMs ?? MINUTE_MS;
 	const states = new Map<string, CooldownState>();
 	const timers = new Map<string, ReturnType<typeof setTimeout>>();
+	const ticks = new Map<string, ReturnType<typeof setInterval>>();
 	const disabled = new Set<string>();
 	let sessionCtx: ExtensionContext | undefined;
 
@@ -435,10 +452,26 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 			clearTimeout(timer);
 			timers.delete(entryName);
 		}
+		stopTick(entryName);
 	}
 
 	function clearAllTimers(): void {
 		for (const entryName of [...timers.keys()]) clearTimer(entryName);
+	}
+
+	function startTick(entryName: string): void {
+		if (ticks.has(entryName)) return;
+		const tick = setInterval(() => updateStatus(entryName), tickMs);
+		tick.unref?.();
+		ticks.set(entryName, tick);
+	}
+
+	function stopTick(entryName: string): void {
+		const tick = ticks.get(entryName);
+		if (tick !== undefined) {
+			clearInterval(tick);
+			ticks.delete(entryName);
+		}
 	}
 
 	function armTimer(entryName: string): void {
@@ -452,13 +485,14 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 				: setTimeout(() => fireResume(entryName), delay);
 		timeout.unref?.();
 		timers.set(entryName, timeout);
+		if (sessionCtx.hasUI) startTick(entryName);
 	}
 
 	function updateStatus(entryName: string): void {
 		const ctx = sessionCtx;
 		const state = states.get(entryName);
 		if (ctx === undefined || state === undefined || config === undefined || !ctx.hasUI) return;
-		ctx.ui.setStatus(STATUS_KEY, `⏳ ${entryName} → ${formatResumeClock(state.fireAtMs)} · ${state.attempts}/${config.maxResumeAttempts} resumes used`);
+		ctx.ui.setStatus(STATUS_KEY, `⏳ ${entryName} in ${formatCountdown(state.fireAtMs, Date.now())} · ${state.attempts}/${config.maxResumeAttempts} resumes used`);
 	}
 
 	function fireResume(entryName: string): void {

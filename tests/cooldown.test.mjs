@@ -34,6 +34,14 @@
  * mismatch warning fires exactly once, then the tombstone keeps starts
  * quiet), and the tui|rpc guard extended to the restart arm/fire path so an
  * opted-in headless run stays inert while the drop path stays unguarded.
+ *
+ * The live-countdown round adds: formatCountdown pure cases (hours and
+ * minutes above the hour, minutes below, <1m inside the final minute and
+ * past the deadline), the live footer string at arm time, the tick
+ * interval arming with the wait and refreshing the footer every tick (the
+ * tickMs seam), tick clearing on cancel, shutdown, and fire (the retained
+ * fired entry must not tick the status back), and the non-assistant
+ * message_end early return leaving states and entries untouched.
  */
 
 import assert from "node:assert/strict";
@@ -41,7 +49,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-const { default: createCooldownExtension, ENTRY_TYPE, STATUS_KEY, loadCooldownConfig, validateCooldownConfig, findCooldownEntry, matchesEntryModel, parseResetEpochMs, planCooldownArm, planRestartResume, formatResumeClock } = await import("../extensions/cooldown.ts");
+const { default: createCooldownExtension, ENTRY_TYPE, STATUS_KEY, loadCooldownConfig, validateCooldownConfig, findCooldownEntry, matchesEntryModel, parseResetEpochMs, planCooldownArm, planRestartResume, formatResumeClock, formatCountdown } = await import("../extensions/cooldown.ts");
 
 const ZAI_OFFSET_MINUTES = 480;
 const VERBATIM_1308 = 'Error: 429: {"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-11-23 06:58:41"}';
@@ -109,13 +117,14 @@ function persistedEntry(data) {
 
 // --- mock pi/ctx runtime for wiring tests ------------------------------
 
-function createRuntime({ config, mode = "tui", hasUI = true } = {}) {
+function createRuntime({ config, mode = "tui", hasUI = true, tickMs } = {}) {
 	const handlers = new Map();
 	const commands = new Map();
 	const sent = [];
 	const appended = [];
 	const notifies = [];
 	const statuses = new Map();
+	const statusCalls = [];
 	const branchEntries = [];
 	let idle = true;
 	const pi = {
@@ -144,6 +153,7 @@ function createRuntime({ config, mode = "tui", hasUI = true } = {}) {
 		},
 		ui: {
 			setStatus(key, text) {
+				statusCalls.push({ key, text });
 				if (text === undefined) statuses.delete(key);
 				else statuses.set(key, text);
 			},
@@ -157,8 +167,11 @@ function createRuntime({ config, mode = "tui", hasUI = true } = {}) {
 		configPath = path.join(mkdtempSync(path.join(tmpdir(), "cooldown-test-")), "cooldown.json");
 		writeFileSync(configPath, JSON.stringify(config));
 	}
-	createCooldownExtension(pi, configPath === undefined ? {} : { configPath });
-	return { handlers, commands, sent, appended, notifies, statuses, ctx, branchEntries, setIdle: (value) => (idle = value) };
+	const factoryOptions = {};
+	if (configPath !== undefined) factoryOptions.configPath = configPath;
+	if (tickMs !== undefined) factoryOptions.tickMs = tickMs;
+	createCooldownExtension(pi, factoryOptions);
+	return { handlers, commands, sent, appended, notifies, statuses, statusCalls, ctx, branchEntries, setIdle: (value) => (idle = value) };
 }
 
 async function startRuntime(runtime, reason = "startup") {
@@ -1045,6 +1058,117 @@ test("/cooldown-simulate without arguments prints usage", async () => {
 	assert.equal(runtime.statuses.size, 0);
 });
 
+// --- wiring: live countdown -----------------------------------------------
+
+test("the armed footer status shows the live countdown with the resume budget", async () => {
+	const runtime = createRuntime();
+	await startRuntime(runtime);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 251 * MINUTES)));
+	assert.equal(runtime.statuses.get(STATUS_KEY), "⏳ zai-glm in 4h 12m · 0/5 resumes used");
+	await shutdownRuntime(runtime);
+});
+
+test("the countdown tick arms with the wait and refreshes the footer on every tick", async () => {
+	const runtime = createRuntime({ tickMs: 20 });
+	await startRuntime(runtime);
+	await sleep(60);
+	assert.equal(runtime.statusCalls.length, 0, "no wait, no tick writes");
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 5 * MINUTES)));
+	assert.equal(runtime.statusCalls.length, 1, "the arm itself writes the status once");
+	await sleep(80);
+	assert.ok(runtime.statusCalls.length > 1, "ticks refresh the footer while the wait pends");
+	for (const call of runtime.statusCalls) {
+		assert.match(call.text, /^⏳ zai-glm in /);
+	}
+	await shutdownRuntime(runtime);
+});
+
+test("cancel clears the countdown tick interval", async () => {
+	const runtime = createRuntime({ tickMs: 20 });
+	await startRuntime(runtime);
+	const realSetInterval = global.setInterval;
+	const realClearInterval = global.clearInterval;
+	const created = [];
+	const cleared = [];
+	global.setInterval = (callback, ms) => {
+		const handle = realSetInterval(callback, ms);
+		created.push(handle);
+		return handle;
+	};
+	global.clearInterval = (handle) => {
+		cleared.push(handle);
+		return realClearInterval(handle);
+	};
+	try {
+		await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 5 * MINUTES)));
+		assert.ok(runtime.statuses.has(STATUS_KEY), "wait armed");
+		await runtime.commands.get("cooldown").handler("cancel", runtime.ctx);
+	} finally {
+		global.setInterval = realSetInterval;
+		global.clearInterval = realClearInterval;
+	}
+	assert.equal(created.length, 1, "arming the wait created exactly one interval");
+	assert.ok(cleared.includes(created[0]), "cancel cleared the armed tick interval");
+	assert.equal(runtime.statuses.has(STATUS_KEY), false);
+	assert.equal(runtime.sent.length, 0);
+});
+
+test("session_shutdown clears the countdown tick interval", async () => {
+	const runtime = createRuntime({ tickMs: 20 });
+	await startRuntime(runtime);
+	const realSetInterval = global.setInterval;
+	const realClearInterval = global.clearInterval;
+	const created = [];
+	const cleared = [];
+	global.setInterval = (callback, ms) => {
+		const handle = realSetInterval(callback, ms);
+		created.push(handle);
+		return handle;
+	};
+	global.clearInterval = (handle) => {
+		cleared.push(handle);
+		return realClearInterval(handle);
+	};
+	try {
+		await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 5 * MINUTES)));
+		await shutdownRuntime(runtime);
+	} finally {
+		global.setInterval = realSetInterval;
+		global.clearInterval = realClearInterval;
+	}
+	assert.equal(created.length, 1, "arming the wait created exactly one interval");
+	assert.ok(cleared.includes(created[0]), "shutdown cleared the armed tick interval");
+	assert.equal(runtime.sent.length, 0);
+});
+
+test("fire clears the countdown tick: the footer status is not resurrected after the resume", async () => {
+	const runtime = createRuntime({ tickMs: 20 });
+	await startRuntime(runtime);
+	await messageEnd(runtime, assistantError(fixture1308(now + 60 - 120 * MINUTES)));
+	assert.ok(runtime.statuses.has(STATUS_KEY));
+	await sleep(120);
+	assert.equal(runtime.sent.length, 1);
+	assert.equal(runtime.statuses.has(STATUS_KEY), false, "status clears at fire time");
+	const writesAtFire = runtime.statusCalls.length;
+	await sleep(80);
+	assert.equal(runtime.statusCalls.length, writesAtFire, "the fired entry must not tick the status back");
+	await shutdownRuntime(runtime);
+});
+
+test("a non-assistant message_end takes the early return without touching states or entries", async () => {
+	const runtime = createRuntime();
+	await startRuntime(runtime);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 5 * MINUTES)));
+	const appendsAfterArm = runtime.appended.length;
+	const notifiesAfterArm = runtime.notifies.length;
+	await messageEnd(runtime, { role: "user", stopReason: "stop", errorMessage: undefined, provider: "zai", model: "glm-5.3" });
+	assert.equal(runtime.appended.length, appendsAfterArm, "no entry appended for a non-assistant message");
+	assert.equal(runtime.notifies.length, notifiesAfterArm, "no notify fired for a non-assistant message");
+	assert.equal(runtime.sent.length, 0);
+	assert.ok(runtime.statuses.has(STATUS_KEY), "the pending wait survives a non-assistant message");
+	await shutdownRuntime(runtime);
+});
+
 // --- formatting -------------------------------------------------------------
 
 test("formatResumeClock renders a non-empty clock string", () => {
@@ -1052,6 +1176,27 @@ test("formatResumeClock renders a non-empty clock string", () => {
 	assert.equal(typeof clock, "string");
 	assert.ok(clock.length >= 3);
 	assert.ok(/\d/.test(clock));
+});
+
+test("formatCountdown renders hours and minutes from the injected now", () => {
+	const base = VERBATIM_RESET_EPOCH;
+	assert.equal(formatCountdown(base + (4 * 60 + 12) * MINUTES, base), "4h 12m");
+	assert.equal(formatCountdown(base + 60 * MINUTES, base), "1h 0m");
+	assert.equal(formatCountdown(base + 5 * 60 * MINUTES, base), "5h 0m");
+});
+
+test("formatCountdown renders minutes only below a full hour", () => {
+	const base = VERBATIM_RESET_EPOCH;
+	assert.equal(formatCountdown(base + 45 * MINUTES, base), "45m");
+	assert.equal(formatCountdown(base + MINUTES, base), "1m");
+	assert.equal(formatCountdown(base + 119_999, base), "1m", "just under two minutes still renders one full minute");
+});
+
+test("formatCountdown degrades to <1m inside the final minute and past the deadline", () => {
+	const base = VERBATIM_RESET_EPOCH;
+	assert.equal(formatCountdown(base + 59_000, base), "<1m");
+	assert.equal(formatCountdown(base, base), "<1m");
+	assert.equal(formatCountdown(base - 30_000, base), "<1m");
 });
 
 // --- runner -----------------------------------------------------------------
