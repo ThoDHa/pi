@@ -586,6 +586,19 @@ test("a 1308 whose reset time fails to parse reports parse_failed with the entry
 	assert.equal(decision.entry.name, "zai-glm");
 });
 
+test("a fresh arm pins the errored model and a re-arm re-pins to the newest error", () => {
+	const { config } = validateCooldownConfig(rawConfig());
+	const fresh = planCooldownArm(config, assistantError(VERBATIM_1308, "zai", "glm-5.3"), undefined, now);
+	assert.equal(fresh.action, "arm");
+	assert.equal(fresh.state.model, "glm-5.3");
+	const rearm = planCooldownArm(config, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES), "zai", "glm-5.3-flash"), fresh.state, now);
+	assert.equal(rearm.action, "arm");
+	assert.equal(rearm.state.model, "glm-5.3-flash", "the newest errored model owns the pin");
+	const bare = planCooldownArm(config, { role: "assistant", stopReason: "error", errorMessage: VERBATIM_1308, provider: "zai" }, undefined, now);
+	assert.equal(bare.action, "arm");
+	assert.equal(bare.state.model, undefined, "a message without a model id arms without a pin");
+});
+
 // --- planRestartResume (restart decision table) --------------------------
 
 test("no persisted state means no restart action", () => {
@@ -965,6 +978,48 @@ test("cancelling clears both per-entry keys and persists one tombstone per pendi
 	assert.equal(cancelled.length, 2, "cancel persists one tombstone per pending entry");
 	await sleep(150);
 	assert.equal(runtime.sent.length, 0, "cancelled timers must not fire");
+});
+
+test("a success from a different model leaves a model-pinned wait armed with its timer intact", async () => {
+	const runtime = createRuntime();
+	await startRuntime(runtime);
+	await messageEnd(runtime, assistantError(fixture1308(now + 60 - 120 * MINUTES)));
+	await messageEnd(runtime, { role: "assistant", stopReason: "stop", provider: "zai", model: "glm-5.3-flash" });
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")), "the pinned wait survives a different model's success");
+	assert.equal(lastAppend(runtime).data.state, "waiting", "no resolved record landed");
+	await sleep(150);
+	assert.equal(runtime.sent.length, 1, "the armed timer kept its deadline and fired");
+});
+
+test("a success from the pinned model retires the wait", async () => {
+	const runtime = createRuntime();
+	await startRuntime(runtime);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	await messageEnd(runtime, { role: "assistant", stopReason: "stop", provider: "zai", model: "glm-5.3" });
+	assert.equal(runtime.statuses.has(statusKeyFor("zai-glm")), false);
+	assert.equal(lastAppend(runtime).data.state, "resolved");
+	await sleep(150);
+	assert.equal(runtime.sent.length, 0);
+});
+
+test("a persisted pinned wait keeps its pin across reload", async () => {
+	const runtime = createRuntime({ config: rawConfig({ resumeOnRestart: true }) });
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "zai-glm", resetAtMs: now + 30 * MINUTES, fireAtMs: now + 32 * MINUTES, attempts: 1, model: "glm-5.3" }));
+	await startRuntime(runtime, "startup");
+	await messageEnd(runtime, { role: "assistant", stopReason: "stop", provider: "zai", model: "glm-5.3-flash" });
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")), "the reloaded pin still filters retirements");
+	await shutdownRuntime(runtime);
+});
+
+test("a wait armed without a model id retires on any matching-entry success", async () => {
+	const runtime = createRuntime({ config: rawConfig({ resumeOnRestart: true }) });
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "zai-glm", resetAtMs: now + 30 * MINUTES, fireAtMs: now + 32 * MINUTES, attempts: 1 }));
+	await startRuntime(runtime, "startup");
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")));
+	await messageEnd(runtime, { role: "assistant", stopReason: "stop", provider: "zai", model: "glm-5.3-flash" });
+	assert.equal(runtime.statuses.has(statusKeyFor("zai-glm")), false, "the unpinned wait retires entry-scoped");
+	assert.equal(lastAppend(runtime).data.state, "resolved");
+	await shutdownRuntime(runtime);
 });
 
 // --- wiring: restart re-arm ----------------------------------------------

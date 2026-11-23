@@ -75,12 +75,14 @@ const MAX_OFFSET_MINUTES = 840;
 const STAMP_PATTERN = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/;
 const TOP_DEFAULTS = { defaultBufferMinutes: 2, maxResumeAttempts: 5, resumeOnRestart: false } as const;
 
-/** One pending recovery: which provider entry, the parsed deadline, and how many resumes it already used. */
+/** One pending recovery: which provider entry, the parsed deadline, how many resumes it already used, and the errored model pinned at arm time. */
 export interface CooldownState {
 	entryName: string;
 	resetAtMs: number;
 	fireAtMs: number;
 	attempts: number;
+	/** The errored model id captured from the arming message; retirement requires this model's success when present, entry-scoped retirement when absent. */
+	model?: string;
 }
 
 export interface ResolvedProviderEntry {
@@ -392,7 +394,13 @@ export function planCooldownArm(config: ResolvedConfig, message: LimitErrorMessa
 		action: "arm",
 		entry,
 		extended,
-		state: { entryName: entry.name, resetAtMs, fireAtMs: candidateFireAtMs, attempts: current !== undefined && current.entryName === entry.name ? current.attempts : 0 },
+		state: {
+			entryName: entry.name,
+			resetAtMs,
+			fireAtMs: candidateFireAtMs,
+			attempts: current !== undefined && current.entryName === entry.name ? current.attempts : 0,
+			...(message.model !== undefined ? { model: message.model } : {}),
+		},
 	};
 }
 
@@ -418,7 +426,7 @@ export function planRestartResume(persisted: CooldownState | undefined, resumeOn
 	return { action: "resume_now", state: persisted };
 }
 
-/** Parse a persisted cooldown record into a pending wait; undefined for anything that is not a real (non-simulated, well-formed) waiting record. */
+	/** Parse a persisted cooldown record into a pending wait; undefined for anything that is not a real (non-simulated, well-formed) waiting record. */
 function persistedStateFrom(data: unknown): CooldownState | undefined {
 	if (typeof data !== "object" || data === null) return undefined;
 	const record = data as Record<string, unknown>;
@@ -426,7 +434,13 @@ function persistedStateFrom(data: unknown): CooldownState | undefined {
 	if (record.simulated === true) return undefined;
 	const { entryName, resetAtMs, fireAtMs, attempts } = record;
 	if (!nonEmptyString(entryName) || !isFiniteNumber(resetAtMs) || !isFiniteNumber(fireAtMs) || !isFiniteNumber(attempts)) return undefined;
-	return { entryName, resetAtMs, fireAtMs, attempts };
+	return {
+		entryName,
+		resetAtMs,
+		fireAtMs,
+		attempts,
+		...(nonEmptyString(record.model) ? { model: record.model } : {}),
+	};
 }
 
 function persistedEntryName(data: unknown): string | undefined {
@@ -618,7 +632,15 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 		}
 		states.set(entry.name, decision.state);
 		armTimer(entry.name);
-		pi.appendEntry(ENTRY_TYPE, { state: "waiting", entryName: entry.name, resetAtMs: decision.state.resetAtMs, fireAtMs: decision.state.fireAtMs, attempts: decision.state.attempts, ...(simulated ? { simulated: true } : {}) });
+		pi.appendEntry(ENTRY_TYPE, {
+			state: "waiting",
+			entryName: entry.name,
+			resetAtMs: decision.state.resetAtMs,
+			fireAtMs: decision.state.fireAtMs,
+			attempts: decision.state.attempts,
+			...(decision.state.model !== undefined ? { model: decision.state.model } : {}),
+			...(simulated ? { simulated: true } : {}),
+		});
 		if (ctx.hasUI) {
 			const move = decision.extended ? "limit window moved; now waiting" : "usage limit reached; waiting";
 			ctx.ui.notify(`${prefix}${entry.name} ${move} until ${formatResumeClock(decision.state.fireAtMs)}, then resuming automatically`, decision.extended ? "info" : "warning");
@@ -630,10 +652,11 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 		if (config === undefined || typeof message.provider !== "string") return;
 		for (const entry of config.providers) {
 			if (entry.match.provider !== message.provider || !matchesEntryModel(entry.match.model, message.model)) continue;
-			const pending = states.has(entry.name);
+			const pending = states.get(entry.name);
 			const wasDisabled = disabled.has(entry.name);
-			if (!pending && !wasDisabled) continue;
-			if (pending) {
+			if (pending === undefined && !wasDisabled) continue;
+			if (pending !== undefined && pending.model !== undefined && pending.model !== message.model) continue;
+			if (pending !== undefined) {
 				clearTimer(entry.name);
 				states.delete(entry.name);
 			}
