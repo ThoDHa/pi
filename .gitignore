@@ -18,3 +18,5 @@
 !/extensions/cwd-scope-gate.ts
 !/extensions/subagent/
 !/extensions/periscope/
+!/extensions/cooldown.ts
+!/extensions/cooldown.json

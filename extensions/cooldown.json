@@ -1,0 +1,17 @@
+{
+	"defaultBufferMinutes": 2,
+	"maxResumeAttempts": 5,
+	"resumeOnRestart": false,
+	"resumePrompt": "The provider usage-limit window has reset. Continue the pending work from where it stopped.",
+	"providers": [
+		{
+			"name": "zai-glm",
+			"match": { "provider": "zai" },
+			"errorPattern": "\"code\"\\s*:\\s*\"?1308(?![0-9])",
+			"resetTimePattern": "your limit will reset at (\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})",
+			"utcOffsetMinutes": 480,
+			"bufferMinutes": 2,
+			"resumePrompt": "The z.ai usage-limit window has reset. Continue the pending work from where it stopped."
+		}
+	]
+}
