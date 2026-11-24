@@ -805,16 +805,23 @@ export function expireStaleAsks(now: number = Date.now(), maxAge: number = ASK_H
  * (host and attachments, deduped per child); refusal denies them all
  * and records the session's denial memory (advisor memo F6), so later
  * asks for the directory deny from memory instead of re-prompting.
- * Every involved request id receives its own wire decision echoing its
- * own id, so the serving loop writes one response per attached child.
- * The child's next queued ask, if any, promotes into the outstanding
- * slot. A queued id resolves only after promotion (not-outstanding); a
- * released, resolved, or never-admitted id resolves unknown.
+ * A denial may carry its provenance across a proxy hop (seam review 22
+ * COR-1): via cap with the authority's own reason writes the honest
+ * decision but records nothing, because a cap denial judges the
+ * child's cadence at the hop above, never the directory; user-class
+ * provenance (user, session-deny, or the plain refusal) records as
+ * before. Every involved request id receives its own wire decision
+ * echoing its own id, so the serving loop writes one response per
+ * attached child. The child's next queued ask, if any, promotes into
+ * the outstanding slot. A queued id resolves only after promotion
+ * (not-outstanding); a released, resolved, or never-admitted id
+ * resolves unknown.
  */
 export function resolveChildAsk(
 	requestId: string,
 	approved: boolean,
 	now: number = Date.now(),
+	denial?: { via: DecisionVia; reason: string },
 ): ResolveOutcome {
 	const state = getFenceAskState();
 	const host = findOutstandingHostByRequestId(state, requestId);
@@ -825,10 +832,16 @@ export function resolveChildAsk(
 	const decisions = involved.map((entry) =>
 		approved
 			? grantDecision(entry.requestId, entry.childToken, host.directory, "user", ASK_USER_GRANT_REASON, now)
-			: denyDecision(entry.requestId, entry.childToken, "user", ASK_USER_DENY_REASON, now),
+			: denyDecision(
+					entry.requestId,
+					entry.childToken,
+					denial?.via ?? "user",
+					denial?.reason ?? ASK_USER_DENY_REASON,
+					now,
+				),
 	);
-	if (!approved && !state.sessionWideGranted.has(host.directory)) {
-		state.sessionWideDenied.set(host.directory, { deniedAt: now, via: "user" });
+	if (!approved && !state.sessionWideGranted.has(host.directory) && denial?.via !== "cap") {
+		state.sessionWideDenied.set(host.directory, { deniedAt: now, via: denial?.via ?? "user" });
 	}
 	const grants: GrantRecord[] = [];
 	if (approved) {

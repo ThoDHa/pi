@@ -35,9 +35,13 @@
  * one proxy hop per level: middle admits (its ledger knows the
  * grandchild token it registered), proxies up under its own token, the
  * top rules, the middle resolves the grandchild locally and writes the
- * grandchild's decision. Grants bind per child at every hop (reading
- * b): a proxy grant lands in the middle's ledger for the grandchild
- * token and never in the middle's own verdict set. The middle's token
+ * grandchild's decision. The denial's provenance crosses with it
+ * (seam review 22 COR-1): a top cap denial forwards as the block
+ * reason without writing deny memory at the middle, and a top user
+ * refusal crosses as the user's decision and records it. Grants bind
+ * per child at every hop (reading b): a proxy grant lands in the
+ * middle's ledger for the grandchild token and never in the middle's
+ * own verdict set. The middle's token
  * caps at 1 outstanding + 3 queue at the top no matter how many
  * grandchildren proxy through it, so prompt pressure stays bounded per
  * dispatched child. Chain latency is serial by construction: each hop
@@ -214,11 +218,17 @@ export function stopForwardingServer(options?: { removeRoot?: boolean }): void {
  * under this process's own spawn token, with the asking grandchild's
  * registry identity and evidence composed into the reason field
  * (display content; the top's provenance names the middle). Grant
- * resolves true, deny resolves false, and anything else (timeout,
- * channel failure) resolves null: no authority ruled, so the tick
- * drops the local entry without deny memory and the downstream asker
- * fails closed on its own bound. Null when this process carries no
- * ask-channel provisioning (it is a top, not a middle).
+ * resolves true, a user-class denial (the user's word, or the
+ * remembered form of one) resolves false and records deny memory one
+ * level down as before, and a cap denial resolves the structured
+ * denial carrying the cap via and reason, so the ledger below the hop
+ * blocks with the honest reason without recording deny memory (a cap
+ * denial judges the child's cadence at this hop, not the directory).
+ * Anything else (timeout, channel failure) resolves null: no
+ * authority ruled, so the tick drops the local entry without deny
+ * memory and the downstream asker fails closed on its own bound. Null
+ * when this process carries no ask-channel provisioning (it is a
+ * top, not a middle).
  */
 export function childProxyHandler(options?: {
 	waitMs?: number;
@@ -248,7 +258,12 @@ export function childProxyHandler(options?: {
 			sleep: pause,
 		});
 		if (outcome.status === "applied") return true;
-		if (outcome.status === "denied") return false;
+		if (outcome.status === "denied") {
+			if (outcome.decision.via === "cap") {
+				return { answer: false, via: outcome.decision.via, reason: outcome.decision.reason };
+			}
+			return false;
+		}
 		return null;
 	};
 }

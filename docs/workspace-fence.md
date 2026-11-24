@@ -73,8 +73,11 @@ forwarded ask under the forwarding root and polls for a decision:
 - Provenance: the parent-side prompt names the child from the ledger's
   registry-bound lookup, never from the wire fields; the ask's own
   evidence rides the body. Denials carry their decision path (`via`:
-  user, session-dedup, session-deny, or cap), so a later ask for a
-  denied directory resolves without a new prompt.
+  user, session-dedup, session-deny, or cap). A user-class denial
+  writes the session's deny memory, so a later ask for that directory
+  resolves without a new prompt; a cap denial judges the child's ask
+  cadence, not the directory, and records nothing, so the directory
+  stays askable once the cap clears.
 - Nested dispatch: a child that dispatches its own children mints and
   serves its own root and proxies unresolved grandchild asks up through
   its own token; the grandchild's identity rides the reason field as
@@ -82,7 +85,10 @@ forwarded ask under the forwarding root and polls for a decision:
   as the default for provisioned processes, so a one-shot json middle
   never depends on `session_start` delivery to serve its root; caps
   stay bounded per hop (one outstanding plus three queue at the top no
-  matter how many grandchildren proxy through a middle).
+  matter how many grandchildren proxy through a middle). A denial's
+  provenance crosses the hop with it: a top user refusal records the
+  middle's deny memory, a top cap denial forwards as the block reason
+  without writing memory, and every non-grant still blocks fail-closed.
 - Lifecycle: the forwarding root is removed when the owning process's
   session shuts down normally. A process killed without its shutdown
   path (SIGKILL, hard kill) leaks a bounded, authority-free tree: the

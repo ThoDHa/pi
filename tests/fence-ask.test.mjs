@@ -2074,6 +2074,269 @@ resetFenceAskState();
 }
 resetFenceAskState();
 
+// --- seam review 22 COR-1: the proxy hop threads denial provenance --
+// The wire's via enum exists to keep a cap denial apart from the
+// user's word, and the ledger's cap contract records nothing for a
+// cap denial because it judges the child's cadence, never the
+// directory. The middle's proxy handler therefore resolves a top
+// user-class denial as the plain boolean false (the user's word; deny
+// memory as before) and a top cap denial as the structured denial
+// carrying the via and reason, so the ledger below the hop writes the
+// honest block reason without poisoning its own deny memory.
+
+resetFenceAskState();
+{
+	const savedRoot = process.env[CHILD_ASK_ROOT_ENV];
+	const savedToken = process.env[CHILD_ASK_TOKEN_ENV];
+	const shapeTopRoot = path.join(os.tmpdir(), `fence-ask-suite-shape-top-${randomUUID()}`);
+	createForwardingRootDirs(shapeTopRoot);
+	const shapeMiddleToken = randomUUID();
+	registerLiveChild(shapeMiddleToken, "shape-middle", "shape dispatch", 165_000);
+	process.env[CHILD_ASK_ROOT_ENV] = shapeTopRoot;
+	process.env[CHILD_ASK_TOKEN_ENV] = shapeMiddleToken;
+	const shapeProxy = childProxyHandler({ pollMs: 10 });
+	const shapeAskFor = (directory) =>
+		createForwardedAsk({
+			requestId: randomUUID(),
+			childToken: randomUUID(),
+			agentName: "shape-grandchild",
+			dispatchLabel: "shape grandchild label",
+			toolName: "read",
+			resolvedPath: directory,
+			reason: "shape fixture ask",
+			askedAt: 165_100,
+		});
+	const shapeProvenanceFor = (wireAsk, directory) => ({
+		requestId: wireAsk.requestId,
+		childToken: wireAsk.childToken,
+		agentName: "shape-worker",
+		dispatchLabel: "shape dispatch",
+		directory,
+	});
+	for (let i = 0; i < ASK_OUTSTANDING_CAP + ASK_QUEUE_CAPACITY; i++) {
+		admitChildAsk(randomUUID(), shapeMiddleToken, `/opt/shape-fill-${i}`, 165_000 + i);
+	}
+	const capShapeAsk = shapeAskFor("/opt/shape-cap-target");
+	const capShapeRuling = shapeProxy(capShapeAsk, shapeProvenanceFor(capShapeAsk, "/opt/shape-cap-target"));
+	await waitFor(() => requestIdsIn(shapeTopRoot).length === 1);
+	await serveForwardingRootTick({
+		root: shapeTopRoot,
+		handler: async () => true,
+		now: () => 165_150,
+		maxAge: 60_000,
+	});
+	checkDeep("a top cap denial resolves the structured denial", await capShapeRuling, {
+		answer: false,
+		via: "cap",
+		reason: ASK_CAP_DENY_REASON,
+	});
+	expireStaleAsks(400_000);
+	const userShapeAsk = shapeAskFor("/opt/shape-user-target");
+	const userShapeRuling = shapeProxy(userShapeAsk, shapeProvenanceFor(userShapeAsk, "/opt/shape-user-target"));
+	await waitFor(() => requestIdsIn(shapeTopRoot).length === 1);
+	await serveForwardingRootTick({
+		root: shapeTopRoot,
+		handler: async () => false,
+		now: () => 165_250,
+		maxAge: 60_000,
+	});
+	check("a top user denial resolves the plain false", await userShapeRuling, false);
+	const sdShapeAsk = shapeAskFor("/opt/shape-sd-target");
+	const sdShapeRuling = shapeProxy(sdShapeAsk, shapeProvenanceFor(sdShapeAsk, "/opt/shape-sd-target"));
+	const sdShapeId = await waitFor(() => requestIdsIn(shapeTopRoot)[0] ?? null);
+	writeForwardedDecision(
+		shapeTopRoot,
+		createForwardedDecision({
+			requestId: sdShapeId,
+			childToken: shapeMiddleToken,
+			decision: "deny",
+			grantedRoot: null,
+			via: "session-deny",
+			reason: ASK_SESSION_DENY_REASON,
+			decidedAt: 165_300,
+		}),
+	);
+	check("a top session-deny crossing resolves the plain false", await sdShapeRuling, false);
+	if (typeof savedRoot === "string") process.env[CHILD_ASK_ROOT_ENV] = savedRoot;
+	if (typeof savedToken === "string") process.env[CHILD_ASK_TOKEN_ENV] = savedToken;
+	fs.rmSync(shapeTopRoot, { recursive: true, force: true });
+}
+resetFenceAskState();
+// The ledger-side contract, pinned directly: a denial ruling that
+// carries the cap provenance judges the child's cadence at the hop
+// above, so it writes its honest via and reason but records nothing,
+// while user-class provenance (the user's word, or the remembered
+// form of one) records the deny memory as before.
+{
+	const denialChildOne = randomUUID();
+	const denialChildTwo = randomUUID();
+	const denialChildThree = randomUUID();
+	const denialChildFour = randomUUID();
+	const denialChildFive = randomUUID();
+	registerLiveChild(denialChildOne, "denial-one", "denial one dispatch", 3000);
+	registerLiveChild(denialChildTwo, "denial-two", "denial two dispatch", 3000);
+	registerLiveChild(denialChildThree, "denial-three", "denial three dispatch", 3000);
+	registerLiveChild(denialChildFour, "denial-four", "denial four dispatch", 3000);
+	registerLiveChild(denialChildFive, "denial-five", "denial five dispatch", 3000);
+	const capDeniedDir = path.join(fixtureDir, "denial", "cap-cross");
+	const capDeniedReq = randomUUID();
+	admitChildAsk(capDeniedReq, denialChildOne, capDeniedDir, 3000);
+	const capRuling = resolveChildAsk(capDeniedReq, false, 3100, { via: "cap", reason: ASK_CAP_DENY_REASON });
+	check("the structured cap refusal resolves", capRuling.kind, "resolved");
+	check("the crossed cap denial writes the cap via", capRuling.decisions[0].via, "cap");
+	check("the crossed cap denial writes the cap reason", capRuling.decisions[0].reason, ASK_CAP_DENY_REASON);
+	check("a cap denial records no deny memory", getFenceAskState().sessionWideDenied.has(capDeniedDir), false);
+	check(
+		"the directory a cap denial refused is askable again",
+		admitChildAsk(randomUUID(), denialChildTwo, capDeniedDir, 3200).kind,
+		"outstanding",
+	);
+	const userDeniedDir = path.join(fixtureDir, "denial", "user-cross");
+	const userDeniedReq = randomUUID();
+	admitChildAsk(userDeniedReq, denialChildThree, userDeniedDir, 3300);
+	const userRuling = resolveChildAsk(userDeniedReq, false, 3400, { via: "user", reason: ASK_USER_DENY_REASON });
+	check("the structured user refusal resolves", userRuling.kind, "resolved");
+	check("the crossed user denial writes the user via", userRuling.decisions[0].via, "user");
+	check("a user denial records the deny memory", getFenceAskState().sessionWideDenied.has(userDeniedDir), true);
+	check(
+		"the directory a user denial refused denies from memory",
+		admitChildAsk(randomUUID(), denialChildFour, userDeniedDir, 3500).kind,
+		"denied-dedup",
+	);
+	const sdDeniedDir = path.join(fixtureDir, "denial", "sd-cross");
+	const sdDeniedReq = randomUUID();
+	admitChildAsk(sdDeniedReq, denialChildFive, sdDeniedDir, 3600);
+	const sdRuling = resolveChildAsk(sdDeniedReq, false, 3700, { via: "session-deny", reason: ASK_SESSION_DENY_REASON });
+	check("a relayed session-deny refusal resolves", sdRuling.kind, "resolved");
+	check("a relayed session-deny refusal records the deny memory", getFenceAskState().sessionWideDenied.has(sdDeniedDir), true);
+}
+resetFenceAskState();
+
+// nested dispatch COR-1 e2e: the driver is the middle at a capped
+// top; the first grandchild ask is cap-denied at the top, and after
+// the top's capacity frees, the re-ask from a later grandchild must
+// cross again and prompt, because the cap denial wrote no deny memory
+// in the middle.
+{
+	resetFenceAskState();
+	const corTopRoot = path.join(os.tmpdir(), `fence-ask-suite-cor1-${randomUUID()}`);
+	createForwardingRootDirs(corTopRoot);
+	const corMiddleToken = randomUUID();
+	registerLiveChild(corMiddleToken, "cor1-middle", "cor1 dispatch", 170_000);
+	for (let i = 0; i < ASK_OUTSTANDING_CAP + ASK_QUEUE_CAPACITY; i++) {
+		admitChildAsk(randomUUID(), corMiddleToken, `/opt/cor1-fill-${i}`, 170_000 + i);
+	}
+	const corTopPrompt = [];
+	const corTopTickOptions = {
+		root: corTopRoot,
+		handler: async (ask, provenance) => {
+			corTopPrompt.push({ ask, provenance });
+			return true;
+		},
+		now: () => 170_500,
+		maxAge: 60_000,
+	};
+	const driverSource = `
+const ledgerPath = ${JSON.stringify(pathToFileURL(path.join(e2eRepoRoot, "extensions", "fence-ask", "grant-ledger.ts")).href)};
+const channelPath = ${JSON.stringify(pathToFileURL(path.join(e2eRepoRoot, "extensions", "fence-ask", "ask-channel.ts")).href)};
+const servePath = ${JSON.stringify(pathToFileURL(path.join(e2eRepoRoot, "extensions", "fence-ask", "serve.ts")).href)};
+const { registerLiveChild, ensureForwardingRoot, getFenceAskState, appliedSelfGrants, grantsForChild } = await import(ledgerPath);
+const { forwardOutOfScopeAsk } = await import(channelPath);
+const { configureForwardingServer, ensureForwardingServer, childProxyHandler } = await import(servePath);
+const firstToken = crypto.randomUUID();
+const secondToken = crypto.randomUUID();
+const thirdToken = crypto.randomUUID();
+const fourthToken = crypto.randomUUID();
+const middleRoot = ensureForwardingRoot("cor1-driver-session", crypto.randomUUID());
+configureForwardingServer({ resolveHandler: childProxyHandler, tickMs: 10 });
+ensureForwardingServer();
+registerLiveChild(firstToken, "cor1-grandchild-one", "cor1 first dispatch", 1);
+registerLiveChild(secondToken, "cor1-grandchild-two", "cor1 second dispatch", 1);
+registerLiveChild(thirdToken, "cor1-grandchild-three", "cor1 third dispatch", 1);
+registerLiveChild(fourthToken, "cor1-grandchild-four", "cor1 fourth dispatch", 1);
+const forwardAt = (directory, childToken) => forwardOutOfScopeAsk({
+	root: middleRoot,
+	childToken,
+	toolName: "write",
+	directory,
+	reason: "cor1 grandchild ask",
+	identityAgentName: "cor1-driver",
+	identityDispatchLabel: "cor1",
+	waitMs: 20000,
+	pollMs: 10,
+	onGrant: () => {},
+});
+const first = await forwardAt("/opt/cor1-target", firstToken);
+const memoryAfterFirst = getFenceAskState().sessionWideDenied.size;
+const second = await forwardAt("/opt/cor1-target", secondToken);
+const memoryAfterSecond = getFenceAskState().sessionWideDenied.size;
+const third = await forwardAt("/opt/cor1-user-target", thirdToken);
+const memoryAfterThird = getFenceAskState().sessionWideDenied.size;
+const fourth = await forwardAt("/opt/cor1-user-target", fourthToken);
+console.log(JSON.stringify({
+	firstStatus: first.status,
+	firstVia: first.decision ? first.decision.via : null,
+	firstReason: first.blockReason,
+	memoryAfterFirst,
+	secondStatus: second.status,
+	secondVia: second.decision ? second.decision.via : null,
+	memoryAfterSecond,
+	thirdStatus: third.status,
+	thirdVia: third.decision ? third.decision.via : null,
+	memoryAfterThird,
+	fourthStatus: fourth.status,
+	fourthVia: fourth.decision ? fourth.decision.via : null,
+	middleApplied: appliedSelfGrants().length,
+	secondGrant: grantsForChild(secondToken).join(","),
+	middleRoot,
+}));
+process.exit(0);
+`;
+	const corDriverPromise = runDriver(
+		driverSource,
+		{
+			[CHILD_ASK_ROOT_ENV]: corTopRoot,
+			[CHILD_ASK_TOKEN_ENV]: corMiddleToken,
+		},
+		30_000,
+	);
+	await waitFor(() => requestIdsIn(corTopRoot).length === 1);
+	await serveForwardingRootTick({ ...corTopTickOptions });
+	expireStaleAsks(400_000);
+	await waitFor(() => requestIdsIn(corTopRoot).length === 1);
+	await serveForwardingRootTick({ ...corTopTickOptions, now: () => 170_600 });
+	await waitFor(() => requestIdsIn(corTopRoot).length === 1);
+	await serveForwardingRootTick({
+		...corTopTickOptions,
+		now: () => 170_700,
+		handler: async (ask, provenance) => {
+			corTopPrompt.push({ ask, provenance });
+			return false;
+		},
+	});
+	const corDriverResult = await corDriverPromise;
+	check("the cor1 driver exited cleanly", corDriverResult.code, 0);
+	const corJson = JSON.parse(corDriverResult.stdout.trim().split("\n").pop());
+	check("the capped first grandchild ask is denied", corJson.firstStatus, "denied");
+	check("the crossed cap denial names the cap provenance", corJson.firstVia, "cap");
+	checkContains("the crossed cap denial reason names the ask cap", corJson.firstReason, ASK_CAP_DENY_REASON);
+	check("the middle holds no deny memory after the cap crossing", corJson.memoryAfterFirst, 0);
+	check("the re-ask after the cap clears applies", corJson.secondStatus, "applied");
+	check("the re-ask's grant crosses as the user's word", corJson.secondVia, "user");
+	check("the re-ask's grant binds the later grandchild", corJson.secondGrant, "/opt/cor1-target");
+	check("the middle's own verdict set stays empty", corJson.middleApplied, 0);
+	check("the grant crossing recorded no middle deny memory", corJson.memoryAfterSecond, 0);
+	check("the cap denial prompted nothing and the two crossings prompted once each", corTopPrompt.length, 2);
+	check("the top user denial crosses and denies", corJson.thirdStatus, "denied");
+	check("the crossed user denial names the user provenance", corJson.thirdVia, "user");
+	check("the middle records the deny memory for the user crossing", corJson.memoryAfterThird, 1);
+	check("the re-ask after a user denial denies from memory without crossing", corJson.fourthStatus, "denied");
+	check("the memory denial carries the session-deny provenance", corJson.fourthVia, "session-deny");
+	fs.rmSync(corTopRoot, { recursive: true, force: true });
+	fs.rmSync(corJson.middleRoot, { recursive: true, force: true });
+	resetFenceAskState();
+}
+
 // --- unit 1-4 DC-2: the spawn-site default proxy resolver ------------
 // A provisioned process starts serving through childProxyHandler the
 // moment it dispatches (ensureForwardingServer at its own spawn site),

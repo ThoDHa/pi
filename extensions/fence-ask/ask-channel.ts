@@ -91,7 +91,7 @@ import {
 	serializeForwardedAsk,
 	serializeForwardedDecision,
 } from "./ask-wire.ts";
-import type { ForwardedAsk, ForwardedDecision } from "./ask-wire.ts";
+import type { DecisionVia, ForwardedAsk, ForwardedDecision } from "./ask-wire.ts";
 import {
 	ASK_HOST_STALE_MS,
 	admitChildAsk,
@@ -315,21 +315,36 @@ export async function forwardOutOfScopeAsk(options: ForwardFlowOptions): Promise
 	};
 }
 
+/**
+ * A denial whose provenance crosses a proxy hop: the ruling surface
+ * answers false with the via the ruling authority used and its own
+ * reason text, so the ledger below the hop can honor the wire's
+ * cap-versus-user distinction instead of flattening every denial into
+ * the user's word. Plain boolean answers keep their meaning: true is
+ * a grant, false is the user's refusal.
+ */
+export interface RuledDenial {
+	answer: false;
+	via: DecisionVia;
+	reason: string;
+}
+
 /** The ruling surface the serving tick calls for outstanding asks. */
 export type AskRulingHandler = (
 	ask: ForwardedAsk,
 	provenance: AskPromptProvenance,
-) => Promise<boolean | null>;
+) => Promise<boolean | RuledDenial | null>;
 
 /** Everything one serving sweep needs from its caller. */
 export interface TickOptions {
 	/** The forwarding root to serve. */
 	root: string;
 	/**
-	 * The ruling surface: boolean for answered, null for no authority
-	 * (drops the entry without deny memory). Null handler means this
-	 * process has no prompting surface: outstanding entries pend for
-	 * the staleness bound instead of being ruled or dropped.
+	 * The ruling surface: boolean or structured denial for answered,
+	 * null for no authority (drops the entry without deny memory). Null
+	 * handler means this process has no prompting surface: outstanding
+	 * entries pend for the staleness bound instead of being ruled or
+	 * dropped.
 	 */
 	handler: AskRulingHandler | null;
 	/** Injectable clock; defaults to Date.now. */
@@ -445,7 +460,10 @@ export async function serveForwardingRootTick(options: TickOptions): Promise<Tic
  * apply the answer through the ledger and write one decision per
  * involved request id. A null handler pends (staleness will evict);
  * a null answer drops without deny memory; a thrown handler answer is
- * treated as no authority, never as a denial.
+ * treated as no authority, never as a denial. A structured denial
+ * hands its via and reason to the ledger, so a cap denial that
+ * crosses a proxy hop stays a cap denial below it instead of
+ * recording as the user's word.
  */
 async function ruleOnOutstanding(
 	options: TickOptions,
@@ -457,19 +475,22 @@ async function ruleOnOutstanding(
 	const provenance = promptProvenanceForRequest(requestId);
 	if (provenance === null) return;
 	summary.prompted++;
-	let answer: boolean | null;
+	let ruling: boolean | RuledDenial | null;
 	try {
-		answer = await options.handler(ask, provenance);
+		ruling = await options.handler(ask, provenance);
 	} catch {
-		answer = null;
+		ruling = null;
 	}
-	if (answer === null) {
+	if (ruling === null) {
 		dropChildAsk(requestId);
 		deleteAskFile(options.root, requestId);
 		summary.dropped++;
 		return;
 	}
-	const outcome = resolveChildAsk(requestId, answer);
+	const outcome =
+		typeof ruling === "boolean"
+			? resolveChildAsk(requestId, ruling)
+			: resolveChildAsk(requestId, ruling.answer, Date.now(), { via: ruling.via, reason: ruling.reason });
 	if (outcome.kind !== "resolved") return;
 	for (const decision of outcome.decisions) {
 		try {
