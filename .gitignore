@@ -21,6 +21,7 @@
 !/extensions/workspace-fence.ts
 !/extensions/subagent/
 !/extensions/periscope/
+!/extensions/fence-ask/
 !/extensions/cooldown.ts
 !/extensions/cooldown.json
 !/extensions/workspace-fence.config.json

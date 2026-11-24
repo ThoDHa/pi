@@ -616,6 +616,16 @@ try {
 
 		configWarnings.length = 0;
 		check(
+			"config __proto__ key warns as unknown and contributes nothing",
+			parseFenceConfig('{"__proto__": {"extraRoots": ["' + outsideDir + '"]}}', "proto.json", fakeHome).length,
+			0,
+		);
+		check("config __proto__ key warned exactly once", configWarnings.length, 1);
+		checkContains("config __proto__ warning names the key", configWarnings.join("\n"), "__proto__");
+		check("config __proto__ key does not pollute Object.prototype", "extraRoots" in {}, false);
+
+		configWarnings.length = 0;
+		check(
 			"config invalid JSON parses to nothing",
 			parseFenceConfig("{not json", "broken.json", fakeHome).length,
 			0,
@@ -1229,6 +1239,7 @@ try {
 	checkContains("ask denial reason names the tool", outScope.denyReason, "read");
 	checkContains("ask denial reason names the resolved path", outScope.denyReason, outFile);
 	checkContains("ask denial reason names the policy", outScope.denyReason, EXTRA_ROOTS_ENV);
+	checkContains("ask denial names the tracked config widening path", outScope.denyReason, FENCE_CONFIG_FILE);
 
 	const grepOutside = gate({ toolName: "grep", input: { pattern: "x", path: outsideDir, glob: "*.txt" } });
 	check("grep with an out-of-scope path asks regardless of glob metadata", grepOutside.action, "ask");

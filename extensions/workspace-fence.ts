@@ -181,7 +181,11 @@
  * can remove): the tracked workspace-fence.config.json beside this
  * module carries the portable defaults; the optional untracked
  * workspace-fence.local.json beside it carries machine-dependent roots
- * the user keeps out of version control; and PISCOPE_EXTRA_ROOTS is a
+ * the user keeps out of version control; the overlay is machine-local
+ * config that shares this module's own trust level: whoever can write
+ * it can already rewrite the module, so its threat model is the user's
+ * own machine and no additional integrity boundary is claimed between
+ * them; and PISCOPE_EXTRA_ROOTS is a
  * delimiter-separated (":" on POSIX) list of absolute paths children
  * inherit through the normal spawn environment chain. Config and
  * overlay share one strict flat shape, an object whose only known key
@@ -895,7 +899,7 @@ export function resolveScopeTarget(
 			return {
 				path: lexical,
 				scope: "ask",
-				detail: `${candidate} resolves outside the session cwd, the temp directory, and every extra allowed root; approve interactively or widen ${EXTRA_ROOTS_ENV}`,
+				detail: `${candidate} resolves outside the session cwd, the temp directory, and every extra allowed root; approve interactively or widen the extra roots (${FENCE_CONFIG_FILE} or ${EXTRA_ROOTS_ENV})`,
 			};
 		}
 	}
@@ -975,7 +979,8 @@ export interface PathGateCall {
 /**
  * The refusal reason a blocked call carries: it names the tool, the
  * resolved path, and the policy (the ask verdict's detail carries the
- * escaping candidate and the widen-PISCOPE_EXTRA_ROOTS remedy).
+ * escaping candidate and the widening remedy: the tracked config or
+ * PISCOPE_EXTRA_ROOTS).
  */
 function scopeDenyReason(toolName: string, verdict: ScopeVerdict): string {
 	return `${toolName} blocked by the workspace-fence: ${verdict.detail}`;
@@ -1596,15 +1601,13 @@ export function decideBashToolCall(call: BashGateCall): PathGateDecision {
  * The extension entry point pi's loader requires (the permission-gate
  * shape): register one tool_call handler that maps the decision data
  * onto the live session. Bash calls dispatch to the bash decider, every
- * other tool to the path decider. Extra roots parse once at factory
- * time; the allowed roots rebuild per call so a moved session cwd is
- * honored; the seal stays omitted so the real release seal evaluates
- * exactly once per session, and the extra-root union evaluates the same
- * lazy way (fenceExtraRoots: tracked config, optional local overlay,
- * PISCOPE_EXTRA_ROOTS, once at the first verdict); the allowed roots
- * rebuild per call so a moved session cwd is honored. Prompt answers
- * other than Yes are refusals: the user is never tricked into approval
- * by a stale dialog.
+ * other tool to the path decider. The extra-root union evaluates
+ * lazily once per process at the first gated verdict (fenceExtraRoots:
+ * tracked config, optional local overlay, PISCOPE_EXTRA_ROOTS), the
+ * allowed roots rebuild per call so a moved session cwd is honored,
+ * and the seal stays omitted so the real release seal evaluates
+ * exactly once per session. Prompt answers other than Yes are
+ * refusals: the user is never tricked into approval by a stale dialog.
  */
 export default function (pi: ExtensionAPI) {
 	pi.on("tool_call", async (event, ctx) => {
