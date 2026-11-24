@@ -470,6 +470,23 @@ test("findCooldownEntry applies the model pattern", () => {
 	assert.equal(findCooldownEntry(config, "zai", "other-model"), undefined);
 });
 
+test("validateCooldownConfig compiles the model matcher once onto the resolved entry", () => {
+	const { config } = validateCooldownConfig({
+		providers: [
+			{ name: "glob", match: { provider: "zai", model: "glm-*" }, errorPattern: "a", resetTimePattern: "(\\d{4})", utcOffsetMinutes: 0 },
+			{ name: "exact", match: { provider: "acme", model: "sonnet-4" }, errorPattern: "a", resetTimePattern: "(\\d{4})", utcOffsetMinutes: 0 },
+			{ name: "absent", match: { provider: "openai" }, errorPattern: "a", resetTimePattern: "(\\d{4})", utcOffsetMinutes: 0 },
+		],
+	});
+	assert.ok(config.providers[0].modelMatcher instanceof RegExp, "the glob pattern compiles at validation time");
+	assert.equal(config.providers[0].modelMatcher.test("glm-5.3-flash"), true);
+	assert.equal(config.providers[0].modelMatcher.test("xglm-5.3"), false);
+	assert.ok(config.providers[1].modelMatcher instanceof RegExp, "the exact pattern compiles to its anchored literal");
+	assert.equal(config.providers[1].modelMatcher.test("sonnet-4"), true);
+	assert.equal(config.providers[1].modelMatcher.test("sonnet-4.5"), false);
+	assert.equal(config.providers[2].modelMatcher, undefined, "an absent model pattern needs no matcher");
+});
+
 // --- reset time parsing -------------------------------------------------
 
 test("the verbatim 1308 message parses to the correct epoch under offset 480", () => {

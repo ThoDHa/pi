@@ -90,6 +90,8 @@ export interface CooldownState {
 export interface ResolvedProviderEntry {
 	name: string;
 	match: { provider: string; model?: string };
+	/** match.model compiled once at validation time so per-message paths never rebuild a RegExp; absent when match.model is absent. */
+	modelMatcher?: RegExp;
 	errorPattern: RegExp;
 	resetTimePattern: RegExp;
 	utcOffsetMinutes: number;
@@ -284,6 +286,7 @@ export function validateCooldownConfig(raw: unknown): ConfigResult {
 				providers.push({
 					name,
 					match: model === undefined ? { provider } : { provider, model },
+					modelMatcher: model === undefined ? undefined : compileModelGlob(model),
 					errorPattern,
 					resetTimePattern,
 					utcOffsetMinutes,
@@ -358,6 +361,19 @@ export function loadCooldownConfigWithLocalOverride(defaultPath: string): Config
 }
 
 /**
+ * Compile a model glob pattern into its anchored matcher. Every
+ * non-star byte is escaped, so an exact pattern compiles to its own
+ * literal and full-string equality falls out of the same builder.
+ */
+function compileModelGlob(pattern: string): RegExp {
+	const source = pattern
+		.split("*")
+		.map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+		.join(".*");
+	return new RegExp(`^${source}$`);
+}
+
+/**
  * Does a configured model pattern match a model id? Absent pattern
  * matches everything; a pattern without "*" is an exact id match;
  * otherwise each "*" is a wildcard segment.
@@ -365,18 +381,23 @@ export function loadCooldownConfigWithLocalOverride(defaultPath: string): Config
 export function matchesEntryModel(pattern: string | undefined, model: string | undefined): boolean {
 	if (pattern === undefined) return true;
 	if (model === undefined) return false;
-	if (!pattern.includes("*")) return pattern === model;
-	const source = pattern
-		.split("*")
-		.map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-		.join(".*");
-	return new RegExp(`^${source}$`).exec(model) !== null;
+	return compileModelGlob(pattern).exec(model) !== null;
+}
+
+/**
+ * Per-message counterpart of matchesEntryModel consulting the entry's
+ * validation-time matcher; falls back to the pure form for entries not
+ * built by validateCooldownConfig (hand-built test entries).
+ */
+function entryModelMatches(entry: Pick<ResolvedProviderEntry, "match" | "modelMatcher">, model: string | undefined): boolean {
+	if (entry.modelMatcher === undefined) return matchesEntryModel(entry.match.model, model);
+	return model !== undefined && entry.modelMatcher.exec(model) !== null;
 }
 
 /** First config entry whose provider and optional model pattern match, in config order. */
 export function findCooldownEntry(config: ResolvedConfig, provider: string | undefined, model: string | undefined): ResolvedProviderEntry | undefined {
 	if (provider === undefined) return undefined;
-	return config.providers.find((entry) => entry.match.provider === provider && matchesEntryModel(entry.match.model, model));
+	return config.providers.find((entry) => entry.match.provider === provider && entryModelMatches(entry, model));
 }
 
 /**
@@ -690,7 +711,7 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 	function retirePendingWait(ctx: ExtensionContext, message: LimitErrorMessage): void {
 		if (config === undefined || typeof message.provider !== "string") return;
 		for (const entry of config.providers) {
-			if (entry.match.provider !== message.provider || !matchesEntryModel(entry.match.model, message.model)) continue;
+			if (entry.match.provider !== message.provider || !entryModelMatches(entry, message.model)) continue;
 			const pending = states.get(entry.name);
 			const wasDisabled = disabled.has(entry.name);
 			if (pending === undefined && !wasDisabled) continue;
