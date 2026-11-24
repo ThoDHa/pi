@@ -9,7 +9,9 @@
  * persist the pending wait via appendEntry, and at fire time resume the
  * work by sending the configured resume prompt (plain send when idle,
  * `followUp` while busy). While the wait pends, a minute-tick countdown
- * refreshes the footer status with the remaining wait; the tick interval
+ * refreshes the footer status with the remaining wait under the entry's
+ * own `cooldown:<name>` status key, so concurrent waits render
+ * independently; the tick interval
  * shares the fire timer's lifecycle, so every site that clears the timer
  * (fire, cancel, retire, cap, restart drop, shutdown) clears the tick
  * too. A repeat limit error on a resumed turn re-arms
@@ -59,26 +61,37 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 export const ENTRY_TYPE = "cooldown";
-export const STATUS_KEY = "cooldown";
+const STATUS_KEY = "cooldown";
 export const DEFAULT_RESUME_PROMPT = "The provider usage-limit window has reset. Continue the pending work from where it stopped.";
+
+/** Footer status key for one entry's countdown segment; per-entry keys keep concurrent waits from flip-flopping a shared slot. */
+export function statusKeyFor(entryName: string): string {
+	return `${STATUS_KEY}:${entryName}`;
+}
 
 const MINUTE_MS = 60_000;
 const TIMEOUT_CAP_MS = 2 ** 31 - 1;
 const MAX_OFFSET_MINUTES = 840;
 const STAMP_PATTERN = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/;
-const TOP_DEFAULTS = { defaultBufferMinutes: 2, maxResumeAttempts: 5, resumeOnRestart: false } as const;
+const TOP_DEFAULTS = { defaultBufferMinutes: 2, maxResumeAttempts: 5, resumeOnRestart: false, autoResume: true } as const;
 
-/** One pending recovery: which provider entry, the parsed deadline, and how many resumes it already used. */
+/** One pending recovery: which provider entry, the parsed deadline, how many resumes it already used, and the errored model pinned at arm time. */
 export interface CooldownState {
 	entryName: string;
 	resetAtMs: number;
 	fireAtMs: number;
 	attempts: number;
+	/** The errored model id captured from the arming message; retirement requires this model's success when present, entry-scoped retirement when absent. */
+	model?: string;
+	/** Runtime-only provenance: the wait was armed by the debug simulate path. Never persisted; a wait read from persistence is always real. */
+	simulated?: boolean;
 }
 
 export interface ResolvedProviderEntry {
 	name: string;
 	match: { provider: string; model?: string };
+	/** match.model compiled once at validation time so per-message paths never rebuild a RegExp; absent when match.model is absent. */
+	modelMatcher?: RegExp;
 	errorPattern: RegExp;
 	resetTimePattern: RegExp;
 	utcOffsetMinutes: number;
@@ -90,11 +103,13 @@ export interface ResolvedConfig {
 	defaultBufferMinutes: number;
 	maxResumeAttempts: number;
 	resumeOnRestart: boolean;
+	/** Starting state of the runtime auto-resume switch; false only disables at session start. */
+	autoResume: boolean;
 	resumePrompt: string;
 	providers: ResolvedProviderEntry[];
 }
 
-export type ConfigResult = { ok: true; config: ResolvedConfig } | { ok: false; problems: string[] };
+export type ConfigResult = { ok: true; config: ResolvedConfig; localOverridePath?: string } | { ok: false; problems: string[] };
 
 /** Structural view of the message fields detection needs; AssistantMessage satisfies it. */
 export interface LimitErrorMessage {
@@ -113,12 +128,14 @@ export type ArmDecision =
 
 export type RestartDecision =
 	| { action: "none" }
-	| { action: "drop"; state: CooldownState; gate: "resumeOnRestart" | "fork" }
+	| { action: "drop"; state: CooldownState; gate: "resumeOnRestart" | "fork" | "autoResume" }
 	| { action: "rearm"; state: CooldownState }
 	| { action: "resume_now"; state: CooldownState };
 
 export interface CooldownExtensionOptions {
 	configPath?: string;
+	/** Root directory holding the tracked default cooldown.json and its cooldown.local.json override; defaults to the extension's own directory. Test-serving seam so tests never touch the live install dir. */
+	defaultConfigRoot?: string;
 	/** Countdown refresh period in milliseconds; defaults to one minute. */
 	tickMs?: number;
 }
@@ -187,6 +204,15 @@ export function validateCooldownConfig(raw: unknown): ConfigResult {
 			problems.push(`resumeOnRestart must be a boolean, got ${JSON.stringify(root.resumeOnRestart)}`);
 		} else {
 			resumeOnRestart = root.resumeOnRestart;
+		}
+	}
+
+	let autoResume = TOP_DEFAULTS.autoResume;
+	if (root.autoResume !== undefined) {
+		if (typeof root.autoResume !== "boolean") {
+			problems.push(`autoResume must be a boolean, got ${JSON.stringify(root.autoResume)}`);
+		} else {
+			autoResume = root.autoResume;
 		}
 	}
 
@@ -273,6 +299,7 @@ export function validateCooldownConfig(raw: unknown): ConfigResult {
 				providers.push({
 					name,
 					match: model === undefined ? { provider } : { provider, model },
+					modelMatcher: model === undefined ? undefined : compileModelGlob(model),
 					errorPattern,
 					resetTimePattern,
 					utcOffsetMinutes,
@@ -284,8 +311,11 @@ export function validateCooldownConfig(raw: unknown): ConfigResult {
 	}
 
 	if (problems.length > 0) return { ok: false, problems };
-	return { ok: true, config: { defaultBufferMinutes, maxResumeAttempts, resumeOnRestart, resumePrompt, providers } };
+	return { ok: true, config: { defaultBufferMinutes, maxResumeAttempts, resumeOnRestart, autoResume, resumePrompt, providers } };
 }
+
+/** Filename of the untracked local override resolved beside the tracked default config. */
+const LOCAL_CONFIG_FILENAME = "cooldown.local.json";
 
 /**
  * Read and validate the config sidecar at filePath. Missing file, invalid
@@ -311,6 +341,53 @@ export function loadCooldownConfig(filePath: string): ConfigResult {
 }
 
 /**
+ * Load the effective config for a tracked default path: a
+ * cooldown.local.json beside it, when present, is the entire config —
+ * valid replaces the tracked default wholesale with no field merge,
+ * invalid (unreadable, broken JSON, schema problems) leaves the caller
+ * inert with problems naming the local path, and an absent local file
+ * loads the tracked default exactly as before. A local win sets
+ * localOverridePath so session_start can surface which file is active.
+ * An explicit configPath bypasses this lookup entirely, so tests and
+ * pointed setups stay deterministic; the local file itself stays
+ * untracked by the extensions default-deny gitignore.
+ */
+export function loadCooldownConfigWithLocalOverride(defaultPath: string): ConfigResult {
+	const localPath = path.join(path.dirname(defaultPath), LOCAL_CONFIG_FILENAME);
+	let text: string;
+	try {
+		text = readFileSync(localPath, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return loadCooldownConfig(defaultPath);
+		const reason = error instanceof Error ? error.message : String(error);
+		return { ok: false, problems: [`cooldown config: cannot read ${localPath}: ${reason}`] };
+	}
+	let raw: unknown;
+	try {
+		raw = JSON.parse(text);
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		return { ok: false, problems: [`cooldown config: ${localPath} is not valid JSON: ${reason}`] };
+	}
+	const result = validateCooldownConfig(raw);
+	if (result.ok) return { ok: true, config: result.config, localOverridePath: localPath };
+	return { ok: false, problems: result.problems.map((problem) => `${localPath}: ${problem}`) };
+}
+
+/**
+ * Compile a model glob pattern into its anchored matcher. Every
+ * non-star byte is escaped, so an exact pattern compiles to its own
+ * literal and full-string equality falls out of the same builder.
+ */
+function compileModelGlob(pattern: string): RegExp {
+	const source = pattern
+		.split("*")
+		.map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+		.join(".*");
+	return new RegExp(`^${source}$`);
+}
+
+/**
  * Does a configured model pattern match a model id? Absent pattern
  * matches everything; a pattern without "*" is an exact id match;
  * otherwise each "*" is a wildcard segment.
@@ -318,18 +395,23 @@ export function loadCooldownConfig(filePath: string): ConfigResult {
 export function matchesEntryModel(pattern: string | undefined, model: string | undefined): boolean {
 	if (pattern === undefined) return true;
 	if (model === undefined) return false;
-	if (!pattern.includes("*")) return pattern === model;
-	const source = pattern
-		.split("*")
-		.map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-		.join(".*");
-	return new RegExp(`^${source}$`).exec(model) !== null;
+	return compileModelGlob(pattern).exec(model) !== null;
+}
+
+/**
+ * Per-message counterpart of matchesEntryModel consulting the entry's
+ * validation-time matcher; falls back to the pure form for entries not
+ * built by validateCooldownConfig (hand-built test entries).
+ */
+function entryModelMatches(entry: Pick<ResolvedProviderEntry, "match" | "modelMatcher">, model: string | undefined): boolean {
+	if (entry.modelMatcher === undefined) return matchesEntryModel(entry.match.model, model);
+	return model !== undefined && entry.modelMatcher.exec(model) !== null;
 }
 
 /** First config entry whose provider and optional model pattern match, in config order. */
 export function findCooldownEntry(config: ResolvedConfig, provider: string | undefined, model: string | undefined): ResolvedProviderEntry | undefined {
 	if (provider === undefined) return undefined;
-	return config.providers.find((entry) => entry.match.provider === provider && matchesEntryModel(entry.match.model, model));
+	return config.providers.find((entry) => entry.match.provider === provider && entryModelMatches(entry, model));
 }
 
 /**
@@ -385,7 +467,13 @@ export function planCooldownArm(config: ResolvedConfig, message: LimitErrorMessa
 		action: "arm",
 		entry,
 		extended,
-		state: { entryName: entry.name, resetAtMs, fireAtMs: candidateFireAtMs, attempts: current !== undefined && current.entryName === entry.name ? current.attempts : 0 },
+		state: {
+			entryName: entry.name,
+			resetAtMs,
+			fireAtMs: candidateFireAtMs,
+			attempts: current !== undefined && current.entryName === entry.name ? current.attempts : 0,
+			...(message.model !== undefined ? { model: message.model } : {}),
+		},
 	};
 }
 
@@ -411,6 +499,71 @@ export function planRestartResume(persisted: CooldownState | undefined, resumeOn
 	return { action: "resume_now", state: persisted };
 }
 
+	/** Parse a persisted cooldown record into a pending wait; undefined for anything that is not a real (non-simulated, well-formed) waiting record. */
+function persistedStateFrom(data: unknown): CooldownState | undefined {
+	if (typeof data !== "object" || data === null) return undefined;
+	const record = data as Record<string, unknown>;
+	if (record.state !== "waiting") return undefined;
+	if (record.simulated === true) return undefined;
+	const { entryName, resetAtMs, fireAtMs, attempts } = record;
+	if (!nonEmptyString(entryName) || !isFiniteNumber(resetAtMs) || !isFiniteNumber(fireAtMs) || !isFiniteNumber(attempts)) return undefined;
+	return {
+		entryName,
+		resetAtMs,
+		fireAtMs,
+		attempts,
+		...(nonEmptyString(record.model) ? { model: record.model } : {}),
+	};
+}
+
+function persistedEntryName(data: unknown): string | undefined {
+	if (typeof data !== "object" || data === null) return undefined;
+	const name = (data as Record<string, unknown>).entryName;
+	return nonEmptyString(name) ? name : undefined;
+}
+
+function isCooldownEntry(entry: unknown): entry is { type: string; customType: string; data: unknown } {
+	const record = entry as { type?: string; customType?: string } | undefined;
+	return record !== undefined && record.type === "custom" && record.customType === ENTRY_TYPE;
+}
+
+/**
+ * Scan a persisted branch for still-pending waits, newest-decides per
+ * entry name: the last cooldown record carrying a readable entryName
+ * decides that name, and the name contributes a pending wait only when
+ * that deciding record is a real waiting entry. Tombstones,
+ * fired/capped/resolved records, simulated waits, and malformed records
+ * all decide their own name as no-wait, keeping the single-slot scan's
+ * double-fire and durability guarantees per name; a record with no
+ * readable entryName is unattributable and cannot decide any name —
+ * that skip is intended: runtime writes always carry entryName, so a
+ * nameless record is hand-made garbage and must not suppress a real
+ * wait.
+ * Returns the waits in branch order so restart adjudication and its
+ * notifies stay deterministic.
+ */
+export function collectPendingWaits(entries: readonly unknown[]): CooldownState[] {
+	const decided = new Map<string, CooldownState | undefined>();
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index];
+		if (!isCooldownEntry(entry)) continue;
+		const name = persistedEntryName(entry.data);
+		if (name === undefined || decided.has(name)) continue;
+		decided.set(name, persistedStateFrom(entry.data));
+	}
+	const waits: CooldownState[] = [];
+	const emitted = new Set<string>();
+	for (const entry of entries) {
+		if (!isCooldownEntry(entry)) continue;
+		const name = persistedEntryName(entry.data);
+		if (name === undefined || emitted.has(name)) continue;
+		emitted.add(name);
+		const state = decided.get(name);
+		if (state !== undefined) waits.push(state);
+	}
+	return waits;
+}
+
 /** Local clock rendering of a deadline for notify messages. */
 export function formatResumeClock(epochMs: number): string {
 	return new Date(epochMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
@@ -426,15 +579,22 @@ export function formatCountdown(fireAtMs: number, nowMs: number): string {
 }
 
 export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExtensionOptions = {}): void {
-	const configPath = options.configPath ?? path.join(path.dirname(fileURLToPath(import.meta.url)), "cooldown.json");
-	const loaded = loadCooldownConfig(configPath);
+	const configPath = options.configPath ?? path.join(options.defaultConfigRoot ?? path.dirname(fileURLToPath(import.meta.url)), "cooldown.json");
+	const loaded = options.configPath !== undefined ? loadCooldownConfig(configPath) : loadCooldownConfigWithLocalOverride(configPath);
 	const config: ResolvedConfig | undefined = loaded.ok ? loaded.config : undefined;
+	const localOverridePath = loaded.ok ? loaded.localOverridePath : undefined;
 	const problems = loaded.ok ? [] : loaded.problems;
-	const tickMs = options.tickMs ?? MINUTE_MS;
+	// A degenerate tickMs would arm a busy loop of status writes; keep the
+	// countdown on the one-minute default instead.
+	const tickMs = options.tickMs !== undefined && isFiniteNumber(options.tickMs) && options.tickMs > 0 ? options.tickMs : MINUTE_MS;
 	const states = new Map<string, CooldownState>();
 	const timers = new Map<string, ReturnType<typeof setTimeout>>();
 	const ticks = new Map<string, ReturnType<typeof setInterval>>();
 	const disabled = new Set<string>();
+	// Runtime master switch, user-commanded via /cooldown off|on. Deliberately
+	// not persisted: a fresh session or /reload falls back to the config's
+	// autoResume default, per the user ruling that off must not survive.
+	let autoResumeEnabled = config?.autoResume !== false;
 	let sessionCtx: ExtensionContext | undefined;
 
 	function entryByName(entryName: string): ResolvedProviderEntry | undefined {
@@ -442,7 +602,7 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 	}
 
 	/** Persist a superseding cancelled record; `gate` records which gate dropped the wait. */
-	function persistCancelled(state: CooldownState, gate?: "resumeOnRestart" | "fork"): void {
+	function persistCancelled(state: CooldownState, gate?: "resumeOnRestart" | "fork" | "autoResume"): void {
 		pi.appendEntry(ENTRY_TYPE, { state: "cancelled", entryName: state.entryName, fireAtMs: state.fireAtMs, attempts: state.attempts, ...(gate !== undefined ? { gate } : {}), cancelledAtMs: Date.now() });
 	}
 
@@ -492,7 +652,7 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 		const ctx = sessionCtx;
 		const state = states.get(entryName);
 		if (ctx === undefined || state === undefined || config === undefined || !ctx.hasUI) return;
-		ctx.ui.setStatus(STATUS_KEY, `⏳ ${entryName} in ${formatCountdown(state.fireAtMs, Date.now())} · ${state.attempts}/${config.maxResumeAttempts} resumes used`);
+		ctx.ui.setStatus(statusKeyFor(entryName), `⏳ ${entryName} in ${formatCountdown(state.fireAtMs, Date.now())} · ${state.attempts}/${config.maxResumeAttempts} resumes used`);
 	}
 
 	function fireResume(entryName: string): void {
@@ -510,7 +670,7 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 		pi.appendEntry(ENTRY_TYPE, { state: "fired", entryName, resetAtMs: state.resetAtMs, fireAtMs: state.fireAtMs, attempts: state.attempts, resumedAtMs: Date.now() });
 		if (ctx.hasUI) {
 			ctx.ui.notify(`cooldown: ${entryName} limit window reset; resuming automatically (attempt ${state.attempts}/${config.maxResumeAttempts})`, "info");
-			ctx.ui.setStatus(STATUS_KEY, undefined);
+			ctx.ui.setStatus(statusKeyFor(entryName), undefined);
 		}
 	}
 
@@ -523,6 +683,19 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 		const entry = findCooldownEntry(config, message.provider, message.model);
 		if (entry === undefined) {
 			if (simulated && ctx.hasUI) ctx.ui.notify(`${prefix}the error text matched no configured provider entry; nothing armed`, "info");
+			return;
+		}
+		if (!autoResumeEnabled) {
+			// Only a matched limit error earns the passive notify: the off branch
+			// mirrors the arming path's own pattern gate, so unrelated errors stay
+			// as silent as they are with the switch on.
+			if (typeof message.errorMessage !== "string" || !entry.errorPattern.test(message.errorMessage)) return;
+			const resetAtMs = parseResetEpochMs(entry, message.errorMessage);
+			if (ctx.hasUI) {
+				ctx.ui.notify(resetAtMs !== undefined
+					? `${prefix}auto-recovery is off; ${entry.name} limit window resets around ${formatResumeClock(resetAtMs)}; send /cooldown on to re-enable`
+					: `${prefix}auto-recovery is off; send /cooldown on to re-enable`, "info");
+			}
 			return;
 		}
 		if (disabled.has(entry.name)) {
@@ -548,14 +721,23 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 			disabled.add(entry.name);
 			pi.appendEntry(ENTRY_TYPE, { state: "capped", entryName: entry.name, attempts: decision.attempts, cappedAtMs: Date.now() });
 			if (ctx.hasUI) {
-				ctx.ui.setStatus(STATUS_KEY, undefined);
+				ctx.ui.setStatus(statusKeyFor(entry.name), undefined);
 				ctx.ui.notify(`${prefix}${entry.name} recovery stopped after ${decision.attempts} resume attempts; continue manually (a successful turn re-enables auto-recovery)`, "error");
 			}
 			return;
 		}
 		states.set(entry.name, decision.state);
+		decision.state.simulated = simulated;
 		armTimer(entry.name);
-		pi.appendEntry(ENTRY_TYPE, { state: "waiting", entryName: entry.name, resetAtMs: decision.state.resetAtMs, fireAtMs: decision.state.fireAtMs, attempts: decision.state.attempts, ...(simulated ? { simulated: true } : {}) });
+		pi.appendEntry(ENTRY_TYPE, {
+			state: "waiting",
+			entryName: entry.name,
+			resetAtMs: decision.state.resetAtMs,
+			fireAtMs: decision.state.fireAtMs,
+			attempts: decision.state.attempts,
+			...(decision.state.model !== undefined ? { model: decision.state.model } : {}),
+			...(simulated ? { simulated: true } : {}),
+		});
 		if (ctx.hasUI) {
 			const move = decision.extended ? "limit window moved; now waiting" : "usage limit reached; waiting";
 			ctx.ui.notify(`${prefix}${entry.name} ${move} until ${formatResumeClock(decision.state.fireAtMs)}, then resuming automatically`, decision.extended ? "info" : "warning");
@@ -566,40 +748,22 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 	function retirePendingWait(ctx: ExtensionContext, message: LimitErrorMessage): void {
 		if (config === undefined || typeof message.provider !== "string") return;
 		for (const entry of config.providers) {
-			if (entry.match.provider !== message.provider || !matchesEntryModel(entry.match.model, message.model)) continue;
-			const pending = states.has(entry.name);
+			if (entry.match.provider !== message.provider || !entryModelMatches(entry, message.model)) continue;
+			const pending = states.get(entry.name);
 			const wasDisabled = disabled.has(entry.name);
-			if (!pending && !wasDisabled) continue;
-			if (pending) {
+			if (pending === undefined && !wasDisabled) continue;
+			if (pending !== undefined && pending.model !== undefined && pending.model !== message.model) continue;
+			if (pending !== undefined) {
 				clearTimer(entry.name);
 				states.delete(entry.name);
 			}
 			disabled.delete(entry.name);
 			pi.appendEntry(ENTRY_TYPE, { state: "resolved", entryName: entry.name, resolvedAtMs: Date.now() });
 			if (ctx.hasUI) {
-				ctx.ui.setStatus(STATUS_KEY, undefined);
+				ctx.ui.setStatus(statusKeyFor(entry.name), undefined);
 				ctx.ui.notify(`cooldown: session is processing again; pending ${entry.name} wait retired`, "info");
 			}
 		}
-	}
-
-	function persistedStateFrom(data: unknown): CooldownState | undefined {
-		if (typeof data !== "object" || data === null) return undefined;
-		const record = data as Record<string, unknown>;
-		if (record.state !== "waiting") return undefined;
-		if (record.simulated === true) return undefined;
-		const { entryName, resetAtMs, fireAtMs, attempts } = record;
-		if (!nonEmptyString(entryName) || !isFiniteNumber(resetAtMs) || !isFiniteNumber(fireAtMs) || !isFiniteNumber(attempts)) return undefined;
-		return { entryName, resetAtMs, fireAtMs, attempts };
-	}
-
-	function newestCooldownState(entries: readonly unknown[]): CooldownState | undefined {
-		for (let index = entries.length - 1; index >= 0; index--) {
-			const entry = entries[index] as { type?: string; customType?: string; data?: unknown } | undefined;
-			if (entry === undefined || entry.type !== "custom" || entry.customType !== ENTRY_TYPE) continue;
-			return persistedStateFrom(entry.data);
-		}
-		return undefined;
 	}
 
 	pi.on("session_start", (event, ctx) => {
@@ -607,9 +771,13 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 		clearAllTimers();
 		states.clear();
 		disabled.clear();
+		autoResumeEnabled = config?.autoResume !== false;
 		if (config === undefined) {
 			if (ctx.hasUI) ctx.ui.notify(`cooldown extension is disabled: ${problems.join("; ")}`, "error");
 			return;
+		}
+		if (localOverridePath !== undefined && ctx.hasUI) {
+			ctx.ui.notify(`cooldown config: ${localOverridePath} overrides the tracked default`, "info");
 		}
 		// Reload bypasses resumeOnRestart in both directions: the armed timer
 		// would have fired on its own had /reload not replaced it, so re-arm or
@@ -618,40 +786,47 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 		// visible and cancellable, but an immediate fire into a freshly forked
 		// branch is the surprise the user ruled against; startup, new, and
 		// resume stay fully gated by resumeOnRestart.
-		const decision = planRestartResume(newestCooldownState(ctx.sessionManager.getBranch()), config.resumeOnRestart, Date.now(), event.reason);
-		if (decision.action === "none") return;
-		const entry = entryByName(decision.state.entryName);
-		if (entry === undefined) {
-			persistCancelled(decision.state);
-			if (ctx.hasUI) ctx.ui.notify(`cooldown: persisted wait for "${decision.state.entryName}" matches no configured provider entry; dropping it`, "warning");
-			return;
-		}
-		if (decision.action === "drop") {
-			// The gate's outcome is persisted as a superseding tombstone so a
-			// later /reload cannot re-adjudicate this entry under its bypass and
-			// fire what the gate withheld. The notify path stays available in
-			// every mode: it is how a headless run still records the drop.
-			persistCancelled(decision.state, decision.gate);
-			if (ctx.hasUI) {
-				ctx.ui.setStatus(STATUS_KEY, undefined);
-				const gateNote = decision.gate === "fork" ? "not auto-resumed into a freshly forked session" : "not auto-resumed (resumeOnRestart: false)";
-				ctx.ui.notify(`cooldown: pending ${decision.state.entryName} wait from the previous session is ${gateNote}; deadline was ${formatResumeClock(decision.state.fireAtMs)}; send a message to continue`, "info");
+		for (const state of collectPendingWaits(ctx.sessionManager.getBranch())) {
+			let decision = planRestartResume(state, config.resumeOnRestart, Date.now(), event.reason);
+			if (!autoResumeEnabled && (decision.action === "rearm" || decision.action === "resume_now")) {
+				decision = { action: "drop", state: decision.state, gate: "autoResume" };
 			}
-			return;
+			if (decision.action === "none") continue;
+			const entry = entryByName(decision.state.entryName);
+			if (entry === undefined) {
+				persistCancelled(decision.state);
+				if (ctx.hasUI) ctx.ui.notify(`cooldown: persisted wait for "${decision.state.entryName}" matches no configured provider entry; dropping it`, "warning");
+				continue;
+			}
+			if (decision.action === "drop") {
+				// The gate's outcome is persisted as a superseding tombstone so a
+				// later /reload cannot re-adjudicate this entry under its bypass and
+				// fire what the gate withheld. The notify path stays available in
+				// every mode: it is how a headless run still records the drop.
+				persistCancelled(decision.state, decision.gate);
+				if (ctx.hasUI) {
+					ctx.ui.setStatus(statusKeyFor(decision.state.entryName), undefined);
+					const gateNote = decision.gate === "fork" ? "not auto-resumed into a freshly forked session"
+						: decision.gate === "autoResume" ? "not auto-resumed (autoResume: false)"
+						: "not auto-resumed (resumeOnRestart: false)";
+					ctx.ui.notify(`cooldown: pending ${decision.state.entryName} wait from the previous session is ${gateNote}; deadline was ${formatResumeClock(decision.state.fireAtMs)}; send a message to continue`, "info");
+				}
+				continue;
+			}
+			// Arming or firing on the restart path is guarded to interactive
+			// surfaces (tui, rpc) so an opted-in headless run stays inert, matching
+			// the "wait for me" ruling for one-shot processes; the persisted wait
+			// itself stays untouched.
+			if (ctx.mode !== "tui" && ctx.mode !== "rpc") continue;
+			states.set(entry.name, decision.state);
+			armTimer(entry.name);
+			if (decision.action === "rearm") {
+				updateStatus(entry.name);
+				if (ctx.hasUI) ctx.ui.notify(`cooldown: re-armed pending ${entry.name} wait from the previous session; resuming at ${formatResumeClock(decision.state.fireAtMs)}`, "info");
+				continue;
+			}
+			if (ctx.hasUI) ctx.ui.notify(`cooldown: pending ${entry.name} wait from the previous session is past its deadline; resuming now`, "info");
 		}
-		// Arming or firing on the restart path is guarded to interactive
-		// surfaces (tui, rpc) so an opted-in headless run stays inert, matching
-		// the "wait for me" ruling for one-shot processes; the persisted wait
-		// itself stays untouched.
-		if (ctx.mode !== "tui" && ctx.mode !== "rpc") return;
-		states.set(entry.name, decision.state);
-		armTimer(entry.name);
-		if (decision.action === "rearm") {
-			updateStatus(entry.name);
-			if (ctx.hasUI) ctx.ui.notify(`cooldown: re-armed pending ${entry.name} wait from the previous session; resuming at ${formatResumeClock(decision.state.fireAtMs)}`, "info");
-			return;
-		}
-		if (ctx.hasUI) ctx.ui.notify(`cooldown: pending ${entry.name} wait from the previous session is past its deadline; resuming now`, "info");
 	});
 
 	pi.on("message_end", (event, ctx) => {
@@ -687,7 +862,8 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 		if (!ctx.hasUI) return;
 		if (states.size === 0) {
 			const suffix = disabled.size > 0 ? ` (auto-recovery disabled for ${[...disabled].join(", ")} until the next successful turn)` : "";
-			ctx.ui.notify(`cooldown: no pending usage-limit wait${suffix}`, "info");
+			const offNote = autoResumeEnabled ? "" : " (auto-recovery is off; /cooldown on re-enables)";
+			ctx.ui.notify(`cooldown: no pending usage-limit wait${suffix}${offNote}`, "info");
 			return;
 		}
 		for (const [entryName, state] of states) {
@@ -703,16 +879,29 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 		for (const [entryName, state] of states) {
 			clearTimer(entryName);
 			persistCancelled(state);
+			if (ctx.hasUI) ctx.ui.setStatus(statusKeyFor(entryName), undefined);
 		}
 		states.clear();
 		if (ctx.hasUI) {
-			ctx.ui.setStatus(STATUS_KEY, undefined);
 			ctx.ui.notify("cooldown: cancelled the pending usage-limit wait(s)", "info");
 		}
 	}
 
+	function disableAutoResume(ctx: ExtensionContext): void {
+		autoResumeEnabled = false;
+		for (const [entryName] of states) {
+			clearTimer(entryName);
+			if (ctx.hasUI) ctx.ui.setStatus(statusKeyFor(entryName), undefined);
+		}
+		// The cancels stay in memory on purpose, unlike /cooldown cancel's
+		// tombstones: the switch itself does not survive a restart, so a
+		// restart must still be able to re-adjudicate the untouched persistence.
+		states.clear();
+		if (ctx.hasUI) ctx.ui.notify("cooldown: auto-recovery is off for this session; pending waits cancelled; they return after a reload unless autoResume is disabled; a restart re-adjudicates them under resumeOnRestart; /cooldown on re-enables", "info");
+	}
+
 	pi.registerCommand("cooldown", {
-		description: "Show or cancel the pending usage-limit cooldown",
+		description: "Show, cancel, or switch the pending usage-limit cooldown",
 		handler: async (args, ctx) => {
 			if (!requireConfig(ctx)) return;
 			const arg = (args ?? "").trim().toLowerCase();
@@ -720,11 +909,20 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 				cancelPending(ctx);
 				return;
 			}
+			if (arg === "off") {
+				disableAutoResume(ctx);
+				return;
+			}
+			if (arg === "on") {
+				autoResumeEnabled = true;
+				if (ctx.hasUI) ctx.ui.notify("cooldown: auto-recovery is on for this session", "info");
+				return;
+			}
 			if (arg === "") {
 				showStatus(ctx);
 				return;
 			}
-			if (ctx.hasUI) ctx.ui.notify("cooldown: use '/cooldown' for status or '/cooldown cancel' to abort the pending wait", "info");
+			if (ctx.hasUI) ctx.ui.notify("cooldown: use '/cooldown' for status, '/cooldown off' or '/cooldown on' for the session switch, or '/cooldown cancel' to abort the pending wait", "info");
 		},
 	});
 
@@ -748,6 +946,16 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 			}
 			if (text === "") {
 				if (ctx.hasUI) ctx.ui.notify("cooldown-simulate: pass the provider error text after the entry name", "info");
+				return;
+			}
+			// The mutation target is whatever the real arming path resolves from
+			// this entry's match, not the named entry itself: overlapping
+			// same-provider patterns put the live real wait on a broader earlier
+			// entry, and that wait is what a simulation would move.
+			const target = findCooldownEntry(config, entry.match.provider, entry.match.model) ?? entry;
+			const live = states.get(target.name);
+			if (live !== undefined && live.simulated !== true) {
+				if (ctx.hasUI) ctx.ui.notify(`cooldown-simulate: ${target.name} already holds a live usage-limit wait; simulating would move the real deadline, so cancel it first with /cooldown cancel`, "warning");
 				return;
 			}
 			handleLimitError(ctx, { role: "assistant", stopReason: "error", errorMessage: text, provider: entry.match.provider, model: entry.match.model }, true);

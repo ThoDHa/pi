@@ -45,11 +45,11 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-const { default: createCooldownExtension, ENTRY_TYPE, STATUS_KEY, loadCooldownConfig, validateCooldownConfig, findCooldownEntry, matchesEntryModel, parseResetEpochMs, planCooldownArm, planRestartResume, formatResumeClock, formatCountdown } = await import("../extensions/cooldown.ts");
+const { default: createCooldownExtension, ENTRY_TYPE, statusKeyFor, collectPendingWaits, loadCooldownConfig, loadCooldownConfigWithLocalOverride, validateCooldownConfig, findCooldownEntry, matchesEntryModel, parseResetEpochMs, planCooldownArm, planRestartResume, formatResumeClock, formatCountdown } = await import("../extensions/cooldown.ts");
 
 const ZAI_OFFSET_MINUTES = 480;
 const VERBATIM_1308 = 'Error: 429: {"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-11-23 06:58:41"}';
@@ -71,6 +71,29 @@ const MINUTES = 60_000;
 const now = Date.now();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Recording setInterval/clearInterval spies for the duration of run; originals restored even when run throws. */
+async function withIntervalSpy(run) {
+	const realSetInterval = global.setInterval;
+	const realClearInterval = global.clearInterval;
+	const created = [];
+	const cleared = [];
+	global.setInterval = (callback, ms) => {
+		const handle = realSetInterval(callback, ms);
+		created.push({ handle, ms });
+		return handle;
+	};
+	global.clearInterval = (handle) => {
+		cleared.push(handle);
+		return realClearInterval(handle);
+	};
+	try {
+		return await run({ created, cleared });
+	} finally {
+		global.setInterval = realSetInterval;
+		global.clearInterval = realClearInterval;
+	}
+}
 
 /** Provider stamps carry no sub-second precision; align test bases so parsed epochs compare exactly. */
 const wholeSecond = (ms) => ms - (ms % 1000);
@@ -102,8 +125,41 @@ function zaiEntry(overrides = {}) {
 	return config.providers[0];
 }
 
+/** The zai entry verbatim plus the synthetic acme entry, for two-entry wiring scenarios. */
+function twoProviderConfig(overrides = {}) {
+	return rawConfig({ providers: [rawConfig().providers[0], ACME_ENTRY], ...overrides });
+}
+
 function assistantError(errorMessage, provider = "zai", model = "glm-5.3") {
 	return { role: "assistant", stopReason: "error", errorMessage, provider, model };
+}
+
+const ACME_OFFSET_MINUTES = -300;
+
+/** A second synthetic provider entry: distinct provider string, distinct error code, same stamp format. */
+const ACME_ENTRY = {
+	name: "acme-pro",
+	match: { provider: "acme" },
+	errorPattern: '"code"\\s*:\\s*"?4290(?![0-9])',
+	resetTimePattern: "your window ends at (\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})",
+	utcOffsetMinutes: -300,
+	bufferMinutes: 2,
+};
+
+/** Render an epoch as an acme wall-clock stamp (UTC-5, the only format the provider sends). */
+function acmeStamp(epochMs) {
+	const shifted = new Date(epochMs + ACME_OFFSET_MINUTES * 60_000);
+	const pad = (value, width = 2) => String(value).padStart(width, "0");
+	return `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())} ${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}:${pad(shifted.getUTCSeconds())}`;
+}
+
+/** A verbatim-shaped acme 4290 error whose reset time is `resetMs`. */
+function acmeFixture(resetMs) {
+	return `Error: 429: {"code":"4290","message":"Acme usage limit reached. Your window ends at ${acmeStamp(resetMs)}"}`;
+}
+
+function acmeError(errorMessage, model = "acme-max") {
+	return { role: "assistant", stopReason: "error", errorMessage, provider: "acme", model };
 }
 
 function waitingState(fireAtMs, attempts = 0, entryName = "zai-glm") {
@@ -117,7 +173,7 @@ function persistedEntry(data) {
 
 // --- mock pi/ctx runtime for wiring tests ------------------------------
 
-function createRuntime({ config, mode = "tui", hasUI = true, tickMs } = {}) {
+function createRuntime({ config, configPath: explicitConfigPath, defaultConfigRoot, mode = "tui", hasUI = true, tickMs } = {}) {
 	const handlers = new Map();
 	const commands = new Map();
 	const sent = [];
@@ -163,12 +219,14 @@ function createRuntime({ config, mode = "tui", hasUI = true, tickMs } = {}) {
 		},
 	};
 	let configPath;
-	if (config !== undefined) {
+	if (explicitConfigPath !== undefined) configPath = explicitConfigPath;
+	else if (config !== undefined) {
 		configPath = path.join(mkdtempSync(path.join(tmpdir(), "cooldown-test-")), "cooldown.json");
 		writeFileSync(configPath, JSON.stringify(config));
 	}
 	const factoryOptions = {};
 	if (configPath !== undefined) factoryOptions.configPath = configPath;
+	if (defaultConfigRoot !== undefined) factoryOptions.defaultConfigRoot = defaultConfigRoot;
 	if (tickMs !== undefined) factoryOptions.tickMs = tickMs;
 	createCooldownExtension(pi, factoryOptions);
 	return { handlers, commands, sent, appended, notifies, statuses, statusCalls, ctx, branchEntries, setIdle: (value) => (idle = value) };
@@ -342,6 +400,79 @@ test("loadCooldownConfig on invalid JSON fails safe with a problem", () => {
 	assert.ok(result.problems.length >= 1);
 });
 
+// --- local config override -----------------------------------------------
+
+/** A tempdir with a tracked default and, when given, a cooldown.local.json (object serializes, string lands verbatim); returns the default path. */
+function tempConfigDir(tracked, local) {
+	const dir = mkdtempSync(path.join(tmpdir(), "cooldown-local-"));
+	const defaultPath = path.join(dir, "cooldown.json");
+	writeFileSync(defaultPath, JSON.stringify(tracked));
+	if (local !== undefined) writeFileSync(path.join(dir, "cooldown.local.json"), typeof local === "string" ? local : JSON.stringify(local));
+	return defaultPath;
+}
+
+const LOCAL_ONLY_CONFIG = {
+	maxResumeAttempts: 2,
+	resumeOnRestart: true,
+	resumePrompt: "local prompt",
+	providers: [{ name: "local-only", match: { provider: "local" }, errorPattern: "limit", resetTimePattern: "at (\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})", utcOffsetMinutes: 0, bufferMinutes: 3 }],
+};
+
+test("a valid local config wholly replaces the tracked default", () => {
+	const defaultPath = tempConfigDir(rawConfig({ defaultBufferMinutes: 7 }), LOCAL_ONLY_CONFIG);
+	const result = loadCooldownConfigWithLocalOverride(defaultPath);
+	assert.equal(result.ok, true);
+	assert.deepEqual(result.config.providers.map((entry) => entry.name), ["local-only"]);
+	assert.equal(result.config.maxResumeAttempts, 2);
+	assert.equal(result.config.resumeOnRestart, true);
+	assert.equal(result.config.resumePrompt, "local prompt");
+	assert.equal(result.config.defaultBufferMinutes, 2, "document-level replacement: the tracked file's 7-minute override must not merge through");
+});
+
+test("an invalid local config leaves the lookup inert naming the local path", () => {
+	const brokenJson = loadCooldownConfigWithLocalOverride(tempConfigDir(rawConfig(), "{ not json"));
+	assert.equal(brokenJson.ok, false);
+	assert.ok(brokenJson.problems.some((problem) => problem.includes("cooldown.local.json")));
+	const schemaInvalid = loadCooldownConfigWithLocalOverride(tempConfigDir(rawConfig(), { providers: [] }));
+	assert.equal(schemaInvalid.ok, false);
+	assert.ok(schemaInvalid.problems.every((problem) => problem.includes("cooldown.local.json")), "schema problems name the local path, not silently the tracked one");
+});
+
+test("an absent local config loads the tracked default exactly as before", () => {
+	const defaultPath = tempConfigDir(rawConfig({ defaultBufferMinutes: 7 }));
+	const result = loadCooldownConfigWithLocalOverride(defaultPath);
+	assert.equal(result.ok, true);
+	assert.equal(result.config.providers[0].name, "zai-glm");
+	assert.equal(result.config.defaultBufferMinutes, 7);
+});
+
+test("an explicit configPath bypasses the local lookup entirely", async () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "cooldown-local-"));
+	const trackedPath = path.join(dir, "cooldown.json");
+	writeFileSync(trackedPath, JSON.stringify(rawConfig()));
+	writeFileSync(path.join(dir, "cooldown.local.json"), JSON.stringify(LOCAL_ONLY_CONFIG));
+	const runtime = createRuntime({ configPath: trackedPath });
+	await startRuntime(runtime);
+	await messageEnd(runtime, { role: "assistant", stopReason: "error", errorMessage: "limit at 2026-01-02 03:04:05", provider: "local", model: "local-model" });
+	assert.equal(runtime.appended.length, 0, "the local file's provider is invisible under an explicit configPath");
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	assert.equal(lastAppend(runtime).data.state, "waiting", "the tracked file's provider armed");
+	await shutdownRuntime(runtime);
+});
+
+test("session_start announces when the local override wins the config lookup", async () => {
+	const dir = path.dirname(tempConfigDir(rawConfig(), rawConfig({ defaultBufferMinutes: 9 })));
+	const runtime = createRuntime({ defaultConfigRoot: dir });
+	await startRuntime(runtime);
+	assert.ok(runtime.notifies.some((notification) => notification.level === "info" && notification.message.includes("cooldown config") && notification.message.includes("cooldown.local.json") && notification.message.includes("override")), "the origin notify names the local path as the active config");
+	await shutdownRuntime(runtime);
+	rmSync(path.join(dir, "cooldown.local.json"), { force: true });
+	const fresh = createRuntime({ defaultConfigRoot: dir });
+	await startRuntime(fresh);
+	assert.ok(!fresh.notifies.some((notification) => notification.message.includes("override")), "no origin notify when the local file is absent");
+	await shutdownRuntime(fresh);
+});
+
 // --- entry matching -----------------------------------------------------
 
 test("findCooldownEntry matches provider exactly and first entry wins", () => {
@@ -374,6 +505,23 @@ test("findCooldownEntry applies the model pattern", () => {
 	});
 	assert.equal(findCooldownEntry(config, "zai", "glm-5.3").name, "glm-only");
 	assert.equal(findCooldownEntry(config, "zai", "other-model"), undefined);
+});
+
+test("validateCooldownConfig compiles the model matcher once onto the resolved entry", () => {
+	const { config } = validateCooldownConfig({
+		providers: [
+			{ name: "glob", match: { provider: "zai", model: "glm-*" }, errorPattern: "a", resetTimePattern: "(\\d{4})", utcOffsetMinutes: 0 },
+			{ name: "exact", match: { provider: "acme", model: "sonnet-4" }, errorPattern: "a", resetTimePattern: "(\\d{4})", utcOffsetMinutes: 0 },
+			{ name: "absent", match: { provider: "openai" }, errorPattern: "a", resetTimePattern: "(\\d{4})", utcOffsetMinutes: 0 },
+		],
+	});
+	assert.ok(config.providers[0].modelMatcher instanceof RegExp, "the glob pattern compiles at validation time");
+	assert.equal(config.providers[0].modelMatcher.test("glm-5.3-flash"), true);
+	assert.equal(config.providers[0].modelMatcher.test("xglm-5.3"), false);
+	assert.ok(config.providers[1].modelMatcher instanceof RegExp, "the exact pattern compiles to its anchored literal");
+	assert.equal(config.providers[1].modelMatcher.test("sonnet-4"), true);
+	assert.equal(config.providers[1].modelMatcher.test("sonnet-4.5"), false);
+	assert.equal(config.providers[2].modelMatcher, undefined, "an absent model pattern needs no matcher");
 });
 
 // --- reset time parsing -------------------------------------------------
@@ -553,6 +701,19 @@ test("a 1308 whose reset time fails to parse reports parse_failed with the entry
 	assert.equal(decision.entry.name, "zai-glm");
 });
 
+test("a fresh arm pins the errored model and a re-arm re-pins to the newest error", () => {
+	const { config } = validateCooldownConfig(rawConfig());
+	const fresh = planCooldownArm(config, assistantError(VERBATIM_1308, "zai", "glm-5.3"), undefined, now);
+	assert.equal(fresh.action, "arm");
+	assert.equal(fresh.state.model, "glm-5.3");
+	const rearm = planCooldownArm(config, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES), "zai", "glm-5.3-flash"), fresh.state, now);
+	assert.equal(rearm.action, "arm");
+	assert.equal(rearm.state.model, "glm-5.3-flash", "the newest errored model owns the pin");
+	const bare = planCooldownArm(config, { role: "assistant", stopReason: "error", errorMessage: VERBATIM_1308, provider: "zai" }, undefined, now);
+	assert.equal(bare.action, "arm");
+	assert.equal(bare.state.model, undefined, "a message without a model id arms without a pin");
+});
+
 // --- planRestartResume (restart decision table) --------------------------
 
 test("no persisted state means no restart action", () => {
@@ -600,6 +761,63 @@ test("startup and resume stay gated by resumeOnRestart and name that gate when d
 	const dropped = planRestartResume(waitingState(now + MINUTES, 0), false, now, "startup");
 	assert.equal(dropped.action, "drop");
 	assert.equal(dropped.gate, "resumeOnRestart");
+});
+
+// --- collectPendingWaits (restart scan) ----------------------------------
+
+test("collectPendingWaits collects a newest real waiting entry", () => {
+	const state = { entryName: "zai-glm", resetAtMs: now + 5 * MINUTES, fireAtMs: now + 7 * MINUTES, attempts: 1 };
+	assert.deepEqual(collectPendingWaits([persistedEntry({ state: "waiting", ...state })]), [state]);
+});
+
+test("collectPendingWaits: a newest terminal entry hides only its own name", () => {
+	const waiting = { state: "waiting", entryName: "zai-glm", resetAtMs: now - 5 * MINUTES, fireAtMs: now - 2 * MINUTES, attempts: 1 };
+	const terminals = [
+		{ state: "fired", entryName: "zai-glm", attempts: 2 },
+		{ state: "cancelled", entryName: "zai-glm", gate: "resumeOnRestart" },
+		{ state: "cancelled", entryName: "zai-glm", gate: "fork" },
+		{ state: "capped", entryName: "zai-glm", attempts: 5 },
+		{ state: "resolved", entryName: "zai-glm" },
+	];
+	for (const terminal of terminals) {
+		assert.deepEqual(collectPendingWaits([persistedEntry(waiting), persistedEntry(terminal)]), [], `a newest ${terminal.state} record must decide its name as no-wait`);
+	}
+});
+
+test("collectPendingWaits decides per entry name: one name's tombstone hides only that name", () => {
+	const zaiWait = { entryName: "zai-glm", resetAtMs: now + 5 * MINUTES, fireAtMs: now + 7 * MINUTES, attempts: 0 };
+	assert.deepEqual(
+		collectPendingWaits([
+			persistedEntry({ state: "waiting", ...zaiWait }),
+			persistedEntry({ state: "waiting", entryName: "acme-pro", resetAtMs: now + 10 * MINUTES, fireAtMs: now + 12 * MINUTES, attempts: 0 }),
+			persistedEntry({ state: "resolved", entryName: "acme-pro" }),
+		]),
+		[zaiWait],
+	);
+});
+
+test("collectPendingWaits: a malformed newest entry with a readable name decides it as no-wait", () => {
+	const waiting = persistedEntry({ state: "waiting", entryName: "zai-glm", resetAtMs: now + 5 * MINUTES, fireAtMs: now + 7 * MINUTES, attempts: 0 });
+	const malformed = persistedEntry({ state: "waiting", entryName: "zai-glm", fireAtMs: "not-a-number", attempts: 0 });
+	assert.deepEqual(collectPendingWaits([waiting, malformed]), []);
+});
+
+test("collectPendingWaits: a cooldown record with no readable entryName is unattributable and decides nothing", () => {
+	const state = { entryName: "zai-glm", resetAtMs: now + 5 * MINUTES, fireAtMs: now + 7 * MINUTES, attempts: 0 };
+	assert.deepEqual(collectPendingWaits([{ type: "custom", customType: ENTRY_TYPE, data: { state: "waiting" } }, persistedEntry({ state: "waiting", ...state })]), [state]);
+});
+
+test("collectPendingWaits: a newest simulated waiting entry decides its own name as no-re-arm", () => {
+	const real = { state: "waiting", entryName: "zai-glm", resetAtMs: now - 5 * MINUTES, fireAtMs: now - 2 * MINUTES, attempts: 1 };
+	const simulated = { state: "waiting", entryName: "zai-glm", resetAtMs: now + 5 * MINUTES, fireAtMs: now + 7 * MINUTES, attempts: 0, simulated: true };
+	assert.deepEqual(collectPendingWaits([persistedEntry(real), persistedEntry(simulated)]), []);
+	assert.deepEqual(collectPendingWaits([persistedEntry(simulated), persistedEntry(real)]).length, 1, "a newer real entry decides its name");
+});
+
+test("collectPendingWaits returns waits in branch order for deterministic adjudication", () => {
+	const acmeWait = { entryName: "acme-pro", resetAtMs: now + 10 * MINUTES, fireAtMs: now + 12 * MINUTES, attempts: 0 };
+	const zaiWait = { entryName: "zai-glm", resetAtMs: now + 5 * MINUTES, fireAtMs: now + 7 * MINUTES, attempts: 0 };
+	assert.deepEqual(collectPendingWaits([persistedEntry({ state: "waiting", ...acmeWait }), persistedEntry({ state: "waiting", ...zaiWait })]), [acmeWait, zaiWait]);
 });
 
 // --- wiring: registration and fail-safe ---------------------------------
@@ -663,7 +881,7 @@ test("a 1308 on message_end arms: status set, waiting entry persisted, warning n
 	const runtime = createRuntime();
 	await startRuntime(runtime);
 	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now))));
-	const status = runtime.statuses.get(STATUS_KEY);
+	const status = runtime.statuses.get(statusKeyFor("zai-glm"));
 	assert.ok(status, "footer status must be set");
 	assert.ok(status.includes("zai-glm"));
 	const append = lastAppend(runtime);
@@ -687,7 +905,7 @@ test("the armed timer fires and resumes with the entry resume prompt", async () 
 	assert.equal(append.data.state, "fired");
 	assert.equal(append.data.attempts, 1);
 	assert.ok(runtime.notifies.some((notification) => notification.level === "info" && /attempt 1\/5/.test(notification.message)));
-	assert.equal(runtime.statuses.has(STATUS_KEY), false, "status clears at fire time");
+	assert.equal(runtime.statuses.has(statusKeyFor("zai-glm")), false, "status clears at fire time");
 });
 
 test("a busy session at fire time resumes as a followUp", async () => {
@@ -730,9 +948,9 @@ test("a successful assistant message from the same provider retires the pending 
 	const runtime = createRuntime();
 	await startRuntime(runtime);
 	await messageEnd(runtime, assistantError(fixture1308(now + 60 - 120 * MINUTES)));
-	assert.ok(runtime.statuses.has(STATUS_KEY));
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")));
 	await messageEnd(runtime, { role: "assistant", stopReason: "stop", errorMessage: undefined, provider: "zai", model: "glm-5.3" });
-	assert.equal(runtime.statuses.has(STATUS_KEY), false);
+	assert.equal(runtime.statuses.has(statusKeyFor("zai-glm")), false);
 	assert.equal(lastAppend(runtime).data.state, "resolved");
 	await sleep(150);
 	assert.equal(runtime.sent.length, 0, "the pending timer must not fire after retirement");
@@ -743,7 +961,7 @@ test("a deadline beyond the timeout cap chains instead of firing early", async (
 	await startRuntime(runtime);
 	await messageEnd(runtime, assistantError(fixture1308(now + 30 * 24 * 60 * MINUTES)));
 	assert.equal(lastAppend(runtime).data.state, "waiting");
-	assert.ok(runtime.statuses.has(STATUS_KEY));
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")));
 	await sleep(120);
 	assert.equal(runtime.sent.length, 0, "node fires over-cap delays immediately; the chained timer must not");
 	await shutdownRuntime(runtime);
@@ -755,7 +973,7 @@ test("an aborted or foreign-provider success does not retire the pending wait", 
 	await messageEnd(runtime, assistantError(fixture1308(now + 60 - 120 * MINUTES)));
 	await messageEnd(runtime, { role: "assistant", stopReason: "aborted", provider: "zai", model: "glm-5.3" });
 	await messageEnd(runtime, { role: "assistant", stopReason: "stop", provider: "anthropic", model: "claude-opus" });
-	assert.equal(runtime.statuses.has(STATUS_KEY), true, "pending wait survives unrelated successes");
+	assert.equal(runtime.statuses.has(statusKeyFor("zai-glm")), true, "pending wait survives unrelated successes");
 	await shutdownRuntime(runtime);
 });
 
@@ -779,7 +997,7 @@ test("hitting maxResumeAttempts notifies error, persists capped, and stops retry
 	await messageEnd(runtime, assistantError(fixture1308(now + 60 - 120 * MINUTES)));
 	assert.ok(runtime.notifies.some((notification) => notification.level === "error" && notification.message.includes("zai-glm")));
 	assert.equal(lastAppend(runtime).data.state, "capped");
-	assert.equal(runtime.statuses.has(STATUS_KEY), false);
+	assert.equal(runtime.statuses.has(statusKeyFor("zai-glm")), false);
 	await sleep(150);
 	assert.equal(runtime.sent.length, 1, "the capped wait must not re-arm or re-send");
 	await messageEnd(runtime, assistantError(fixture1308(now + 60 - 120 * MINUTES)));
@@ -791,6 +1009,134 @@ test("hitting maxResumeAttempts notifies error, persists capped, and stops retry
 	await shutdownRuntime(runtime);
 });
 
+// --- wiring: multi-entry status keys -------------------------------------
+
+test("two concurrently armed entries render under their own per-entry status keys", async () => {
+	const runtime = createRuntime({ config: twoProviderConfig() });
+	await startRuntime(runtime);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	await messageEnd(runtime, acmeError(acmeFixture(wholeSecond(now) + 40 * MINUTES)));
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")), "the zai wait renders under its own key");
+	assert.ok(runtime.statuses.has(statusKeyFor("acme-pro")), "the acme wait renders under its own key");
+	await shutdownRuntime(runtime);
+});
+
+test("each entry's tick writes only its own key with its own countdown", async () => {
+	const runtime = createRuntime({ config: twoProviderConfig(), tickMs: 20 });
+	await startRuntime(runtime);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	await messageEnd(runtime, acmeError(acmeFixture(wholeSecond(now) + 40 * MINUTES)));
+	await sleep(70);
+	const ticked = new Set();
+	for (const call of runtime.statusCalls) {
+		const entryName = call.key === statusKeyFor("zai-glm") ? "zai-glm" : call.key === statusKeyFor("acme-pro") ? "acme-pro" : undefined;
+		assert.ok(entryName !== undefined, `every status write targets a per-entry key, got ${JSON.stringify(call.key)}`);
+		assert.ok(call.text.includes(entryName), "the write's text belongs to the key's entry");
+		ticked.add(entryName);
+	}
+	assert.ok(ticked.has("zai-glm") && ticked.has("acme-pro"), "both entries tick their own keys");
+	await shutdownRuntime(runtime);
+});
+
+test("firing one entry clears only its own key and leaves the survivor's segment intact", async () => {
+	const runtime = createRuntime({ config: twoProviderConfig() });
+	await startRuntime(runtime);
+	await messageEnd(runtime, acmeError(acmeFixture(wholeSecond(now) + 60 * MINUTES)));
+	await messageEnd(runtime, assistantError(fixture1308(now + 60 - 120 * MINUTES)));
+	await sleep(150);
+	assert.equal(runtime.sent.length, 1, "the near-deadline zai wait fired");
+	assert.equal(runtime.statuses.has(statusKeyFor("zai-glm")), false, "the fired entry's key cleared");
+	assert.ok(runtime.statuses.has(statusKeyFor("acme-pro")), "the survivor's segment is intact");
+	await shutdownRuntime(runtime);
+});
+
+test("a success from one provider retires only its entry's wait and key", async () => {
+	const runtime = createRuntime({ config: twoProviderConfig() });
+	await startRuntime(runtime);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	await messageEnd(runtime, acmeError(acmeFixture(wholeSecond(now) + 40 * MINUTES)));
+	await messageEnd(runtime, { role: "assistant", stopReason: "stop", provider: "zai", model: "glm-5.3" });
+	assert.equal(runtime.statuses.has(statusKeyFor("zai-glm")), false, "the retired entry's key cleared");
+	assert.ok(runtime.statuses.has(statusKeyFor("acme-pro")), "the other provider's segment is intact");
+	const resolved = runtime.appended.filter((append) => append.data.state === "resolved");
+	assert.equal(resolved.length, 1, "exactly one entry resolved");
+	assert.equal(resolved[0].data.entryName, "zai-glm");
+	await sleep(150);
+	assert.equal(runtime.sent.length, 0, "the retired timer must not fire");
+	await shutdownRuntime(runtime);
+});
+
+test("capping one entry clears only its key and leaves the other segment armed", async () => {
+	const runtime = createRuntime({ config: twoProviderConfig({ maxResumeAttempts: 1 }) });
+	await startRuntime(runtime);
+	await messageEnd(runtime, acmeError(acmeFixture(wholeSecond(now) + 60 * MINUTES)));
+	await messageEnd(runtime, assistantError(fixture1308(now + 60 - 120 * MINUTES)));
+	await sleep(150);
+	assert.equal(runtime.sent.length, 1);
+	await messageEnd(runtime, assistantError(fixture1308(now + 60 - 120 * MINUTES)));
+	assert.equal(lastAppend(runtime).data.state, "capped");
+	assert.equal(lastAppend(runtime).data.entryName, "zai-glm");
+	assert.equal(runtime.statuses.has(statusKeyFor("zai-glm")), false, "the capped entry's key cleared");
+	assert.ok(runtime.statuses.has(statusKeyFor("acme-pro")), "the capped entry's cap does not erase the other segment");
+	await shutdownRuntime(runtime);
+});
+
+test("cancelling clears both per-entry keys and persists one tombstone per pending entry", async () => {
+	const runtime = createRuntime({ config: twoProviderConfig() });
+	await startRuntime(runtime);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	await messageEnd(runtime, acmeError(acmeFixture(wholeSecond(now) + 40 * MINUTES)));
+	await runtime.commands.get("cooldown").handler("cancel", runtime.ctx);
+	assert.equal(runtime.statuses.has(statusKeyFor("zai-glm")), false);
+	assert.equal(runtime.statuses.has(statusKeyFor("acme-pro")), false);
+	const cancelled = runtime.appended.filter((append) => append.data.state === "cancelled");
+	assert.equal(cancelled.length, 2, "cancel persists one tombstone per pending entry");
+	await sleep(150);
+	assert.equal(runtime.sent.length, 0, "cancelled timers must not fire");
+});
+
+test("a success from a different model leaves a model-pinned wait armed with its timer intact", async () => {
+	const runtime = createRuntime();
+	await startRuntime(runtime);
+	await messageEnd(runtime, assistantError(fixture1308(now + 60 - 120 * MINUTES)));
+	await messageEnd(runtime, { role: "assistant", stopReason: "stop", provider: "zai", model: "glm-5.3-flash" });
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")), "the pinned wait survives a different model's success");
+	assert.equal(lastAppend(runtime).data.state, "waiting", "no resolved record landed");
+	await sleep(150);
+	assert.equal(runtime.sent.length, 1, "the armed timer kept its deadline and fired");
+});
+
+test("a success from the pinned model retires the wait", async () => {
+	const runtime = createRuntime();
+	await startRuntime(runtime);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	await messageEnd(runtime, { role: "assistant", stopReason: "stop", provider: "zai", model: "glm-5.3" });
+	assert.equal(runtime.statuses.has(statusKeyFor("zai-glm")), false);
+	assert.equal(lastAppend(runtime).data.state, "resolved");
+	await sleep(150);
+	assert.equal(runtime.sent.length, 0);
+});
+
+test("a persisted pinned wait keeps its pin across reload", async () => {
+	const runtime = createRuntime({ config: rawConfig({ resumeOnRestart: true }) });
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "zai-glm", resetAtMs: now + 30 * MINUTES, fireAtMs: now + 32 * MINUTES, attempts: 1, model: "glm-5.3" }));
+	await startRuntime(runtime, "startup");
+	await messageEnd(runtime, { role: "assistant", stopReason: "stop", provider: "zai", model: "glm-5.3-flash" });
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")), "the reloaded pin still filters retirements");
+	await shutdownRuntime(runtime);
+});
+
+test("a wait armed without a model id retires on any matching-entry success", async () => {
+	const runtime = createRuntime({ config: rawConfig({ resumeOnRestart: true }) });
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "zai-glm", resetAtMs: now + 30 * MINUTES, fireAtMs: now + 32 * MINUTES, attempts: 1 }));
+	await startRuntime(runtime, "startup");
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")));
+	await messageEnd(runtime, { role: "assistant", stopReason: "stop", provider: "zai", model: "glm-5.3-flash" });
+	assert.equal(runtime.statuses.has(statusKeyFor("zai-glm")), false, "the unpinned wait retires entry-scoped");
+	assert.equal(lastAppend(runtime).data.state, "resolved");
+	await shutdownRuntime(runtime);
+});
+
 // --- wiring: restart re-arm ----------------------------------------------
 
 test("restart with a future deadline and resumeOnRestart re-arms and fires later", async () => {
@@ -798,7 +1144,7 @@ test("restart with a future deadline and resumeOnRestart re-arms and fires later
 	const base = wholeSecond(Date.now());
 	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "zai-glm", resetAtMs: base + 1500 - 120 * MINUTES, fireAtMs: base + 1500, attempts: 2 }));
 	await startRuntime(runtime, "resume");
-	assert.ok(runtime.statuses.has(STATUS_KEY), "re-arm restores the footer status");
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")), "re-arm restores the footer status");
 	assert.ok(runtime.notifies.some((notification) => notification.message.includes("re-armed")));
 	await sleep(1600);
 	assert.equal(runtime.sent.length, 1);
@@ -823,10 +1169,20 @@ test("restart with resumeOnRestart false drops the status and waits for the user
 	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "zai-glm", resetAtMs: now + 60 * MINUTES, fireAtMs: now + 62 * MINUTES, attempts: 1 }));
 	await startRuntime(runtime, "resume");
 	assert.equal(runtime.sent.length, 0);
-	assert.equal(runtime.statuses.has(STATUS_KEY), false);
+	assert.equal(runtime.statuses.has(statusKeyFor("zai-glm")), false);
 	assert.ok(runtime.notifies.some((notification) => notification.level === "info" && notification.message.includes("resumeOnRestart")));
 	await sleep(60);
 	assert.equal(runtime.sent.length, 0);
+});
+
+test("a gated drop under hasUI false lands the tombstone and notifies nothing", async () => {
+	const runtime = createRuntime({ hasUI: false });
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "zai-glm", resetAtMs: now + 60 * MINUTES, fireAtMs: now + 62 * MINUTES, attempts: 1 }));
+	await startRuntime(runtime, "resume");
+	assert.equal(runtime.notifies.length, 0, "a headless run records the drop without notifies");
+	assert.equal(lastAppend(runtime).data.state, "cancelled", "the gate's tombstone still lands");
+	assert.equal(lastAppend(runtime).data.gate, "resumeOnRestart");
+	await shutdownRuntime(runtime);
 });
 
 test("restart scans only waiting entries: a newest fired entry means no resume", async () => {
@@ -853,7 +1209,7 @@ test("a mid-session reload re-arms from the persisted entry even with resumeOnRe
 	const base = wholeSecond(Date.now());
 	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "zai-glm", resetAtMs: base + 1500 - 120 * MINUTES, fireAtMs: base + 1500, attempts: 1 }));
 	await startRuntime(runtime, "reload");
-	assert.ok(runtime.statuses.has(STATUS_KEY), "reload re-arm restores the footer status");
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")), "reload re-arm restores the footer status");
 	assert.ok(runtime.notifies.some((notification) => notification.message.includes("re-armed")));
 	await sleep(1700);
 	assert.equal(runtime.sent.length, 1, "the re-armed wait fires after the reload");
@@ -892,7 +1248,7 @@ test("a real wait persisted after a simulated one still re-arms on reload", asyn
 	runtime.statuses.clear();
 	await startRuntime(runtime, "reload");
 	assert.ok(runtime.notifies.some((notification) => notification.message.includes("re-armed")), "the newest real waiting entry still re-arms");
-	assert.ok(runtime.statuses.has(STATUS_KEY));
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")));
 	await shutdownRuntime(runtime);
 });
 
@@ -916,7 +1272,7 @@ test("fork re-arms a future deadline mid-session and drops a past one", async ()
 	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "zai-glm", resetAtMs: wholeSecond(Date.now()) + 60_000 - 120 * MINUTES, fireAtMs: wholeSecond(Date.now()) + 60_000, attempts: 1 }));
 	await startRuntime(runtime, "fork");
 	assert.ok(runtime.notifies.some((notification) => notification.message.includes("re-armed")), "fork re-arms the future deadline without resumeOnRestart");
-	assert.ok(runtime.statuses.has(STATUS_KEY));
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")));
 	await shutdownRuntime(runtime);
 
 	const pastRuntime = createRuntime({ config: rawConfig({ resumeOnRestart: true }) });
@@ -1008,6 +1364,53 @@ test("the gated drop path is not mode-guarded: print mode still tombstones and n
 	assert.equal(runtime.sent.length, 0);
 });
 
+// --- wiring: multi-entry restart scan ------------------------------------
+
+test("a waiting entry behind another entry's resolved tombstone re-arms on restart", async () => {
+	const runtime = createRuntime({ config: twoProviderConfig({ resumeOnRestart: true }) });
+	const base = wholeSecond(Date.now());
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "zai-glm", resetAtMs: base + 1500 - 120 * MINUTES, fireAtMs: base + 1500, attempts: 1 }));
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "acme-pro", resetAtMs: base + 1500 - 120 * MINUTES, fireAtMs: base + 1500, attempts: 1 }));
+	runtime.branchEntries.push(persistedEntry({ state: "resolved", entryName: "acme-pro" }));
+	await startRuntime(runtime, "startup");
+	assert.ok(runtime.notifies.some((notification) => notification.message.includes("re-armed") && notification.message.includes("zai-glm")), "the older zai wait re-arms behind acme's resolved tombstone");
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")));
+	assert.equal(runtime.notifies.some((notification) => notification.message.includes("acme-pro")), false, "the resolved acme name stays dead");
+	await sleep(1600);
+	assert.equal(runtime.sent.length, 1, "the re-armed zai wait fires");
+	assert.equal(lastAppend(runtime).data.entryName, "zai-glm");
+	await shutdownRuntime(runtime);
+});
+
+test("a gated-drop tombstone for one name leaves another name's wait adjudicable", async () => {
+	const runtime = createRuntime({ config: twoProviderConfig({ resumeOnRestart: true }) });
+	const base = wholeSecond(Date.now());
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "acme-pro", resetAtMs: now - 5 * MINUTES, fireAtMs: now - 2 * MINUTES, attempts: 1 }));
+	runtime.branchEntries.push(persistedEntry({ state: "cancelled", entryName: "acme-pro", gate: "fork", fireAtMs: now - 2 * MINUTES, attempts: 1 }));
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "zai-glm", resetAtMs: base + 1500 - 120 * MINUTES, fireAtMs: base + 1500, attempts: 0 }));
+	await startRuntime(runtime, "startup");
+	assert.ok(runtime.notifies.some((notification) => notification.message.includes("re-armed") && notification.message.includes("zai-glm")), "the zai wait re-arms beside the acme tombstone");
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")));
+	assert.equal(runtime.notifies.some((notification) => notification.message.includes("forked")), false, "the fork tombstone is not re-adjudicated");
+	assert.equal(runtime.appended.length, 0, "the tombstone name lands no new records");
+	await shutdownRuntime(runtime);
+});
+
+test("a newest simulated waiting entry hides only its own name on reload", async () => {
+	const runtime = createRuntime({ config: twoProviderConfig({ resumeOnRestart: true }) });
+	const base = wholeSecond(Date.now());
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "acme-pro", resetAtMs: base + 1500 - 120 * MINUTES, fireAtMs: base + 1500, attempts: 1 }));
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "zai-glm", resetAtMs: base + 1500 - 120 * MINUTES, fireAtMs: base + 1500, attempts: 0, simulated: true }));
+	await startRuntime(runtime, "reload");
+	assert.ok(runtime.notifies.some((notification) => notification.message.includes("re-armed") && notification.message.includes("acme-pro")), "the real acme wait re-arms behind the simulated zai entry");
+	assert.ok(runtime.statuses.has(statusKeyFor("acme-pro")));
+	assert.equal(runtime.statuses.has(statusKeyFor("zai-glm")), false, "the simulated zai name does not re-arm");
+	await sleep(1600);
+	assert.equal(runtime.sent.length, 1, "the acme timer fires");
+	assert.equal(lastAppend(runtime).data.entryName, "acme-pro");
+	await shutdownRuntime(runtime);
+});
+
 // --- wiring: commands ------------------------------------------------------
 
 test("/cooldown reports pending state, and cancel aborts it", async () => {
@@ -1019,7 +1422,7 @@ test("/cooldown reports pending state, and cancel aborts it", async () => {
 	await runtime.commands.get("cooldown").handler("", runtime.ctx);
 	assert.ok(runtime.notifies.some((notification) => notification.message.includes("zai-glm")));
 	await runtime.commands.get("cooldown").handler("cancel", runtime.ctx);
-	assert.equal(runtime.statuses.has(STATUS_KEY), false);
+	assert.equal(runtime.statuses.has(statusKeyFor("zai-glm")), false);
 	assert.equal(lastAppend(runtime).data.state, "cancelled");
 	await sleep(150);
 	assert.equal(runtime.sent.length, 0, "cancelled waits never fire");
@@ -1034,7 +1437,7 @@ test("/cooldown-simulate drives the real detection path end to end", async () =>
 	await startRuntime(runtime);
 	const text = fixture1308(now + 60 - 120 * MINUTES);
 	await runtime.commands.get("cooldown-simulate").handler(`zai-glm ${text}`, runtime.ctx);
-	assert.ok(runtime.statuses.has(STATUS_KEY), "simulate arms through the real path");
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")), "simulate arms through the real path");
 	assert.ok(runtime.notifies.some((notification) => notification.message.includes("simulated")));
 	await sleep(120);
 	assert.equal(runtime.sent.length, 1);
@@ -1044,7 +1447,7 @@ test("/cooldown-simulate defaults to the first entry and explains non-matching t
 	const runtime = createRuntime();
 	await startRuntime(runtime);
 	await runtime.commands.get("cooldown-simulate").handler(fixture1308(wholeSecond(now) + 5 * MINUTES - 120 * MINUTES), runtime.ctx);
-	assert.ok(runtime.statuses.has(STATUS_KEY));
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")));
 	await runtime.commands.get("cooldown-simulate").handler("Error: 429: too many requests", runtime.ctx);
 	assert.ok(runtime.notifies.some((notification) => notification.message.includes("simulated") && notification.message.includes("no configured provider")));
 	await shutdownRuntime(runtime);
@@ -1058,13 +1461,73 @@ test("/cooldown-simulate without arguments prints usage", async () => {
 	assert.equal(runtime.statuses.size, 0);
 });
 
+test("simulate refuses against a live real wait and mutates nothing", async () => {
+	const runtime = createRuntime();
+	await startRuntime(runtime);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	const statusBefore = runtime.statuses.get(statusKeyFor("zai-glm"));
+	const appendsBefore = runtime.appended.length;
+	const notifiesBefore = runtime.notifies.length;
+	await runtime.commands.get("cooldown-simulate").handler(`zai-glm ${fixture1308(wholeSecond(now) + 90 * MINUTES)}`, runtime.ctx);
+	assert.ok(runtime.notifies.length > notifiesBefore, "the refusal notifies");
+	assert.ok(runtime.notifies.some((notification) => notification.message.includes("/cooldown cancel")), "the refusal names the cancel path");
+	assert.equal(runtime.appended.length, appendsBefore, "no new persisted record");
+	assert.equal(runtime.statuses.get(statusKeyFor("zai-glm")), statusBefore, "the real deadline is untouched");
+	await sleep(150);
+	assert.equal(runtime.sent.length, 0);
+});
+
+test("simulating over a simulated wait still arms and extends", async () => {
+	const runtime = createRuntime();
+	await startRuntime(runtime);
+	await runtime.commands.get("cooldown-simulate").handler(`zai-glm ${fixture1308(wholeSecond(now) + 30 * MINUTES)}`, runtime.ctx);
+	const appendsAfterFirst = runtime.appended.length;
+	await runtime.commands.get("cooldown-simulate").handler(`zai-glm ${fixture1308(wholeSecond(now) + 90 * MINUTES)}`, runtime.ctx);
+	assert.equal(runtime.appended.length, appendsAfterFirst + 1, "the simulated re-arm persists");
+	assert.equal(lastAppend(runtime).data.simulated, true);
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")));
+});
+
+/** Broad-earlier + narrow-later same-provider overlap: every real zai error resolves to the broad first entry. */
+function overlappingConfig() {
+	const broad = { ...rawConfig().providers[0], name: "zai-all", match: { provider: "zai" } };
+	const narrow = { ...rawConfig().providers[0], name: "zai-glm45", match: { provider: "zai", model: "glm-4.5" } };
+	return rawConfig({ providers: [broad, narrow] });
+}
+
+test("simulate refuses at the entry the arming path resolves to and never overwrites real provenance", async () => {
+	const runtime = createRuntime({ config: overlappingConfig() });
+	await startRuntime(runtime);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-all")), "the real wait arms on the broad first-match entry");
+	const statusBefore = runtime.statuses.get(statusKeyFor("zai-all"));
+	const appendsBefore = runtime.appended.length;
+	const notifiesBefore = runtime.notifies.length;
+	await runtime.commands.get("cooldown-simulate").handler(`zai-glm45 ${fixture1308(wholeSecond(now) + 90 * MINUTES)}`, runtime.ctx);
+	assert.ok(runtime.notifies.length > notifiesBefore, "the refusal notifies");
+	const refusal = runtime.notifies.at(-1).message;
+	assert.ok(refusal.includes("zai-all"), "the refusal names the resolved entry, not the named one");
+	assert.ok(refusal.includes("/cooldown cancel"), "the refusal names the cancel path");
+	assert.equal(runtime.appended.length, appendsBefore, "no new persisted record");
+	assert.equal(runtime.appended[appendsBefore - 1].data.simulated, undefined, "the real wait's persisted provenance stays real");
+	assert.equal(runtime.statuses.get(statusKeyFor("zai-all")), statusBefore, "the real deadline is untouched");
+	await sleep(150);
+	assert.equal(runtime.sent.length, 0);
+	await startRuntime(runtime, "reload");
+	assert.ok(runtime.notifies.some((notification) => notification.message.includes("re-armed pending zai-all")), "the real wait survives the refused simulate and re-arms on reload");
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-all")));
+	await shutdownRuntime(runtime);
+});
+
 // --- wiring: live countdown -----------------------------------------------
 
 test("the armed footer status shows the live countdown with the resume budget", async () => {
 	const runtime = createRuntime();
 	await startRuntime(runtime);
-	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 251 * MINUTES)));
-	assert.equal(runtime.statuses.get(STATUS_KEY), "⏳ zai-glm in 4h 12m · 0/5 resumes used");
+	const resetAt = wholeSecond(Date.now()) + 251 * MINUTES;
+	await messageEnd(runtime, assistantError(fixture1308(resetAt)));
+	const expected = formatCountdown(resetAt + 2 * MINUTES, Date.now());
+	assert.equal(runtime.statuses.get(statusKeyFor("zai-glm")), `⏳ zai-glm in ${expected} · 0/5 resumes used`);
 	await shutdownRuntime(runtime);
 });
 
@@ -1083,72 +1546,53 @@ test("the countdown tick arms with the wait and refreshes the footer on every ti
 	await shutdownRuntime(runtime);
 });
 
+test("degenerate tickMs values fall back to the minute default instead of arming a busy loop", async () => {
+	for (const degenerate of [0, -5, Number.NaN, Number.POSITIVE_INFINITY]) {
+		await withIntervalSpy(async ({ created }) => {
+			const runtime = createRuntime({ tickMs: degenerate });
+			await startRuntime(runtime);
+			await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 5 * MINUTES)));
+			assert.equal(created.length, 1, `tickMs ${degenerate} arms exactly one tick interval`);
+			assert.equal(created[0].ms, MINUTES, `tickMs ${degenerate} must fall back to the one-minute default`);
+			await shutdownRuntime(runtime);
+		});
+	}
+});
+
 test("cancel clears the countdown tick interval", async () => {
 	const runtime = createRuntime({ tickMs: 20 });
 	await startRuntime(runtime);
-	const realSetInterval = global.setInterval;
-	const realClearInterval = global.clearInterval;
-	const created = [];
-	const cleared = [];
-	global.setInterval = (callback, ms) => {
-		const handle = realSetInterval(callback, ms);
-		created.push(handle);
-		return handle;
-	};
-	global.clearInterval = (handle) => {
-		cleared.push(handle);
-		return realClearInterval(handle);
-	};
-	try {
+	await withIntervalSpy(async ({ created, cleared }) => {
 		await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 5 * MINUTES)));
-		assert.ok(runtime.statuses.has(STATUS_KEY), "wait armed");
+		assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")), "wait armed");
 		await runtime.commands.get("cooldown").handler("cancel", runtime.ctx);
-	} finally {
-		global.setInterval = realSetInterval;
-		global.clearInterval = realClearInterval;
-	}
-	assert.equal(created.length, 1, "arming the wait created exactly one interval");
-	assert.ok(cleared.includes(created[0]), "cancel cleared the armed tick interval");
-	assert.equal(runtime.statuses.has(STATUS_KEY), false);
-	assert.equal(runtime.sent.length, 0);
+		assert.equal(created.length, 1, "arming the wait created exactly one interval");
+		assert.ok(cleared.includes(created[0].handle), "cancel cleared the armed tick interval");
+		assert.equal(runtime.statuses.has(statusKeyFor("zai-glm")), false);
+		assert.equal(runtime.sent.length, 0);
+	});
 });
 
 test("session_shutdown clears the countdown tick interval", async () => {
 	const runtime = createRuntime({ tickMs: 20 });
 	await startRuntime(runtime);
-	const realSetInterval = global.setInterval;
-	const realClearInterval = global.clearInterval;
-	const created = [];
-	const cleared = [];
-	global.setInterval = (callback, ms) => {
-		const handle = realSetInterval(callback, ms);
-		created.push(handle);
-		return handle;
-	};
-	global.clearInterval = (handle) => {
-		cleared.push(handle);
-		return realClearInterval(handle);
-	};
-	try {
+	await withIntervalSpy(async ({ created, cleared }) => {
 		await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 5 * MINUTES)));
 		await shutdownRuntime(runtime);
-	} finally {
-		global.setInterval = realSetInterval;
-		global.clearInterval = realClearInterval;
-	}
-	assert.equal(created.length, 1, "arming the wait created exactly one interval");
-	assert.ok(cleared.includes(created[0]), "shutdown cleared the armed tick interval");
-	assert.equal(runtime.sent.length, 0);
+		assert.equal(created.length, 1, "arming the wait created exactly one interval");
+		assert.ok(cleared.includes(created[0].handle), "shutdown cleared the armed tick interval");
+		assert.equal(runtime.sent.length, 0);
+	});
 });
 
 test("fire clears the countdown tick: the footer status is not resurrected after the resume", async () => {
 	const runtime = createRuntime({ tickMs: 20 });
 	await startRuntime(runtime);
 	await messageEnd(runtime, assistantError(fixture1308(now + 60 - 120 * MINUTES)));
-	assert.ok(runtime.statuses.has(STATUS_KEY));
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")));
 	await sleep(120);
 	assert.equal(runtime.sent.length, 1);
-	assert.equal(runtime.statuses.has(STATUS_KEY), false, "status clears at fire time");
+	assert.equal(runtime.statuses.has(statusKeyFor("zai-glm")), false, "status clears at fire time");
 	const writesAtFire = runtime.statusCalls.length;
 	await sleep(80);
 	assert.equal(runtime.statusCalls.length, writesAtFire, "the fired entry must not tick the status back");
@@ -1165,7 +1609,121 @@ test("a non-assistant message_end takes the early return without touching states
 	assert.equal(runtime.appended.length, appendsAfterArm, "no entry appended for a non-assistant message");
 	assert.equal(runtime.notifies.length, notifiesAfterArm, "no notify fired for a non-assistant message");
 	assert.equal(runtime.sent.length, 0);
-	assert.ok(runtime.statuses.has(STATUS_KEY), "the pending wait survives a non-assistant message");
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")), "the pending wait survives a non-assistant message");
+	await shutdownRuntime(runtime);
+});
+
+// --- wiring: runtime auto-resume toggle -----------------------------------
+
+test("cooldown off cancels every pending wait in memory without tombstones", async () => {
+	const runtime = createRuntime({ config: twoProviderConfig() });
+	await startRuntime(runtime);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 40 * MINUTES)));
+	await messageEnd(runtime, acmeError(acmeFixture(wholeSecond(now) + 50 * MINUTES)));
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")) && runtime.statuses.has(statusKeyFor("acme-pro")), "both waits armed");
+	const appendsAtOff = runtime.appended.length;
+	await runtime.commands.get("cooldown").handler("off", runtime.ctx);
+	assert.ok(runtime.notifies.some((notification) => notification.message.includes("cancelled") && notification.message.includes("return after a reload unless autoResume is disabled") && notification.message.includes("re-adjudicates them under resumeOnRestart")), "the off notify states the reload return is autoResume-gated and a restart re-adjudicates under resumeOnRestart");
+	assert.equal(runtime.statuses.size, 0, "off clears every entry's footer segment");
+	await sleep(40);
+	assert.equal(runtime.sent.length, 0, "off cancels the timers, nothing fires");
+	assert.equal(runtime.appended.length, appendsAtOff, "the off cancel stays in memory: no tombstones");
+	await shutdownRuntime(runtime);
+});
+
+test("cooldown off blocks arming with one passive notify naming the reset time", async () => {
+	const runtime = createRuntime();
+	await startRuntime(runtime);
+	await runtime.commands.get("cooldown").handler("off", runtime.ctx);
+	const notifiesAtOff = runtime.notifies.length;
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	assert.equal(runtime.appended.length, 0, "no wait arms while off");
+	assert.equal(runtime.statuses.size, 0, "no footer while off");
+	const passives = runtime.notifies.slice(notifiesAtOff).filter((notification) => notification.level === "info" && notification.message.includes("off"));
+	assert.equal(passives.length, 1, "exactly one passive notify per matching limit error");
+	assert.ok(passives[0].message.includes("zai-glm"));
+	assert.ok(/\d\d:\d\d/.test(passives[0].message), "the parsed reset time is named");
+	await runtime.commands.get("cooldown").handler("", runtime.ctx);
+	assert.ok(runtime.notifies.at(-1).message.includes("off"), "/cooldown reports the switch state while off");
+	await shutdownRuntime(runtime);
+});
+
+test("cooldown on restores arming after off cancelled the pending wait", async () => {
+	const runtime = createRuntime();
+	await startRuntime(runtime);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 40 * MINUTES)));
+	await runtime.commands.get("cooldown").handler("off", runtime.ctx);
+	assert.equal(runtime.statuses.size, 0, "off cancels the pending wait");
+	await runtime.commands.get("cooldown").handler("on", runtime.ctx);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 50 * MINUTES)));
+	assert.equal(runtime.appended.length, 2, "the post-on 1308 arms a fresh wait");
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")), "the restored wait renders its footer segment");
+	await shutdownRuntime(runtime);
+});
+
+test("the runtime switch resets to the config default on reload and in a fresh factory", async () => {
+	const runtime = createRuntime();
+	await startRuntime(runtime);
+	await runtime.commands.get("cooldown").handler("off", runtime.ctx);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	assert.equal(runtime.appended.length, 0, "off blocks arming");
+	await startRuntime(runtime, "reload");
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	assert.equal(runtime.appended.length, 1, "reload resets the switch to the config default");
+	const fresh = createRuntime();
+	await startRuntime(fresh);
+	await messageEnd(fresh, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	assert.equal(fresh.appended.length, 1, "a fresh factory starts from the config default");
+	await shutdownRuntime(runtime);
+	await shutdownRuntime(fresh);
+});
+
+test("autoResume false starts the session with the switch off", async () => {
+	const resolved = validateCooldownConfig(rawConfig({ autoResume: false }));
+	assert.equal(resolved.ok, true);
+	assert.equal(resolved.config.autoResume, false);
+	const runtime = createRuntime({ config: rawConfig({ autoResume: false }) });
+	await startRuntime(runtime);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	assert.equal(runtime.appended.length, 0, "autoResume false disables at start");
+	assert.ok(runtime.notifies.some((notification) => notification.level === "info" && notification.message.includes("off")), "the passive notify fires");
+	await runtime.commands.get("cooldown").handler("on", runtime.ctx);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	assert.equal(runtime.appended.length, 1, "runtime on re-enables per-session despite autoResume false");
+	await shutdownRuntime(runtime);
+});
+
+test("an autoResume of the wrong type fails the existing config validation", () => {
+	const result = validateCooldownConfig(rawConfig({ autoResume: "yes" }));
+	assert.equal(result.ok, false);
+	assert.ok(result.problems.some((problem) => problem.includes("autoResume")));
+});
+
+test("autoResume false tombstones the previous session's waits at start instead of resuming them", async () => {
+	const runtime = createRuntime({ config: twoProviderConfig({ resumeOnRestart: true, autoResume: false }) });
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "zai-glm", resetAtMs: now - 5 * MINUTES, fireAtMs: now - 2 * MINUTES, attempts: 1 }));
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "acme-pro", resetAtMs: now + 60 * MINUTES, fireAtMs: now + 62 * MINUTES, attempts: 1 }));
+	await startRuntime(runtime, "resume");
+	await sleep(20);
+	assert.equal(runtime.sent.length, 0, "no resume fires in a session that starts off");
+	assert.equal(runtime.statuses.size, 0);
+	const cancels = runtime.appended.filter((append) => append.data.state === "cancelled");
+	assert.equal(cancels.length, 2, "both persisted waits land tombstones");
+	assert.ok(cancels.every((append) => append.data.gate === "autoResume"));
+	assert.ok(runtime.notifies.some((notification) => notification.message.includes("autoResume")), "the drop notify names the autoResume gate");
+	await shutdownRuntime(runtime);
+});
+
+test("while off, a non-limit error from a matching provider stays silent", async () => {
+	const runtime = createRuntime();
+	await startRuntime(runtime);
+	await runtime.commands.get("cooldown").handler("off", runtime.ctx);
+	const notifiesAtOff = runtime.notifies.length;
+	await messageEnd(runtime, { role: "assistant", stopReason: "error", errorMessage: "ECONNRESET socket hung up", provider: "zai", model: "glm-5.3" });
+	assert.equal(runtime.appended.length, 0);
+	assert.equal(runtime.notifies.length, notifiesAtOff, "no passive notify without a matched limit error");
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	assert.equal(runtime.notifies.length, notifiesAtOff + 1, "a real limit error still notifies exactly once");
 	await shutdownRuntime(runtime);
 });
 
