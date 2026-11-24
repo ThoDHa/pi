@@ -11,6 +11,9 @@
 /tests/*
 !/tests/*.test.mjs
 !/tests/provision-pi-tui.mjs
+!/tests/run-all.sh
+!/tests/README.md
+!/tests/task-storage-isolation/
 /extensions/*
 !/extensions/permission-gate.ts
 !/extensions/protected-paths.ts
@@ -22,3 +25,9 @@
 !/extensions/cooldown.json
 !/extensions/workspace-fence.config.json
 /extensions/workspace-fence.local.json
+!/extensions/manager-mode.ts
+!/extensions/manager-body.md
+!/extensions/task-storage-isolation.ts
+!/extensions/task-storage-isolation-client.py
+!/extensions/task-storage-isolation-service.py
+!/extensions/task-storage-isolation-wrap.py
