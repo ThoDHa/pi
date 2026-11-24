@@ -13,10 +13,23 @@
  * session-scoped job registry, returns job IDs immediately, and delivers
  * results later via the jobs tool or a wake on completion.
  *
+ * Every spawned child carries fence-ask provisioning: a uuid v4 spawn
+ * token registered in the shared grant ledger before the child starts
+ * (the parent's serving loop admits only asks from tokens it issued)
+ * and released when the child exits, the parent session's forwarding
+ * root (minted once per process on the shared ledger state, under the
+ * tmpdir subtree), and a PISCOPE_EXTRA_ROOTS composed by
+ * inheritedExtraRootsEnvValue from the parent's full granted scope:
+ * config, overlay, env, the parent's own runtime grants, plus the
+ * parent session cwd when the dispatch cwd differs. Grants another
+ * child obtained through a forwarded ask never compose here; they
+ * dedup at ask time. Inheritance is dispatch-time: a parent grant
+ * after a child spawned reaches it only through the ask channel.
  * Uses JSON mode to capture structured output from subagents.
  */
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -35,6 +48,15 @@ import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { releasePromptDir, writePromptToTempFile } from "./prompt-temp.ts";
+import { childProvisioningEnv } from "../fence-ask/ask-wire.ts";
+import {
+	ensureForwardingRoot,
+	inheritedExtraRootsEnvValue,
+	parentGrantedDirectories,
+	registerLiveChild,
+	releaseChild,
+} from "../fence-ask/grant-ledger.ts";
+import { EXTRA_ROOTS_ENV, fenceExtraRoots } from "../workspace-fence.ts";
 import {
 	extractActivityLog,
 	extractLastActivity,
@@ -349,6 +371,7 @@ async function runSingleAgent(
 	signal: AbortSignal | undefined,
 	onUpdate?: OnUpdateCallback,
 	makeDetails?: (results: SingleResult[]) => SubagentDetails,
+	parentSessionId?: string,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -410,11 +433,44 @@ async function runSingleAgent(
 		args.push(`Task: ${task}`);
 		let wasAborted = false;
 
+		// Ask-channel provisioning (fence-ask): the env fragment builds
+		// before the token registers, so a wiring defect throws with no
+		// ledger state leaked; the token registers in the shared ledger
+		// immediately before spawn, because the parent's serving loop
+		// admits only asks from tokens it issued; release on exit retires
+		// the token and drops its pending asks while its grants stay. The
+		// forwarding root is minted once per parent process on the shared
+		// state, so every child of one session and the future serving loop
+		// converge on one root. The child's extra roots compose the
+		// parent's full granted scope (config, overlay, env, parent-own
+		// runtime grants, plus the parent session cwd when the dispatch cwd
+		// differs); sibling child-ask grants never compose here, they
+		// dedup at ask time.
+		const childToken = randomUUID();
+		const dispatchCwd = cwd ?? defaultCwd;
+		const forwardingRoot = ensureForwardingRoot(parentSessionId ?? `pid-${process.pid}`, randomUUID());
+		const inheritedRootsValue = inheritedExtraRootsEnvValue({
+			configRoots: fenceExtraRoots(),
+			overlayRoots: [],
+			envRoots: [],
+			parentGrantRoots: parentGrantedDirectories(),
+			parentSessionCwd: defaultCwd,
+			dispatchCwd,
+		});
+		const childEnv: Record<string, string | undefined> = {
+			...process.env,
+			PI_MANAGER_MODE: "off",
+			...childProvisioningEnv({ childToken, forwardingRoot }),
+		};
+		if (inheritedRootsValue.length > 0) childEnv[EXTRA_ROOTS_ENV] = inheritedRootsValue;
+		else delete childEnv[EXTRA_ROOTS_ENV];
+		registerLiveChild(childToken, agentName, formatTaskPreview(task));
+
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
 			const proc = spawn(invocation.command, invocation.args, {
-				cwd: cwd ?? defaultCwd,
-				env: { ...process.env, PI_MANAGER_MODE: "off" },
+				cwd: dispatchCwd,
+				env: childEnv,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 			});
@@ -487,12 +543,14 @@ async function runSingleAgent(
 			}, SUBAGENT_HARD_TIMEOUT_MS);
 
 			proc.on("close", (code) => {
+				releaseChild(childToken);
 				if (buffer.trim()) processLine(buffer);
 				clearTimeout(hardTimeout);
 				resolve(code ?? 0);
 			});
 
 			proc.on("error", () => {
+				releaseChild(childToken);
 				clearTimeout(hardTimeout);
 				resolve(1);
 			});
@@ -647,6 +705,7 @@ async function runDetachedJob(
 	defaultCwd: string,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 	onJobFinished: (job: DetachedJob) => void,
+	parentSessionId?: string,
 ): Promise<void> {
 	// Per-slot live nodes the update callbacks merge into and every
 	// publication carries: the detached counterpart of the blocking
@@ -698,6 +757,7 @@ async function runDetachedJob(
 					job.abort.signal,
 					slotUpdate(slot),
 					makeDetails,
+					parentSessionId,
 				);
 			});
 			results.forEach((result, slot) => publishSlotUpdate(slot, result));
@@ -719,6 +779,7 @@ async function runDetachedJob(
 					job.abort.signal,
 					slotUpdate(i),
 					makeDetails,
+					parentSessionId,
 				);
 				results.push(result);
 				publishSlotUpdate(i, result);
@@ -739,6 +800,7 @@ async function runDetachedJob(
 				job.abort.signal,
 				slotUpdate(0),
 				makeDetails,
+				parentSessionId,
 			);
 			results = [result];
 			publishSlotUpdate(0, result);
@@ -1063,6 +1125,7 @@ export default function (pi: ExtensionAPI) {
 				model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 				thinkingLevel: ctx.thinkingLevel,
 			};
+			const parentSessionId = ctx.sessionManager?.getSessionId();
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
@@ -1178,7 +1241,7 @@ export default function (pi: ExtensionAPI) {
 				const job = createDetachedJob(`job-${nextJobId++}`, mode, steps);
 				jobs.set(job.id, job);
 				publishDetachedJobSnapshot(job, new Map());
-				void runDetachedJob(job, steps, agents, dispatchDefaults, ctx.cwd, makeDetails(mode), wakeOnCompletion);
+				void runDetachedJob(job, steps, agents, dispatchDefaults, ctx.cwd, makeDetails(mode), wakeOnCompletion, parentSessionId);
 				return {
 					content: [
 						{
@@ -1229,6 +1292,7 @@ export default function (pi: ExtensionAPI) {
 							signal,
 							chainUpdate,
 							makeDetails("chain"),
+							parentSessionId,
 						);
 						syncRegistryAgent(dispatchRegistry, taskNode.id, round.index, 0, result, step.cwd ?? ctx.cwd);
 						results.push(result);
@@ -1325,6 +1389,7 @@ export default function (pi: ExtensionAPI) {
 								}
 							},
 							makeDetails("parallel"),
+							parentSessionId,
 						);
 						allResults[index] = result;
 						syncRegistryAgent(dispatchRegistry, taskNode.id, dispatchRound.index, index, result, t.cwd ?? ctx.cwd);
@@ -1379,6 +1444,7 @@ export default function (pi: ExtensionAPI) {
 						signal,
 						streamingUpdate,
 						makeDetails("single"),
+						parentSessionId,
 					);
 					syncRegistryAgent(dispatchRegistry, taskNode.id, dispatchRound.index, 0, result, params.cwd ?? ctx.cwd);
 					const isError = isFailedResult(result);

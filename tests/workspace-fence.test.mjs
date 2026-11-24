@@ -77,6 +77,20 @@
  * tilde-user and glob-traversal overrides, device exemption, degraded-
  * seal ask, headless block), and the factory handler maps bash events
  * onto the shared ask/block machinery.
+ *
+ * The unit 1-2 parent-own grant recorder is pinned at three depths:
+ * recordParentOwnGrant's classification classes against real fixture
+ * nodes (directory keys itself, file keys its parent, write-ahead
+ * tails key their literal dirname, dangling symlinks and trailing
+ * separators converge on the containing real directory, symlinked
+ * directories key their physical self, idempotent re-recording,
+ * unusable candidates record nothing); the escapingCandidate verdict
+ * field (set on candidate-bearing asks, absent on allows, degraded
+ * asks, and unusable input) and the grantCandidate field it feeds on
+ * the ask decision; and the factory wiring end to end, where an
+ * approved out-of-scope handler call records the derived grant into
+ * the fence-ask ledger and refusals, headless blocks, and repeat
+ * approvals record nothing.
  */
 
 import * as fs from "node:fs";
@@ -110,9 +124,11 @@ import cwdScopeGate, {
 	resetSessionSeal,
 	resolveRunningRelease,
 	resolveScopeTarget,
+	recordParentOwnGrant,
 	scanBashCommand,
 	sessionSealState,
 } from "../extensions/workspace-fence.ts";
+import { inheritedExtraRootsEnvValue, parentGrantedDirectories, resetFenceAskState } from "../extensions/fence-ask/grant-ledger.ts";
 
 let failed = 0;
 let total = 0;
@@ -1991,6 +2007,235 @@ try {
 		handlerRedirectHead.reason,
 		"/etc/passwd",
 	);
+
+	// --- parent-own grant recorder: unit 1-2 wiring ----------------------
+	// The interactive Yes on the parent's own ask path is property 1's
+	// producer: the approved ask's escaping candidate is classified
+	// (directory/file/unresolved) and keyed per the fence-ask
+	// grant-key contract, then recorded into the ledger as a parent-own
+	// grant. Verdicts never consult the ledger: recording changes what
+	// FUTURE CHILDREN inherit and what the ask-dedup index holds, not
+	// this session's decisions.
+
+	const recBase = path.join(fixtureRoot, "recorder");
+	const recDir = path.join(recBase, "dir");
+	fs.mkdirSync(recDir, { recursive: true });
+	const recFile = path.join(recDir, "file.txt");
+	fs.writeFileSync(recFile, "fixture");
+	const recAlias = path.join(recBase, "alias");
+	fs.symlinkSync(recDir, recAlias, "dir");
+	const recDangle = path.join(recDir, "dangle-link");
+	fs.symlinkSync(path.join(recDir, "missing-target"), recDangle, "file");
+	const recWriteAhead = path.join(recDir, "newdir", "newfile.txt");
+	const recRealDir = fs.realpathSync(recDir);
+
+	resetFenceAskState();
+	check(
+		"the recorder starts from an empty parent-own ledger",
+		parentGrantedDirectories().length,
+		0,
+	);
+	check("recording a directory-form candidate keys itself", recordParentOwnGrant(recDir), recRealDir);
+	check(
+		"the recorded directory joins the parent-own source",
+		JSON.stringify(parentGrantedDirectories()),
+		JSON.stringify([recRealDir]),
+	);
+	check(
+		"recording a file-form candidate keys its parent directory",
+		recordParentOwnGrant(recFile),
+		recRealDir,
+	);
+	check(
+		"recording a symlinked directory keys the physical self",
+		recordParentOwnGrant(recAlias),
+		recRealDir,
+	);
+	check(
+		"recording a dangling symlink keys the containing real directory",
+		recordParentOwnGrant(recDangle),
+		recRealDir,
+	);
+	check(
+		"recording a trailing-separator directory form keys the stripped self",
+		recordParentOwnGrant(recDir + path.sep),
+		recRealDir,
+	);
+	check(
+		"recording a write-ahead candidate keys the literal dirname",
+		recordParentOwnGrant(recWriteAhead),
+		path.dirname(recWriteAhead),
+	);
+	check("re-recording a keyed directory keeps one row", parentGrantedDirectories().length, 2);
+	check("recording an unusable candidate records nothing", recordParentOwnGrant(null), null);
+	check("recording an empty candidate records nothing", recordParentOwnGrant(""), null);
+	check("recording a relative candidate records nothing", recordParentOwnGrant("rel/path"), null);
+	check("recording an undefined candidate records nothing", recordParentOwnGrant(undefined), null);
+	check("unusable candidates leave the ledger untouched", parentGrantedDirectories().length, 2);
+	resetFenceAskState();
+
+	// property 1 as the Task Breakdown's measurable, with the re-review
+	// 11 DC-A negative at both the roots level and the verdict level:
+	// the real classifier seeds a parent-own grant, the real
+	// composition produces the child env value, the child-side
+	// parseExtraRoots consumes it, and the child's verdict allows the
+	// granted directory while its parent stays asked (a mis-wired
+	// classifier that keyed the parent would fail the second half).
+	resetFenceAskState();
+	const propDir = path.join(fixtureRoot, "property1", "granted");
+	fs.mkdirSync(propDir, { recursive: true });
+	fs.writeFileSync(path.join(propDir, "inner.txt"), "fixture");
+	const childSessionCwd = path.join(fixtureRoot, "childwork");
+	fs.mkdirSync(childSessionCwd, { recursive: true });
+	check("the seeded grant records the directory itself", recordParentOwnGrant(propDir), fs.realpathSync(propDir));
+	const childEnvValue = inheritedExtraRootsEnvValue({
+		configRoots: [],
+		overlayRoots: [],
+		envRoots: [],
+		parentGrantRoots: parentGrantedDirectories(),
+		parentSessionCwd: cwdDir,
+		dispatchCwd: childSessionCwd,
+	});
+	const childRoots = parseExtraRoots(childEnvValue);
+	check(
+		"the child's composed roots contain exactly the granted directory",
+		childRoots.includes(fs.realpathSync(propDir)),
+		true,
+	);
+	check(
+		"the child's composed roots do not contain the granted directory's parent",
+		childRoots.includes(fs.realpathSync(path.join(fixtureRoot, "property1"))),
+		false,
+	);
+	const childAllowed = buildAllowedRoots(childSessionCwd, childRoots, customTmpDir);
+	const childAllowVerdict = resolveScopeTarget(
+		childSessionCwd,
+		childAllowed,
+		path.join(propDir, "inner.txt"),
+		fakeHome,
+		cleanSeal,
+	);
+	check("the child's verdict allows the granted directory", childAllowVerdict.scope, "allow");
+	checkContains("the child allow names the granted root", childAllowVerdict.detail, fs.realpathSync(propDir));
+	const childParentAsk = resolveScopeTarget(
+		childSessionCwd,
+		childAllowed,
+		path.join(fixtureRoot, "property1"),
+		fakeHome,
+		cleanSeal,
+	);
+	check("the granted directory's parent stays asked for the child", childParentAsk.scope, "ask");
+	resetFenceAskState();
+
+	// the escaping candidate rides the ask verdict so the recorder has
+	// the exact candidate to key, whatever resolution surfaced it
+	const candidateAsk = resolveScopeTarget(cwdDir, customRoots, outFile, fakeHome, cleanSeal);
+	check("an out-of-scope ask carries its escaping candidate", candidateAsk.escapingCandidate, outFile);
+	const candidateKernelAsk = resolveScopeTarget(cwdDir, customRoots, linkOut, fakeHome, cleanSeal);
+	check(
+		"a symlink-escape ask carries the kernel-resolved candidate",
+		candidateKernelAsk.escapingCandidate,
+		fs.realpathSync(outsideDir),
+	);
+	check(
+		"an allow verdict carries no escaping candidate",
+		resolveScopeTarget(cwdDir, customRoots, inFile, fakeHome, cleanSeal).escapingCandidate,
+		undefined,
+	);
+	check(
+		"a degraded-seal ask carries no escaping candidate",
+		resolveScopeTarget(cwdDir, customRoots, inFile, fakeHome, degradedSeal).escapingCandidate,
+		undefined,
+	);
+	check(
+		"an unusable-input ask carries no escaping candidate",
+		resolveScopeTarget(cwdDir, customRoots, "", fakeHome, cleanSeal).escapingCandidate,
+		undefined,
+	);
+
+	// the ask decision carries the candidate for the factory's Yes branch
+	const candidateDecision = decidePathToolCall({
+		toolName: "read",
+		input: { path: outFile },
+		sessionCwd: cwdDir,
+		allowedRoots: customRoots,
+		hasUI: true,
+		seal: cleanSeal,
+	});
+	check("the path ask decision carries the grant candidate", candidateDecision.grantCandidate, outFile);
+	const bashCandidateDecision = decideBashToolCall({
+		toolName: "bash",
+		input: { command: `cat ${outFile}` },
+		sessionCwd: cwdDir,
+		allowedRoots: customRoots,
+		hasUI: true,
+		seal: cleanSeal,
+	});
+	check("the bash operand ask decision carries the grant candidate", bashCandidateDecision.grantCandidate, outFile);
+	const bashSubstitutionDecision = decideBashToolCall({
+		toolName: "bash",
+		input: { command: "echo $HOME/secret" },
+		sessionCwd: cwdDir,
+		allowedRoots: customRoots,
+		hasUI: true,
+		seal: cleanSeal,
+	});
+	check(
+		"a bash substitution ask carries no grant candidate",
+		bashSubstitutionDecision.grantCandidate,
+		undefined,
+	);
+	const bashCdDecision = decideBashToolCall({
+		toolName: "bash",
+		input: { command: "cd" },
+		sessionCwd: cwdDir,
+		allowedRoots: customRoots,
+		hasUI: true,
+		seal: cleanSeal,
+	});
+	check("a bash cd ask carries no grant candidate", bashCdDecision.grantCandidate, undefined);
+	check(
+		"a pass decision carries no grant candidate",
+		decidePathToolCall({
+			toolName: "read",
+			input: { path: inFile },
+			sessionCwd: cwdDir,
+			allowedRoots: customRoots,
+			hasUI: true,
+			seal: cleanSeal,
+		}).grantCandidate,
+		undefined,
+	);
+
+	// end-to-end through the real handler: the approved out-of-scope
+	// call records the derived parent-own grant; refusal, headless
+	// block, and repeat approval record nothing
+	resetFenceAskState();
+	const approvedRecorder = await handler(
+		{ toolName: "read", input: { path: "/etc/passwd" } },
+		ctxWithChoice("Yes"),
+	);
+	check("the approved out-of-scope handler call still passes", approvedRecorder, undefined);
+	check(
+		"the approval records the derived parent-own grant",
+		JSON.stringify(parentGrantedDirectories()),
+		JSON.stringify(["/etc"]),
+	);
+	const refusedRecorder = await handler(
+		{ toolName: "read", input: { path: "/etc/passwd" } },
+		ctxWithChoice("No"),
+	);
+	check("the refused handler call still blocks", refusedRecorder && refusedRecorder.block, true);
+	check("a refusal records nothing", parentGrantedDirectories().length, 1);
+	const headlessRecorder = await handler(
+		{ toolName: "read", input: { path: "/etc/passwd" } },
+		{ cwd: cwdDir, hasUI: false, ui: { select: async () => "Yes" } },
+	);
+	check("the headless handler call still blocks", headlessRecorder && headlessRecorder.block, true);
+	check("a headless block records nothing", parentGrantedDirectories().length, 1);
+	await handler({ toolName: "read", input: { path: "/etc/passwd" } }, ctxWithChoice("Yes"));
+	check("a repeat approval stays one grant row", parentGrantedDirectories().length, 1);
+	resetFenceAskState();
 } finally {
 	fs.rmSync(fixtureRoot, { recursive: true, force: true });
 }

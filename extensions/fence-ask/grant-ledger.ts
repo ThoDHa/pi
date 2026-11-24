@@ -73,12 +73,15 @@
  * established in-repo precedent. resetFenceAskState clears in place so
  * references held across extensions stay valid.
  *
- * Dependency-free by design (only node:path plus ask-wire types) so
- * plain-node suites exercise the machine directly.
+ * Dependency-free by design (only node builtins: node:path and
+ * node:os) plus ask-wire types and helpers, so plain-node suites
+ * exercise the machine directly; the spawn nonce is caller-supplied
+ * for the same reason.
  */
 
+import * as os from "node:os";
 import * as path from "node:path";
-import { DEFAULT_ASK_WAIT_MS } from "./ask-wire.ts";
+import { DEFAULT_ASK_WAIT_MS, encodePathSegment } from "./ask-wire.ts";
 import type { DecisionVia, ForwardedDecision } from "./ask-wire.ts";
 
 /**
@@ -191,6 +194,13 @@ export interface FenceAskState {
 	liveChildren: Map<string, ChildIdentity>;
 	/** Child token -> its admission state. */
 	pendingByChild: Map<string, ChildPendingAsks>;
+	/**
+	 * The parent session's ask-forwarding root (unit 1-2), minted once
+	 * per process at the first spawn and shared with the serving loop
+	 * through this state; null until minted. Carries no directory
+	 * creation: the 0700 mkdir is the 1-3 consumer obligation.
+	 */
+	forwardingRoot: string | null;
 }
 
 /** What admitChildAsk decided to do with one incoming ask. */
@@ -260,6 +270,7 @@ export function getFenceAskState(): FenceAskState {
 		parentOwnGrants: [],
 		liveChildren: new Map(),
 		pendingByChild: new Map(),
+		forwardingRoot: null,
 	};
 	return globalThis.__piFenceAskState;
 }
@@ -277,6 +288,7 @@ export function resetFenceAskState(): void {
 	state.parentOwnGrants.length = 0;
 	state.liveChildren.clear();
 	state.pendingByChild.clear();
+	state.forwardingRoot = null;
 }
 
 /**
@@ -362,6 +374,58 @@ export function parentGrantedDirectories(): string[] {
 /** Every session-wide granted directory, in first-grant order. */
 export function sessionGrantedDirectories(): string[] {
 	return [...getFenceAskState().sessionWideGranted.keys()];
+}
+
+/**
+ * Compose the forwarding root path from the parent session id, a
+ * caller-supplied random nonce, and the base directory (unit 1-2).
+ * Pure string work: the result is ONE directory name under base, the
+ * session id percent-encoded into it via encodePathSegment so no
+ * separator or traversal syntax survives, and the nonce glued in as
+ * the random component that closes guessed-path injection. The
+ * suite-pinned hostile-input property: even a traversal-spelled
+ * session id stays one encoded segment, so the result never escapes
+ * base. No directory is created here; the 0700 creation is the 1-3
+ * consumer obligation.
+ */
+export function composeForwardingRootPath(sessionId: string, nonce: string, base: string): string {
+	if (typeof sessionId !== "string" || sessionId.length === 0) {
+		throw new TypeError("forwarding root session id must be a non-empty string");
+	}
+	if (typeof nonce !== "string" || nonce.length === 0) {
+		throw new TypeError("forwarding root nonce must be a non-empty string");
+	}
+	if (typeof base !== "string" || base.length === 0) {
+		throw new TypeError("forwarding root base must be a non-empty string");
+	}
+	return path.join(base, `pi-fence-ask-${encodePathSegment(sessionId)}-${encodePathSegment(nonce)}`);
+}
+
+/**
+ * Mint the parent session's forwarding root once per process (unit
+ * 1-2, the spawn site's producer half): the first call composes the
+ * root from the session id, the caller's random nonce, and
+ * os.tmpdir(), stores it on the shared state, and returns it; every
+ * later call returns the stored root regardless of the nonce passed,
+ * so every child of one parent session shares one serving root. The
+ * root lives under the tmpdir subtree on purpose: the fence's own
+ * allowlist covers that subtree for every fence-bearing process, so
+ * the channel's request/response file I/O never crosses a scope
+ * boundary on either side. The caller supplies the nonce (its
+ * crypto.randomUUID) so this module stays crypto-free; only the
+ * first call's nonce is consumed.
+ */
+export function ensureForwardingRoot(sessionId: string, randomNonce: string): string {
+	const state = getFenceAskState();
+	if (state.forwardingRoot === null) {
+		state.forwardingRoot = composeForwardingRootPath(sessionId, randomNonce, os.tmpdir());
+	}
+	return state.forwardingRoot;
+}
+
+/** The minted forwarding root, or null before the first spawn. */
+export function currentForwardingRoot(): string | null {
+	return getFenceAskState().forwardingRoot;
 }
 
 /** The prompt provenance the parent surfaces for one forwarded ask. */
@@ -719,4 +783,21 @@ export function composeInheritedExtraRoots(input: InheritedRootsInput): string[]
 		add(parentCwd);
 	}
 	return composed;
+}
+
+/**
+ * The composed inherited union serialized for the child's env value
+ * (unit 1-2): composeInheritedExtraRoots joined with the env
+ * delimiter, ready to assign to the child's PISCOPE_EXTRA_ROOTS. The
+ * empty string is the "nothing to inherit" value, and the caller's
+ * obligation is to DELETE the child's env key in that case rather
+ * than write an empty value, so a no-grant dispatch ships exactly
+ * today's default env posture. The child's own parseExtraRoots is
+ * the dual-form expander on the far side: entries arrive here in the
+ * producers' validated forms and re-expand through realpath at child
+ * parse time, which is also where the documented write-ahead drop
+ * (grantScopeDirectory's known property-1 gap) would surface.
+ */
+export function inheritedExtraRootsEnvValue(input: InheritedRootsInput): string {
+	return composeInheritedExtraRoots(input).join(path.delimiter);
 }

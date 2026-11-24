@@ -22,8 +22,10 @@
  *
  * Child provisioning contract: the spawn site passes the forwarding
  * root path in PISCOPE_ASK_FORWARDING_ROOT and the child's spawn token
- * in PISCOPE_ASK_CHILD_TOKEN. The token is a uuid v4 issued by the
- * parent's subagent extension and registered in the grant ledger
+ * in PISCOPE_ASK_CHILD_TOKEN; childProvisioningEnv is the pinned
+ * fragment the subagent extension merges into the child's spawn env
+ * (unit FENCE-1-2). The token is a uuid v4 issued by the parent's
+ * subagent extension and registered in the grant ledger
  * (grant-ledger.ts) before the child starts; the serving loop admits
  * only asks carrying a token it issued, and a root path embedding the
  * parent session id plus a random component closes guessed-path
@@ -74,13 +76,15 @@
  * itself, so approving a directory ask grants exactly what was asked
  * (asking /opt/tools grants /opt/tools, never /opt); a file-form
  * candidate keys its parent directory; an unresolved write-ahead tail
- * keys its deepest existing ancestor's parent directory; the root
- * path keys itself and no branch derives above it. Every granted
- * root reaches an allowed-root set only through expandGrantedRoot's
- * literal-plus-realpath dual forms, the same shape parseExtraRoots
- * gives configured roots. Both rules are consumer obligations for
- * FENCE-1-2 and FENCE-1-3; the write-ahead env-round-trip gap and its
- * pre-create remedy are documented on grantScopeDirectory.
+ * keys the realpath of its not-yet-existing parent directory spelled
+ * under the deepest existing ancestor, falling back to that literal
+ * dirname when it does not resolve; the root path keys itself and no
+ * branch derives above it. Every granted root reaches an allowed-root
+ * set only through expandGrantedRoot's literal-plus-realpath dual
+ * forms, the same shape parseExtraRoots gives configured roots. Both
+ * rules are consumer obligations for FENCE-1-2 and FENCE-1-3; the
+ * write-ahead env-round-trip gap and its pre-create remedy are
+ * documented on grantScopeDirectory.
  *
  * Dependency-free by design (only node:path) so plain-node suites
  * exercise the contract directly, matching subagent/registry.ts.
@@ -109,6 +113,40 @@ export const CHILD_ASK_ROOT_ENV = "PISCOPE_ASK_FORWARDING_ROOT";
 
 /** Child env key carrying the child's spawn token. */
 export const CHILD_ASK_TOKEN_ENV = "PISCOPE_ASK_CHILD_TOKEN";
+
+/**
+ * Child provisioning env fragment builder (unit FENCE-1-2). Merges
+ * these two pairs into the child's spawn env alongside PI_MANAGER_MODE
+ * and the composed PISCOPE_EXTRA_ROOTS.
+ */
+export interface ChildProvisioning {
+	/** The uuid v4 spawn token the parent issued and registered. */
+	childToken: string;
+	/** The parent session's forwarding root path. */
+	forwardingRoot: string;
+}
+
+/**
+ * The child env fragment for one dispatch: the forwarding root under
+ * CHILD_ASK_ROOT_ENV and the spawn token under CHILD_ASK_TOKEN_ENV,
+ * exactly the two keys the child-side loop reads. Trusted in-process
+ * caller (the subagent extension's spawn site); a defect throws, so a
+ * wiring bug fails the dispatch loudly instead of shipping a child
+ * that cannot ask or that would pollute the parent's serving root
+ * with unvalidated values.
+ */
+export function childProvisioningEnv(provisioning: ChildProvisioning): Record<string, string> {
+	if (!isUuidV4(provisioning?.childToken)) {
+		throw new TypeError("child provisioning token must be a uuid v4 string");
+	}
+	if (!isValidForwardingRoot(provisioning?.forwardingRoot)) {
+		throw new TypeError("child provisioning forwarding root must be an absolute normalized path");
+	}
+	return {
+		[CHILD_ASK_ROOT_ENV]: provisioning.forwardingRoot,
+		[CHILD_ASK_TOKEN_ENV]: provisioning.childToken,
+	};
+}
 
 /** Requests subdirectory under a forwarding root (GPS layout). */
 export const REQUESTS_DIR_NAME = "requests";

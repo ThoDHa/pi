@@ -203,6 +203,15 @@
  * process at the first gated verdict, memoized beside the seal
  * (fenceExtraRoots, reset by resetFenceExtraRoots), so a config edit or
  * env change mid-session needs a restart to apply.
+ *
+ * Unit 1-2 adds the runtime-grant producer side: an approved
+ * out-of-scope ask records a parent-own grant into the fence-ask
+ * ledger (recordParentOwnGrant at the interactive Yes branch), keyed
+ * from the ask's escaping candidate per the fence-ask grant-key
+ * contract. The subagent extension's spawn site composes those grants
+ * into every dispatched child's PISCOPE_EXTRA_ROOTS, so a child's
+ * starting scope is the parent's current granted scope; sibling
+ * child-ask grants dedup at ask time and never compose silently.
  */
 
 import * as fs from "node:fs";
@@ -211,6 +220,9 @@ import * as path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { grantScopeDirectory } from "./fence-ask/ask-wire.ts";
+import type { AskCandidateForm } from "./fence-ask/ask-wire.ts";
+import { recordParentGrant } from "./fence-ask/grant-ledger.ts";
 
 /**
  * Environment variable carrying extra allowed roots, colon-separated
@@ -248,6 +260,15 @@ export interface ScopeVerdict {
 	path: string;
 	scope: "allow" | "ask";
 	detail: string;
+	/**
+	 * The escaping candidate exactly as resolution surfaced it, on ask
+	 * verdicts where a candidate exists (unit 1-2: the recorder keys the
+	 * parent-own grant from it per the fence-ask grant-key contract).
+	 * Absent on allow verdicts, degraded-seal asks (which precede any
+	 * resolution, so no trustworthy candidate exists), and unusable-input
+	 * asks.
+	 */
+	escapingCandidate?: string;
 }
 
 /**
@@ -900,6 +921,7 @@ export function resolveScopeTarget(
 				path: lexical,
 				scope: "ask",
 				detail: `${candidate} resolves outside the session cwd, the temp directory, and every extra allowed root; approve interactively or widen the extra roots (${FENCE_CONFIG_FILE} or ${EXTRA_ROOTS_ENV})`,
+				escapingCandidate: candidate,
 			};
 		}
 	}
@@ -952,7 +974,7 @@ function gatedToolPath(toolName: string, input: Record<string, unknown>): unknow
 /** One gated tool_call's decision as pure data; the path and bash gates share it. */
 export type PathGateDecision =
 	| { action: "pass" }
-	| { action: "ask"; title: string; denyReason: string }
+	| { action: "ask"; title: string; denyReason: string; grantCandidate?: string }
 	| { action: "block"; reason: string };
 
 /** Everything decidePathToolCall needs from one tool_call event. */
@@ -1010,7 +1032,12 @@ function assembleGateDecision(
 	const denyReason = scopeDenyReason(toolName, verdict);
 	if (!hasUI) return { action: "block", reason: `${denyReason}${HEADLESS_REMEDY}` };
 	if (approved === undefined) {
-		return { action: "ask", title: scopeAskTitle(toolName, verdict), denyReason };
+		return {
+			action: "ask",
+			title: scopeAskTitle(toolName, verdict),
+			denyReason,
+			grantCandidate: verdict.escapingCandidate,
+		};
 	}
 	if (approved) return { action: "pass" };
 	return { action: "block", reason: denyReason };
@@ -1598,6 +1625,53 @@ export function decideBashToolCall(call: BashGateCall): PathGateDecision {
 }
 
 /**
+ * Classify one escaping candidate for the grant-key derivation, per
+ * the fence-ask caller contract: an existing node (stat follows
+ * symlinks) is directory form with its own realpath, or file form
+ * with its parent directory's realpath; a candidate that does not
+ * resolve is the write-ahead class with the parent directory's
+ * realpath when the parent resolves, else null so the derivation
+ * falls back to the literal dirname.
+ */
+function classifyGrantCandidate(candidate: string): { form: AskCandidateForm; resolvedRealpath: string | null } {
+	try {
+		const stats = fs.statSync(candidate);
+		if (stats.isDirectory()) {
+			return { form: "directory", resolvedRealpath: fs.realpathSync(candidate) };
+		}
+		return { form: "file", resolvedRealpath: fs.realpathSync(path.dirname(candidate)) };
+	} catch {
+		const parent = path.dirname(candidate);
+		try {
+			return { form: "unresolved", resolvedRealpath: fs.realpathSync(parent) };
+		} catch {
+			return { form: "unresolved", resolvedRealpath: null };
+		}
+	}
+}
+
+/**
+ * Record one parent-own grant from an approved ask's escaping
+ * candidate (unit 1-2, property 1's producer): classify the candidate
+ * against the real filesystem, derive the grant-scope directory per
+ * the fence-ask grant-key contract, and record it into the shared
+ * ledger, which feeds spawn-time inheritance composition and the
+ * session's ask-dedup index. Returns the recorded directory, or null
+ * when the candidate is unusable (degraded-seal and unusable-input
+ * asks carry none, so a degraded Yes records nothing and cannot
+ * launder untrusted-machinery evidence into an inherited grant).
+ * Idempotent per directory in the ledger. The fence's own verdicts
+ * never consult the ledger: a recorded grant changes what future
+ * dispatched children inherit, never this session's decisions.
+ */
+export function recordParentOwnGrant(candidate: unknown, now: number = Date.now()): string | null {
+	if (typeof candidate !== "string" || candidate.length === 0 || !path.isAbsolute(candidate)) return null;
+	const classified = classifyGrantCandidate(candidate);
+	const directory = grantScopeDirectory(candidate, classified.form, classified.resolvedRealpath);
+	return recordParentGrant(directory, now).directory;
+}
+
+/**
  * The extension entry point pi's loader requires (the permission-gate
  * shape): register one tool_call handler that maps the decision data
  * onto the live session. Bash calls dispatch to the bash decider, every
@@ -1625,6 +1699,7 @@ export default function (pi: ExtensionAPI) {
 		if (decision.action === "block") return { block: true, reason: decision.reason };
 		const choice = await ctx.ui.select(decision.title, ["Yes", "No"]);
 		if (choice !== "Yes") return { block: true, reason: decision.denyReason };
+		if (decision.action === "ask") recordParentOwnGrant(decision.grantCandidate);
 		return undefined;
 	});
 }

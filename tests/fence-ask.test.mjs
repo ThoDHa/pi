@@ -52,6 +52,17 @@
  * ask-dedup index fed by every source; and the globalThis convergence
  * contract (one state object across calls, in-place reset keeping
  * reference identity).
+ *
+ * The unit 1-2 spawn-wiring surface pins the forwarding-root mint
+ * (one root per parent process, carried on the shared ledger state so
+ * the spawn site and the 1-3 serving loop converge, embedded session
+ * id plus nonce, tmpdir-subtree placement so channel file I/O never
+ * crosses a scope boundary, hostile session ids surviving as one
+ * encoded segment), the child provisioning env fragment (the exact
+ * two wire keys, uuid-validated token, normalized-root validation),
+ * and the composed inherited roots serialized into the child env
+ * value (delimiter join, empty-to-empty, Q4 parent cwd riding the
+ * value, parent-own grants reaching the value).
  */
 
 import * as path from "node:path";
@@ -82,6 +93,7 @@ import {
 	parseForwardedAsk,
 	parseForwardedDecision,
 	resolveAskWaitMs,
+	childProvisioningEnv,
 	serializeForwardedAsk,
 	serializeForwardedDecision,
 } from "../extensions/fence-ask/ask-wire.ts";
@@ -96,7 +108,11 @@ import {
 	ASK_USER_GRANT_REASON,
 	admitChildAsk,
 	childIdentity,
+	composeForwardingRootPath,
 	composeInheritedExtraRoots,
+	currentForwardingRoot,
+	ensureForwardingRoot,
+	inheritedExtraRootsEnvValue,
 	expireStaleAsks,
 	getFenceAskState,
 	grantsForChild,
@@ -947,6 +963,145 @@ checkDeep(
 	[],
 );
 
+// --- unit 1-2: forwarding-root mint on the shared state --------------
+// One root per parent process, minted by the spawn site (the producer)
+// and read by the serving loop (the 1-3 consumer) through the same
+// globalThis state as the grants. The mint does no I/O: creating the
+// root with mode 0700 stays the 1-3 consumer obligation.
+
+resetFenceAskState();
+check("no forwarding root exists before the first mint", currentForwardingRoot(), null);
+const mintedSession = "session id with spaces/and:colons";
+const minted = ensureForwardingRoot(mintedSession, "nonce-1");
+check("the minted root is stored on the shared state", currentForwardingRoot(), minted);
+check(
+	"re-minting with a different nonce returns the stored root",
+	ensureForwardingRoot(mintedSession, "nonce-2"),
+	minted,
+);
+checkDeep(
+	"the minted root composes from the session id and the first nonce",
+	minted,
+	composeForwardingRootPath(mintedSession, "nonce-1", os.tmpdir()),
+);
+checkContains("the minted root embeds the encoded session id", minted, encodePathSegment(mintedSession));
+checkContains("the minted root embeds the nonce", minted, "nonce-1");
+check(
+	"the minted root stays inside the tmpdir subtree",
+	minted.startsWith(os.tmpdir() + path.sep),
+	true,
+);
+check(
+	"a hostile session id survives as one encoded path segment under the base",
+	path.dirname(composeForwardingRootPath("../../etc-hostile", "n", "/base")),
+	"/base",
+);
+check(
+	"composition is deterministic per inputs",
+	composeForwardingRootPath("s", "n", "/base"),
+	composeForwardingRootPath("s", "n", "/base"),
+);
+check(
+	"different session ids mint different roots",
+	composeForwardingRootPath("s1", "n", "/base") !== composeForwardingRootPath("s2", "n", "/base"),
+	true,
+);
+resetFenceAskState();
+check("reset clears the minted root", currentForwardingRoot(), null);
+checkContains(
+	"a different session mints a different root",
+	ensureForwardingRoot("other-session", "nonce-3"),
+	"other-session",
+);
+resetFenceAskState();
+
+// --- unit 1-2: child provisioning env fragment ------------------------
+
+resetFenceAskState();
+const provisioningToken = randomUUID();
+const provisioningRoot = composeForwardingRootPath("prov-session", "prov-nonce", os.tmpdir());
+checkDeep(
+	"child provisioning env carries exactly the wire's root and token keys",
+	childProvisioningEnv({ childToken: provisioningToken, forwardingRoot: provisioningRoot }),
+	{ [CHILD_ASK_ROOT_ENV]: provisioningRoot, [CHILD_ASK_TOKEN_ENV]: provisioningToken },
+);
+let provisioningTokenThrew = false;
+try {
+	childProvisioningEnv({ childToken: "not-a-uuid", forwardingRoot: provisioningRoot });
+} catch {
+	provisioningTokenThrew = true;
+}
+check("child provisioning refuses a non-uuid token", provisioningTokenThrew, true);
+let provisioningRootThrew = false;
+try {
+	childProvisioningEnv({ childToken: provisioningToken, forwardingRoot: "relative/root" });
+} catch {
+	provisioningRootThrew = true;
+}
+check("child provisioning refuses a relative forwarding root", provisioningRootThrew, true);
+let provisioningTraversalThrew = false;
+try {
+	childProvisioningEnv({ childToken: provisioningToken, forwardingRoot: "/tmp/x/../root" });
+} catch {
+	provisioningTraversalThrew = true;
+}
+check("child provisioning refuses a traversal-carrying root", provisioningTraversalThrew, true);
+
+// --- unit 1-2: composed inherited roots as the child env value --------
+
+checkDeep(
+	"the env value joins the composed union with the env delimiter",
+	inheritedExtraRootsEnvValue({
+		configRoots: ["/cfg/a"],
+		overlayRoots: ["/overlay/b"],
+		envRoots: ["/env/c"],
+		parentGrantRoots: ["/grants/d"],
+		parentSessionCwd: "/work/parent",
+		dispatchCwd: "/work/parent",
+	}),
+	["/cfg/a", "/overlay/b", "/env/c", "/grants/d"].join(path.delimiter),
+);
+check(
+	"composition with no sources serializes to the empty value",
+	inheritedExtraRootsEnvValue({
+		configRoots: [],
+		overlayRoots: [],
+		envRoots: [],
+		parentGrantRoots: [],
+		parentSessionCwd: "/work/same",
+		dispatchCwd: "/work/same",
+	}),
+	"",
+);
+check(
+	"the Q4 parent cwd rides the env value when the dispatch cwd differs",
+	inheritedExtraRootsEnvValue({
+		configRoots: [],
+		overlayRoots: [],
+		envRoots: [],
+		parentGrantRoots: [],
+		parentSessionCwd: "/work/parent",
+		dispatchCwd: "/work/child",
+	}).includes("/work/parent"),
+	true,
+);
+resetFenceAskState();
+const envGrantDir = "/env-value-probe/granted";
+recordParentGrant(envGrantDir, 1000);
+check(
+	"a parent-own grant reaches the child env value",
+	inheritedExtraRootsEnvValue({
+		configRoots: [],
+		overlayRoots: [],
+		envRoots: [],
+		parentGrantRoots: parentGrantedDirectories(),
+		parentSessionCwd: "/p",
+		dispatchCwd: "/p",
+	}).includes(envGrantDir),
+	true,
+);
+resetFenceAskState();
+
 // --- ledger: globalThis convergence ----------------------------------
 
 resetFenceAskState();
@@ -961,6 +1116,7 @@ check("reset empties the grants map", sharedState.grantsByChild.size, 0);
 check("reset empties the pending map", sharedState.pendingByChild.size, 0);
 check("reset empties the parent-own grants", sharedState.parentOwnGrants.length, 0);
 check("reset empties the session denial map", sharedState.sessionWideDenied.size, 0);
+check("reset clears the forwarding root", sharedState.forwardingRoot, null);
 
 // ---------------------------------------------------------------------
 
