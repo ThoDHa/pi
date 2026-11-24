@@ -49,7 +49,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-const { default: createCooldownExtension, ENTRY_TYPE, statusKeyFor, collectPendingWaits, loadCooldownConfig, validateCooldownConfig, findCooldownEntry, matchesEntryModel, parseResetEpochMs, planCooldownArm, planRestartResume, formatResumeClock, formatCountdown } = await import("../extensions/cooldown.ts");
+const { default: createCooldownExtension, ENTRY_TYPE, statusKeyFor, collectPendingWaits, loadCooldownConfig, loadCooldownConfigWithLocalOverride, validateCooldownConfig, findCooldownEntry, matchesEntryModel, parseResetEpochMs, planCooldownArm, planRestartResume, formatResumeClock, formatCountdown } = await import("../extensions/cooldown.ts");
 
 const ZAI_OFFSET_MINUTES = 480;
 const VERBATIM_1308 = 'Error: 429: {"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-11-23 06:58:41"}';
@@ -150,7 +150,7 @@ function persistedEntry(data) {
 
 // --- mock pi/ctx runtime for wiring tests ------------------------------
 
-function createRuntime({ config, mode = "tui", hasUI = true, tickMs } = {}) {
+function createRuntime({ config, configPath: explicitConfigPath, mode = "tui", hasUI = true, tickMs } = {}) {
 	const handlers = new Map();
 	const commands = new Map();
 	const sent = [];
@@ -196,7 +196,8 @@ function createRuntime({ config, mode = "tui", hasUI = true, tickMs } = {}) {
 		},
 	};
 	let configPath;
-	if (config !== undefined) {
+	if (explicitConfigPath !== undefined) configPath = explicitConfigPath;
+	else if (config !== undefined) {
 		configPath = path.join(mkdtempSync(path.join(tmpdir(), "cooldown-test-")), "cooldown.json");
 		writeFileSync(configPath, JSON.stringify(config));
 	}
@@ -373,6 +374,66 @@ test("loadCooldownConfig on invalid JSON fails safe with a problem", () => {
 	const result = loadCooldownConfig(file);
 	assert.equal(result.ok, false);
 	assert.ok(result.problems.length >= 1);
+});
+
+// --- local config override -----------------------------------------------
+
+/** A tempdir with a tracked default and, when given, a cooldown.local.json (object serializes, string lands verbatim); returns the default path. */
+function tempConfigDir(tracked, local) {
+	const dir = mkdtempSync(path.join(tmpdir(), "cooldown-local-"));
+	const defaultPath = path.join(dir, "cooldown.json");
+	writeFileSync(defaultPath, JSON.stringify(tracked));
+	if (local !== undefined) writeFileSync(path.join(dir, "cooldown.local.json"), typeof local === "string" ? local : JSON.stringify(local));
+	return defaultPath;
+}
+
+const LOCAL_ONLY_CONFIG = {
+	maxResumeAttempts: 2,
+	resumeOnRestart: true,
+	resumePrompt: "local prompt",
+	providers: [{ name: "local-only", match: { provider: "local" }, errorPattern: "limit", resetTimePattern: "at (\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})", utcOffsetMinutes: 0, bufferMinutes: 3 }],
+};
+
+test("a valid local config wholly replaces the tracked default", () => {
+	const defaultPath = tempConfigDir(rawConfig({ defaultBufferMinutes: 7 }), LOCAL_ONLY_CONFIG);
+	const result = loadCooldownConfigWithLocalOverride(defaultPath);
+	assert.equal(result.ok, true);
+	assert.deepEqual(result.config.providers.map((entry) => entry.name), ["local-only"]);
+	assert.equal(result.config.maxResumeAttempts, 2);
+	assert.equal(result.config.resumeOnRestart, true);
+	assert.equal(result.config.resumePrompt, "local prompt");
+	assert.equal(result.config.defaultBufferMinutes, 2, "document-level replacement: the tracked file's 7-minute override must not merge through");
+});
+
+test("an invalid local config leaves the lookup inert naming the local path", () => {
+	const brokenJson = loadCooldownConfigWithLocalOverride(tempConfigDir(rawConfig(), "{ not json"));
+	assert.equal(brokenJson.ok, false);
+	assert.ok(brokenJson.problems.some((problem) => problem.includes("cooldown.local.json")));
+	const schemaInvalid = loadCooldownConfigWithLocalOverride(tempConfigDir(rawConfig(), { providers: [] }));
+	assert.equal(schemaInvalid.ok, false);
+	assert.ok(schemaInvalid.problems.every((problem) => problem.includes("cooldown.local.json")), "schema problems name the local path, not silently the tracked one");
+});
+
+test("an absent local config loads the tracked default exactly as before", () => {
+	const defaultPath = tempConfigDir(rawConfig({ defaultBufferMinutes: 7 }));
+	const result = loadCooldownConfigWithLocalOverride(defaultPath);
+	assert.equal(result.ok, true);
+	assert.equal(result.config.providers[0].name, "zai-glm");
+	assert.equal(result.config.defaultBufferMinutes, 7);
+});
+
+test("an explicit configPath bypasses the local lookup entirely", async () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "cooldown-local-"));
+	const trackedPath = path.join(dir, "cooldown.json");
+	writeFileSync(trackedPath, JSON.stringify(rawConfig()));
+	writeFileSync(path.join(dir, "cooldown.local.json"), JSON.stringify(LOCAL_ONLY_CONFIG));
+	const runtime = createRuntime({ configPath: trackedPath });
+	await startRuntime(runtime);
+	await messageEnd(runtime, { role: "assistant", stopReason: "error", errorMessage: "limit at 2026-01-02 03:04:05", provider: "local", model: "local-model" });
+	assert.equal(runtime.appended.length, 0, "the local file's provider is invisible under an explicit configPath");
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	assert.equal(lastAppend(runtime).data.state, "waiting", "the tracked file's provider armed");
+	await shutdownRuntime(runtime);
 });
 
 // --- entry matching -----------------------------------------------------

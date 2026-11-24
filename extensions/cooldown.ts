@@ -298,6 +298,9 @@ export function validateCooldownConfig(raw: unknown): ConfigResult {
 	return { ok: true, config: { defaultBufferMinutes, maxResumeAttempts, resumeOnRestart, resumePrompt, providers } };
 }
 
+/** Filename of the untracked local override resolved beside the tracked default config. */
+const LOCAL_CONFIG_FILENAME = "cooldown.local.json";
+
 /**
  * Read and validate the config sidecar at filePath. Missing file, invalid
  * JSON, and schema problems all come back as ok: false with a problem
@@ -319,6 +322,39 @@ export function loadCooldownConfig(filePath: string): ConfigResult {
 		return { ok: false, problems: [`cooldown config: ${filePath} is not valid JSON: ${reason}`] };
 	}
 	return validateCooldownConfig(raw);
+}
+
+/**
+ * Load the effective config for a tracked default path: a
+ * cooldown.local.json beside it, when present, is the entire config —
+ * valid replaces the tracked default wholesale with no field merge,
+ * invalid (unreadable, broken JSON, schema problems) leaves the caller
+ * inert with problems naming the local path, and an absent local file
+ * loads the tracked default exactly as before. An explicit configPath
+ * bypasses this lookup entirely, so tests and pointed setups stay
+ * deterministic; the local file itself stays untracked by the
+ * extensions default-deny gitignore.
+ */
+export function loadCooldownConfigWithLocalOverride(defaultPath: string): ConfigResult {
+	const localPath = path.join(path.dirname(defaultPath), LOCAL_CONFIG_FILENAME);
+	let text: string;
+	try {
+		text = readFileSync(localPath, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return loadCooldownConfig(defaultPath);
+		const reason = error instanceof Error ? error.message : String(error);
+		return { ok: false, problems: [`cooldown config: cannot read ${localPath}: ${reason}`] };
+	}
+	let raw: unknown;
+	try {
+		raw = JSON.parse(text);
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		return { ok: false, problems: [`cooldown config: ${localPath} is not valid JSON: ${reason}`] };
+	}
+	const result = validateCooldownConfig(raw);
+	if (result.ok) return result;
+	return { ok: false, problems: result.problems.map((problem) => `${localPath}: ${problem}`) };
 }
 
 /**
@@ -506,7 +542,7 @@ export function formatCountdown(fireAtMs: number, nowMs: number): string {
 
 export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExtensionOptions = {}): void {
 	const configPath = options.configPath ?? path.join(path.dirname(fileURLToPath(import.meta.url)), "cooldown.json");
-	const loaded = loadCooldownConfig(configPath);
+	const loaded = options.configPath !== undefined ? loadCooldownConfig(configPath) : loadCooldownConfigWithLocalOverride(configPath);
 	const config: ResolvedConfig | undefined = loaded.ok ? loaded.config : undefined;
 	const problems = loaded.ok ? [] : loaded.problems;
 	const tickMs = options.tickMs ?? MINUTE_MS;
