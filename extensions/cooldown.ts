@@ -134,6 +134,8 @@ export type RestartDecision =
 
 export interface CooldownExtensionOptions {
 	configPath?: string;
+	/** Root directory holding the tracked default cooldown.json and its cooldown.local.json override; defaults to the extension's own directory. Test-serving seam so tests never touch the live install dir. */
+	defaultConfigRoot?: string;
 	/** Countdown refresh period in milliseconds; defaults to one minute. */
 	tickMs?: number;
 }
@@ -577,7 +579,7 @@ export function formatCountdown(fireAtMs: number, nowMs: number): string {
 }
 
 export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExtensionOptions = {}): void {
-	const configPath = options.configPath ?? path.join(path.dirname(fileURLToPath(import.meta.url)), "cooldown.json");
+	const configPath = options.configPath ?? path.join(options.defaultConfigRoot ?? path.dirname(fileURLToPath(import.meta.url)), "cooldown.json");
 	const loaded = options.configPath !== undefined ? loadCooldownConfig(configPath) : loadCooldownConfigWithLocalOverride(configPath);
 	const config: ResolvedConfig | undefined = loaded.ok ? loaded.config : undefined;
 	const localOverridePath = loaded.ok ? loaded.localOverridePath : undefined;
@@ -895,7 +897,7 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 		// tombstones: the switch itself does not survive a restart, so a
 		// restart must still be able to re-adjudicate the untouched persistence.
 		states.clear();
-		if (ctx.hasUI) ctx.ui.notify("cooldown: auto-recovery is off for this session; pending waits cancelled; they return after a reload or restart; /cooldown on re-enables", "info");
+		if (ctx.hasUI) ctx.ui.notify("cooldown: auto-recovery is off for this session; pending waits cancelled; they return after a reload unless autoResume is disabled; a restart re-adjudicates them under resumeOnRestart; /cooldown on re-enables", "info");
 	}
 
 	pi.registerCommand("cooldown", {

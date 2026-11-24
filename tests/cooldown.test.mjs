@@ -173,7 +173,7 @@ function persistedEntry(data) {
 
 // --- mock pi/ctx runtime for wiring tests ------------------------------
 
-function createRuntime({ config, configPath: explicitConfigPath, mode = "tui", hasUI = true, tickMs } = {}) {
+function createRuntime({ config, configPath: explicitConfigPath, defaultConfigRoot, mode = "tui", hasUI = true, tickMs } = {}) {
 	const handlers = new Map();
 	const commands = new Map();
 	const sent = [];
@@ -226,6 +226,7 @@ function createRuntime({ config, configPath: explicitConfigPath, mode = "tui", h
 	}
 	const factoryOptions = {};
 	if (configPath !== undefined) factoryOptions.configPath = configPath;
+	if (defaultConfigRoot !== undefined) factoryOptions.defaultConfigRoot = defaultConfigRoot;
 	if (tickMs !== undefined) factoryOptions.tickMs = tickMs;
 	createCooldownExtension(pi, factoryOptions);
 	return { handlers, commands, sent, appended, notifies, statuses, statusCalls, ctx, branchEntries, setIdle: (value) => (idle = value) };
@@ -460,17 +461,13 @@ test("an explicit configPath bypasses the local lookup entirely", async () => {
 });
 
 test("session_start announces when the local override wins the config lookup", async () => {
-	const localPath = path.join(path.dirname(new URL(import.meta.url).pathname), "..", "extensions", "cooldown.local.json");
-	writeFileSync(localPath, JSON.stringify(rawConfig({ defaultBufferMinutes: 9 })));
-	try {
-		const runtime = createRuntime();
-		await startRuntime(runtime);
-		assert.ok(runtime.notifies.some((notification) => notification.level === "info" && notification.message.includes("cooldown config") && notification.message.includes("cooldown.local.json") && notification.message.includes("override")), "the origin notify names the local path as the active config");
-		await shutdownRuntime(runtime);
-	} finally {
-		rmSync(localPath, { force: true });
-	}
-	const fresh = createRuntime();
+	const dir = path.dirname(tempConfigDir(rawConfig(), rawConfig({ defaultBufferMinutes: 9 })));
+	const runtime = createRuntime({ defaultConfigRoot: dir });
+	await startRuntime(runtime);
+	assert.ok(runtime.notifies.some((notification) => notification.level === "info" && notification.message.includes("cooldown config") && notification.message.includes("cooldown.local.json") && notification.message.includes("override")), "the origin notify names the local path as the active config");
+	await shutdownRuntime(runtime);
+	rmSync(path.join(dir, "cooldown.local.json"), { force: true });
+	const fresh = createRuntime({ defaultConfigRoot: dir });
 	await startRuntime(fresh);
 	assert.ok(!fresh.notifies.some((notification) => notification.message.includes("override")), "no origin notify when the local file is absent");
 	await shutdownRuntime(fresh);
@@ -1626,7 +1623,7 @@ test("cooldown off cancels every pending wait in memory without tombstones", asy
 	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")) && runtime.statuses.has(statusKeyFor("acme-pro")), "both waits armed");
 	const appendsAtOff = runtime.appended.length;
 	await runtime.commands.get("cooldown").handler("off", runtime.ctx);
-	assert.ok(runtime.notifies.some((notification) => notification.message.includes("cancelled") && notification.message.includes("return") && notification.message.includes("reload") && notification.message.includes("restart")), "the off notify states the cancelled waits return after reload or restart");
+	assert.ok(runtime.notifies.some((notification) => notification.message.includes("cancelled") && notification.message.includes("return after a reload unless autoResume is disabled") && notification.message.includes("re-adjudicates them under resumeOnRestart")), "the off notify states the reload return is autoResume-gated and a restart re-adjudicates under resumeOnRestart");
 	assert.equal(runtime.statuses.size, 0, "off clears every entry's footer segment");
 	await sleep(40);
 	assert.equal(runtime.sent.length, 0, "off cancels the timers, nothing fires");
