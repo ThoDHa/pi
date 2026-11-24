@@ -155,6 +155,7 @@ import {
 	childProxyHandler,
 	configureForwardingServer,
 	ensureForwardingServer,
+	servingMaxAgeMs,
 	stopForwardingServer,
 } from "../extensions/fence-ask/serve.ts";
 
@@ -2070,6 +2071,210 @@ resetFenceAskState();
 	if (typeof savedRoot === "string") process.env[CHILD_ASK_ROOT_ENV] = savedRoot;
 	if (typeof savedToken === "string") process.env[CHILD_ASK_TOKEN_ENV] = savedToken;
 	fs.rmSync(proxyRoot, { recursive: true, force: true });
+}
+resetFenceAskState();
+
+// --- unit 1-4 DC-2: the spawn-site default proxy resolver ------------
+// A provisioned process starts serving through childProxyHandler the
+// moment it dispatches (ensureForwardingServer at its own spawn site),
+// before and regardless of any session_start configuration: a one-shot
+// json middle's session_start delivery must not be load-bearing for
+// the nested channel (review 17 DC-2). A top without provisioning
+// keeps the null default, so session_start's UI layering stays the
+// only change there.
+
+resetFenceAskState();
+{
+	const savedRoot = process.env[CHILD_ASK_ROOT_ENV];
+	const savedToken = process.env[CHILD_ASK_TOKEN_ENV];
+	const defaultRoot = ensureForwardingRoot("dc2-default-suite", randomUUID());
+	const defaultToken = randomUUID();
+	registerLiveChild(defaultToken, "dc2-middle", "dc2 dispatch", 150_000);
+	process.env[CHILD_ASK_ROOT_ENV] = defaultRoot;
+	process.env[CHILD_ASK_TOKEN_ENV] = defaultToken;
+	try {
+		configureForwardingServer({ resolveHandler: null });
+		ensureForwardingServer();
+		const defaultResolver = globalThis.__piFenceAskServer.resolveHandler;
+		check("the spawn-site start installed a resolver without session_start", typeof defaultResolver, "function");
+		const defaultSurface = defaultResolver ? defaultResolver() : null;
+		check("the default resolver serves the proxy role for a provisioned process", typeof defaultSurface, "function");
+		const probeAsk = createForwardedAsk({
+			requestId: randomUUID(),
+			childToken: randomUUID(),
+			agentName: "dc2-wire",
+			dispatchLabel: "dc2 wire label",
+			toolName: "read",
+			resolvedPath: "/opt/dc2-probe",
+			reason: "dc2 probe evidence",
+			askedAt: 150_000,
+		});
+		const probeRuling = defaultSurface(probeAsk, {
+			requestId: probeAsk.requestId,
+			childToken: defaultToken,
+			agentName: "dc2-registry",
+			dispatchLabel: "dc2 registry label",
+			directory: "/opt/dc2-probe",
+		});
+		await waitFor(() => requestIdsIn(defaultRoot).length === 1);
+		await serveForwardingRootTick({ root: defaultRoot, handler: async () => true, now: () => 150_100, maxAge: 60_000 });
+		check("the default proxy surface forwarded under the process token", await probeRuling, true);
+	} finally {
+		stopForwardingServer({ removeRoot: true });
+		if (typeof savedRoot === "string") process.env[CHILD_ASK_ROOT_ENV] = savedRoot;
+		else delete process.env[CHILD_ASK_ROOT_ENV];
+		if (typeof savedToken === "string") process.env[CHILD_ASK_TOKEN_ENV] = savedToken;
+		else delete process.env[CHILD_ASK_TOKEN_ENV];
+	}
+}
+resetFenceAskState();
+{
+	const savedRoot = process.env[CHILD_ASK_ROOT_ENV];
+	const savedToken = process.env[CHILD_ASK_TOKEN_ENV];
+	delete process.env[CHILD_ASK_ROOT_ENV];
+	delete process.env[CHILD_ASK_TOKEN_ENV];
+	const toplessRoot = ensureForwardingRoot("dc2-topless-suite", randomUUID());
+	try {
+		configureForwardingServer({ resolveHandler: null });
+		ensureForwardingServer();
+		const toplessResolver = globalThis.__piFenceAskServer.resolveHandler;
+		check("a top without provisioning keeps the null default", toplessResolver ? toplessResolver() : null, null);
+	} finally {
+		stopForwardingServer({ removeRoot: true });
+		if (typeof savedRoot === "string") process.env[CHILD_ASK_ROOT_ENV] = savedRoot;
+		if (typeof savedToken === "string") process.env[CHILD_ASK_TOKEN_ENV] = savedToken;
+	}
+	fs.rmSync(toplessRoot, { recursive: true, force: true });
+}
+resetFenceAskState();
+{
+	const topRoot = path.join(os.tmpdir(), `fence-ask-suite-dc2-${randomUUID()}`);
+	createForwardingRootDirs(topRoot);
+	const middleToken = randomUUID();
+	registerLiveChild(middleToken, "dc2-middle-child", "dc2 dispatch", 160_000);
+	const topPrompt = [];
+	const driverSource = `
+const ledgerPath = ${JSON.stringify(pathToFileURL(path.join(e2eRepoRoot, "extensions", "fence-ask", "grant-ledger.ts")).href)};
+const channelPath = ${JSON.stringify(pathToFileURL(path.join(e2eRepoRoot, "extensions", "fence-ask", "ask-channel.ts")).href)};
+const servePath = ${JSON.stringify(pathToFileURL(path.join(e2eRepoRoot, "extensions", "fence-ask", "serve.ts")).href)};
+const { ensureForwardingRoot, registerLiveChild } = await import(ledgerPath);
+const { forwardOutOfScopeAsk } = await import(channelPath);
+const { ensureForwardingServer } = await import(servePath);
+const grandchildToken = crypto.randomUUID();
+const middleRoot = ensureForwardingRoot("dc2-driver-session", crypto.randomUUID());
+ensureForwardingServer();
+registerLiveChild(grandchildToken, "dc2-worker", "dc2 nested dispatch", 1);
+const outcome = await forwardOutOfScopeAsk({
+	root: middleRoot,
+	childToken: grandchildToken,
+	toolName: "read",
+	directory: "/opt/dc2-target",
+	reason: "dc2 grandchild ask",
+	identityAgentName: "dc2-driver",
+	identityDispatchLabel: "dc2",
+	waitMs: 20000,
+	pollMs: 10,
+	onGrant: () => {},
+});
+console.log(JSON.stringify({ status: outcome.status }));
+process.exit(0);
+`;
+	const driverPromise = runDriver(
+		driverSource,
+		{
+			[CHILD_ASK_ROOT_ENV]: topRoot,
+			[CHILD_ASK_TOKEN_ENV]: middleToken,
+		},
+		30_000,
+	);
+	const proxyAppeared = await waitFor(() => requestIdsIn(topRoot).length === 1, 20_000);
+	await serveForwardingRootTick({
+		root: topRoot,
+		handler: async (ask, provenance) => {
+			topPrompt.push({ ask, provenance });
+			return true;
+		},
+		now: () => 160_100,
+		maxAge: 60_000,
+	});
+	const driverResult = await driverPromise;
+	check("the dc2 driver exited cleanly", driverResult.code, 0);
+	const dc2Json = JSON.parse(driverResult.stdout.trim().split("\n").pop());
+	check("the default proxy served the nested chain without session_start", dc2Json.status, "applied");
+	check("the proxy ask reached the top root", proxyAppeared !== null, true);
+	check("the top prompted once for the dc2 middle", topPrompt.length, 1);
+	fs.rmSync(topRoot, { recursive: true, force: true });
+}
+resetFenceAskState();
+
+// --- unit 1-4 DC-1: bound-aware admit ordering -----------------------
+// Serial prompting is the accepted posture (batching one Yes across N
+// asks would coarsen the per-ask provenance discipline), so the tick
+// walks request files oldest-first: under concurrent children the
+// longest-waiting ask surfaces first, which buys back the widest
+// liveness margin the serial shape allows. The env-derived serving
+// staleness bound rides the same block: raising PISCOPE_ASK_WAIT_MS
+// extends the children's patience and the host lifetime together, so
+// the documented multi-child knob stays coherent (review 17 S-1).
+
+{
+	const savedWait = process.env[ASK_WAIT_ENV];
+	delete process.env[ASK_WAIT_ENV];
+	check("the serving staleness bound defaults to the locked bound", servingMaxAgeMs(), 120_000);
+	process.env[ASK_WAIT_ENV] = "300000";
+	check("the serving staleness bound follows the env override", servingMaxAgeMs(), 300_000);
+	process.env[ASK_WAIT_ENV] = "not-a-number";
+	check("a garbage override falls back to the locked bound", servingMaxAgeMs(), 120_000);
+	if (typeof savedWait === "string") process.env[ASK_WAIT_ENV] = savedWait;
+	else delete process.env[ASK_WAIT_ENV];
+}
+{
+	const orderRoot = path.join(os.tmpdir(), `fence-ask-suite-order-${randomUUID()}`);
+	createForwardingRootDirs(orderRoot);
+	const oldToken = randomUUID();
+	const youngToken = randomUUID();
+	registerLiveChild(oldToken, "order-old", "older dispatch", 170_000);
+	registerLiveChild(youngToken, "order-young", "younger dispatch", 170_000);
+	const oldId = randomUUID();
+	const youngId = randomUUID();
+	writeForwardedAsk(orderRoot, {
+		requestId: youngId,
+		childToken: youngToken,
+		agentName: "order-young",
+		dispatchLabel: "younger dispatch",
+		toolName: "read",
+		resolvedPath: "/opt/order-young",
+		reason: "younger ask",
+		askedAt: 170_200,
+	});
+	writeForwardedAsk(orderRoot, {
+		requestId: oldId,
+		childToken: oldToken,
+		agentName: "order-old",
+		dispatchLabel: "older dispatch",
+		toolName: "read",
+		resolvedPath: "/opt/order-old",
+		reason: "older ask",
+		askedAt: 170_000,
+	});
+	const oldPath = path.join(orderRoot, "requests", `${oldId}.json`);
+	const youngPath = path.join(orderRoot, "requests", `${youngId}.json`);
+	fs.utimesSync(oldPath, new Date(170_000), new Date(170_000));
+	fs.utimesSync(youngPath, new Date(170_200), new Date(170_200));
+	const promptOrder = [];
+	await serveForwardingRootTick({
+		root: orderRoot,
+		handler: async (ask) => {
+			promptOrder.push(ask.resolvedPath);
+			return true;
+		},
+		now: () => 170_300,
+		maxAge: 60_000,
+	});
+	check("the tick prompted both asks once", promptOrder.length, 2);
+	check("the oldest ask surfaced first", promptOrder[0], "/opt/order-old");
+	check("the younger ask surfaced second", promptOrder[1], "/opt/order-young");
+	fs.rmSync(orderRoot, { recursive: true, force: true });
 }
 resetFenceAskState();
 

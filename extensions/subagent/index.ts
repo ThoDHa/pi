@@ -466,24 +466,33 @@ async function runSingleAgent(
 		};
 		if (inheritedRootsValue.length > 0) childEnv[EXTRA_ROOTS_ENV] = inheritedRootsValue;
 		else delete childEnv[EXTRA_ROOTS_ENV];
+		// The invocation resolution stays ahead of registration: it is the
+		// last fallible step, and a throw here must leave no live token
+		// behind, per the same ordering rule the env fragment follows.
+		const invocation = getPiInvocation(args);
 		registerLiveChild(childToken, agentName, formatTaskPreview(task));
 
-		const exitCode = await new Promise<number>((resolve) => {
-			const invocation = getPiInvocation(args);
-			const proc = spawn(invocation.command, invocation.args, {
-				cwd: dispatchCwd,
-				env: childEnv,
-				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-			});
-			let buffer = "";
+		let exitCode: number;
+		try {
+			exitCode = await new Promise<number>((resolve) => {
+				const proc = spawn(invocation.command, invocation.args, {
+					cwd: dispatchCwd,
+					env: childEnv,
+					shell: false,
+					stdio: ["ignore", "pipe", "pipe"],
+				});
+				let buffer = "";
 
-			const killProc = () => {
-				proc.kill("SIGTERM");
-				setTimeout(() => {
-					if (!proc.killed) proc.kill("SIGKILL");
-				}, 5000);
-			};
+				// The SIGKILL escalation is armed only while the child runs;
+				// the close and error paths clear it so an aborted dispatch
+				// never holds the process open on the escalation timer.
+				let escalationTimer: ReturnType<typeof setTimeout> | null = null;
+				const killProc = () => {
+					proc.kill("SIGTERM");
+					escalationTimer = setTimeout(() => {
+						if (!proc.killed) proc.kill("SIGKILL");
+					}, 5000);
+				};
 
 			const processLine = (line: string) => {
 				if (!line.trim()) return;
@@ -548,12 +557,14 @@ async function runSingleAgent(
 				releaseChild(childToken);
 				if (buffer.trim()) processLine(buffer);
 				clearTimeout(hardTimeout);
+				if (escalationTimer !== null) clearTimeout(escalationTimer);
 				resolve(code ?? 0);
 			});
 
 			proc.on("error", () => {
 				releaseChild(childToken);
 				clearTimeout(hardTimeout);
+				if (escalationTimer !== null) clearTimeout(escalationTimer);
 				resolve(1);
 			});
 
@@ -565,7 +576,15 @@ async function runSingleAgent(
 				if (signal.aborted) killOnAbort();
 				else signal.addEventListener("abort", killOnAbort, { once: true });
 			}
-		});
+			});
+		} catch (spawnError) {
+			// The executor threw before the close and error handlers could
+			// run (spawn rejecting synchronously): retire the token the
+			// registration just issued so the ledger holds no live child
+			// with no process behind it, then surface the wiring defect.
+			releaseChild(childToken);
+			throw spawnError;
+		}
 
 		currentResult.exitCode = exitCode;
 		if (wasAborted) throw new Error("Subagent was aborted");

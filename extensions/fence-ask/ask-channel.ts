@@ -29,7 +29,10 @@
  *   are display-at-most and the parent's prompt never trusts them.
  * - serveForwardingRootTick is one parent-side sweep: expire stale
  *   hosts first (their files go with them), sweep orphaned files by
- *   age, then walk the request files. Admittance runs once per id
+ *   age, then walk the request files oldest-first (review 17 DC-1:
+ *   prompting is serial, so the longest-waiting ask surfaces first;
+ *   the accepted residual and the multi-child knob are stated in
+ *   docs/workspace-fence.md). Admittance runs once per id
  *   (pendingRequestLocation): an unknown id admits, an outstanding id
  *   rules through the injected handler (registry-bound provenance in,
  *   boolean ruling or null out), queued and coalesced ids wait, and a
@@ -287,8 +290,9 @@ export async function forwardOutOfScopeAsk(options: ForwardFlowOptions): Promise
 			blockReason: `${toolName} blocked by the workspace-fence: the ask-forwarding channel is unusable for ${directory} under ${root}: ${describeError(error)}; the call fails closed`,
 		};
 	}
-	const deadline = Date.now() + waitMs;
-	while (Date.now() < deadline) {
+	const startedAt = performance.now();
+	const deadline = startedAt + waitMs;
+	while (performance.now() < deadline) {
 		await pause(pollMs);
 		const decision = readForwardedDecision(root, requestId, childToken);
 		if (decision !== null) {
@@ -373,10 +377,23 @@ export async function serveForwardingRootTick(options: TickOptions): Promise<Tic
 	const sweepAgeMs = maxAge * 2;
 	sweepAgedRequestFiles(root, nowMs, sweepAgeMs, summary);
 	sweepAgedResponseFiles(root, nowMs, sweepAgeMs, summary);
-	for (const requestId of requestIdsIn(root)) {
+	// Bound-aware ordering (review 17 DC-1): prompting is serial, so the
+	// walk surfaces the longest-waiting ask first; equal mtimes keep
+	// readdir order, and unstatable files sort last rather than blocking
+	// the sweep.
+	const orderedRequests = requestIdsIn(root)
+		.map((requestId) => {
+			const name = askFileName(requestId);
+			if (name === null) return { requestId, name, mtimeMs: Number.POSITIVE_INFINITY };
+			try {
+				return { requestId, name, mtimeMs: fs.statSync(path.join(forwardingRequestsDir(root), name)).mtimeMs };
+			} catch {
+				return { requestId, name, mtimeMs: Number.POSITIVE_INFINITY };
+			}
+		})
+		.sort((a, b) => a.mtimeMs - b.mtimeMs);
+	for (const { requestId, name } of orderedRequests) {
 		const location = pendingRequestLocation(requestId);
-		const name = askFileName(requestId);
-		if (name === null) continue;
 		const text = readFileSyncOrNull(path.join(forwardingRequestsDir(root), name));
 		if (text === null) continue;
 		const ask = parseForwardedAsk(text);

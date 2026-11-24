@@ -229,7 +229,16 @@
  * factory's per-call allowed-roots build consumes that set via
  * childScopedAllowedRoots, so the granted directory admits from the
  * next verdict on. Denials, timeouts, and channel failures block
- * fail-closed with the flow's actionable reason.
+ * fail-closed with the flow's actionable reason. Residual at this
+ * honor site (unit 1-4 truthing, review 17 DC-3): the honor path is
+ * same-user-forgeable. A provisioned child holds the forwarding root
+ * and its token in its env, and the tmpdir subtree hosting the root is
+ * an always-allowed root, so a child, or prompt-injected code inside
+ * it, can write both a request and a matching wire-valid decision and
+ * this module will honor it with no user round-trip. The echo check is
+ * an accident guard, not integrity; no integrity wall is claimed at
+ * this boundary (the same-user wall is stated in the fence-ask module
+ * headers and docs/workspace-fence.md).
  */
 
 import * as fs from "node:fs";

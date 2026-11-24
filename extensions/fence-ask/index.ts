@@ -18,7 +18,12 @@
  *   pend and the staleness bound evicts them, and every downstream
  *   asker fails closed on its own wait bound. The resolver is read per
  *   tick, so the role tracks the current process env and UI, not the
- *   session_start snapshot.
+ *   session_start snapshot. The spawn-site start (unit 1-4, DC-2)
+ *   already installs the proxy role as the default for provisioned
+ *   processes, so a one-shot json middle never depends on this event
+ *   to serve its nested root; session_start layers the UI surface and
+ *   replaces the default in place, behavior-neutrally for provisioned
+ *   processes.
  *
  * - session_shutdown stops the server and removes the forwarding root
  *   this process created at its first spawn (stopForwardingServer),

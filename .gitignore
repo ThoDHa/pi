@@ -3,6 +3,7 @@
 !/README.md
 !/settings.json
 !/AGENTS.md
+!/docs/
 !/themes/
 !/prompts/
 !/.githooks/
@@ -13,6 +14,7 @@
 !/tests/provision-pi-tui.mjs
 !/tests/run-all.sh
 !/tests/README.md
+!/tests/fence-ask-smoke.mjs
 !/tests/task-storage-isolation/
 /extensions/*
 !/extensions/permission-gate.ts

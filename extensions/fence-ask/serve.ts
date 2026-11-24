@@ -22,7 +22,13 @@
  * When the process has a session UI, the entry factory wires ctx.ui
  * with askPromptTitle. When neither surface exists, entries pend and
  * the staleness bound evicts them, so every downstream ask fails
- * closed on its own wait bound.
+ * closed on its own wait bound. The spawn-site start installs the
+ * proxy role as the DEFAULT for provisioned processes (DC-2, unit
+ * 1-4), so a one-shot json middle serves its root from its first
+ * dispatch tick without depending on session_start delivery; the
+ * entry's session_start configuration replaces the default in place
+ * with the full role selection, behavior-neutrally for provisioned
+ * processes.
  *
  * Nested dispatch (report 13 DC-1): the proxy composition is the
  * designed fold. A grandchild's ask reaches the user through exactly
@@ -55,7 +61,7 @@ import {
 	POLL_INTERVAL_MS,
 	resolveAskWaitMs,
 } from "./ask-wire.ts";
-import { ASK_HOST_STALE_MS, currentForwardingRoot } from "./grant-ledger.ts";
+import { currentForwardingRoot } from "./grant-ledger.ts";
 import {
 	childProvisioningFromEnv,
 	createForwardingRootDirs,
@@ -120,6 +126,16 @@ export function configureForwardingServer(config: {
  * no-op before the first spawn (no minted root) and safe to call from
  * every spawn site. Sweeps overlap guard through the serving flag, and
  * the timer is unref'd so it never holds a draining process open.
+ *
+ * When no session_start configuration has landed yet, the start
+ * installs the default resolver (defaultResolveHandler): a process
+ * carrying ask-channel provisioning serves the proxy role from its
+ * first dispatch tick, so a one-shot json middle never depends on
+ * session_start delivery to serve its own root (review 17 DC-2); a
+ * top keeps the null default and session_start layers the UI surface
+ * in place, unchanged. The default reads the env per tick exactly
+ * like the entry's resolver, so a later configureForwardingServer
+ * replaces it behavior-neutrally for provisioned processes.
  */
 export function ensureForwardingServer(): void {
 	const handle = serverHandle();
@@ -127,6 +143,7 @@ export function ensureForwardingServer(): void {
 	const root = currentForwardingRoot();
 	if (root === null) return;
 	createForwardingRootDirs(root);
+	if (handle.resolveHandler === null) handle.resolveHandler = defaultResolveHandler;
 	handle.createdRoot = root;
 	handle.timer = setInterval(() => {
 		if (handle.serving) return;
@@ -134,13 +151,39 @@ export function ensureForwardingServer(): void {
 		if (current === null) return;
 		const handler = handle.resolveHandler === null ? null : handle.resolveHandler();
 		handle.serving = true;
-		void serveForwardingRootTick({ root: current, handler, maxAge: ASK_HOST_STALE_MS })
+		void serveForwardingRootTick({ root: current, handler, maxAge: servingMaxAgeMs(process.env) })
 			.catch(() => {})
 			.finally(() => {
 				handle.serving = false;
 			});
 	}, handle.tickMs);
 	handle.timer.unref?.();
+}
+
+/**
+ * The staleness bound the serving sweeps run under: the parent's own
+ * wait override when set, the locked bound otherwise. The parent
+ * composes its children's env from this process env, so the value is
+ * the user's multi-child knob, not child-controllable; deriving the
+ * host lifetime from the same knob keeps pended and queued entries
+ * alive exactly as long as their askers listen (review 17 S-1).
+ */
+export function servingMaxAgeMs(env: NodeJS.ProcessEnv = process.env): number {
+	return resolveAskWaitMs(env[ASK_WAIT_ENV]);
+}
+
+/**
+ * The per-tick ruling-surface default the spawn-site start installs:
+ * a process carrying ask-channel provisioning proxies unresolved asks
+ * up through its own token; anything else (a top without provisioning)
+ * resolves null so entries pend for the staleness bound. Read per
+ * tick, so the role tracks the current process env like the entry's
+ * resolver, and session_start's configureForwardingServer replaces it
+ * in place with the full role selection (proxy, UI, or null).
+ */
+function defaultResolveHandler(): AskRulingHandler | null {
+	if (childProvisioningFromEnv() === null) return null;
+	return childProxyHandler();
 }
 
 /**

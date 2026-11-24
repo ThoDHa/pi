@@ -16,6 +16,24 @@ node suites; the moved task-storage-isolation family under
 lint gates require python3, tasks, node, bwrap, and shellcheck on the
 host; `ISOLATION_ALLOW_DEGRADED=1` runs the degraded posture instead).
 
+## Manual harness-level smoke (needs the pi binary, not part of run-all)
+
+    node tests/fence-ask-smoke.mjs
+
+The FENCE-1 landing's live integration check. Leg A runs the real
+`pi --mode json -p --no-session` binary with cwd at this repo, so the
+real loader discovers the whole extensions/ family (every factory must
+load; the incident rule at the binary level), plus a probe extension
+recording session_start and session_shutdown to a marker file; the run
+dies at the provider call on an invalid API key, so it is free and
+fast, and the session_start marker is the live-delivery evidence for
+one-shot json children (review 17 DC-2). Leg B drives the real
+child-side production path (forwardHeadlessAsk from the real
+workspace-fence module) in a subprocess against a stub parent serving
+the forwarding root with the real tick: grant applies and becomes
+visible to the per-call allowed-roots build, deny fails closed naming
+the user decision, timeout fails closed naming the bound.
+
 ## Manual suites (LLM-calling, not part of run-all)
 
     bash tests/task-storage-isolation/run-skeleton.sh [model]
