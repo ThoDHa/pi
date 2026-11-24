@@ -72,6 +72,29 @@ const now = Date.now();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Recording setInterval/clearInterval spies for the duration of run; originals restored even when run throws. */
+async function withIntervalSpy(run) {
+	const realSetInterval = global.setInterval;
+	const realClearInterval = global.clearInterval;
+	const created = [];
+	const cleared = [];
+	global.setInterval = (callback, ms) => {
+		const handle = realSetInterval(callback, ms);
+		created.push({ handle, ms });
+		return handle;
+	};
+	global.clearInterval = (handle) => {
+		cleared.push(handle);
+		return realClearInterval(handle);
+	};
+	try {
+		return await run({ created, cleared });
+	} finally {
+		global.setInterval = realSetInterval;
+		global.clearInterval = realClearInterval;
+	}
+}
+
 /** Provider stamps carry no sub-second precision; align test bases so parsed epochs compare exactly. */
 const wholeSecond = (ms) => ms - (ms % 1000);
 
@@ -1138,6 +1161,16 @@ test("restart with resumeOnRestart false drops the status and waits for the user
 	assert.equal(runtime.sent.length, 0);
 });
 
+test("a gated drop under hasUI false lands the tombstone and notifies nothing", async () => {
+	const runtime = createRuntime({ hasUI: false });
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "zai-glm", resetAtMs: now + 60 * MINUTES, fireAtMs: now + 62 * MINUTES, attempts: 1 }));
+	await startRuntime(runtime, "resume");
+	assert.equal(runtime.notifies.length, 0, "a headless run records the drop without notifies");
+	assert.equal(lastAppend(runtime).data.state, "cancelled", "the gate's tombstone still lands");
+	assert.equal(lastAppend(runtime).data.gate, "resumeOnRestart");
+	await shutdownRuntime(runtime);
+});
+
 test("restart scans only waiting entries: a newest fired entry means no resume", async () => {
 	const runtime = createRuntime({ config: rawConfig({ resumeOnRestart: true }) });
 	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "zai-glm", resetAtMs: now - 5 * MINUTES, fireAtMs: now - 2 * MINUTES, attempts: 1 }));
@@ -1446,8 +1479,10 @@ test("simulating over a simulated wait still arms and extends", async () => {
 test("the armed footer status shows the live countdown with the resume budget", async () => {
 	const runtime = createRuntime();
 	await startRuntime(runtime);
-	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 251 * MINUTES)));
-	assert.equal(runtime.statuses.get(statusKeyFor("zai-glm")), "⏳ zai-glm in 4h 12m · 0/5 resumes used");
+	const resetAt = wholeSecond(Date.now()) + 251 * MINUTES;
+	await messageEnd(runtime, assistantError(fixture1308(resetAt)));
+	const expected = formatCountdown(resetAt + 2 * MINUTES, Date.now());
+	assert.equal(runtime.statuses.get(statusKeyFor("zai-glm")), `⏳ zai-glm in ${expected} · 0/5 resumes used`);
 	await shutdownRuntime(runtime);
 });
 
@@ -1466,62 +1501,43 @@ test("the countdown tick arms with the wait and refreshes the footer on every ti
 	await shutdownRuntime(runtime);
 });
 
+test("degenerate tickMs values fall back to the minute default instead of arming a busy loop", async () => {
+	for (const degenerate of [0, -5, Number.NaN, Number.POSITIVE_INFINITY]) {
+		await withIntervalSpy(async ({ created }) => {
+			const runtime = createRuntime({ tickMs: degenerate });
+			await startRuntime(runtime);
+			await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 5 * MINUTES)));
+			assert.equal(created.length, 1, `tickMs ${degenerate} arms exactly one tick interval`);
+			assert.equal(created[0].ms, MINUTES, `tickMs ${degenerate} must fall back to the one-minute default`);
+			await shutdownRuntime(runtime);
+		});
+	}
+});
+
 test("cancel clears the countdown tick interval", async () => {
 	const runtime = createRuntime({ tickMs: 20 });
 	await startRuntime(runtime);
-	const realSetInterval = global.setInterval;
-	const realClearInterval = global.clearInterval;
-	const created = [];
-	const cleared = [];
-	global.setInterval = (callback, ms) => {
-		const handle = realSetInterval(callback, ms);
-		created.push(handle);
-		return handle;
-	};
-	global.clearInterval = (handle) => {
-		cleared.push(handle);
-		return realClearInterval(handle);
-	};
-	try {
+	await withIntervalSpy(async ({ created, cleared }) => {
 		await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 5 * MINUTES)));
 		assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")), "wait armed");
 		await runtime.commands.get("cooldown").handler("cancel", runtime.ctx);
-	} finally {
-		global.setInterval = realSetInterval;
-		global.clearInterval = realClearInterval;
-	}
-	assert.equal(created.length, 1, "arming the wait created exactly one interval");
-	assert.ok(cleared.includes(created[0]), "cancel cleared the armed tick interval");
-	assert.equal(runtime.statuses.has(statusKeyFor("zai-glm")), false);
-	assert.equal(runtime.sent.length, 0);
+		assert.equal(created.length, 1, "arming the wait created exactly one interval");
+		assert.ok(cleared.includes(created[0].handle), "cancel cleared the armed tick interval");
+		assert.equal(runtime.statuses.has(statusKeyFor("zai-glm")), false);
+		assert.equal(runtime.sent.length, 0);
+	});
 });
 
 test("session_shutdown clears the countdown tick interval", async () => {
 	const runtime = createRuntime({ tickMs: 20 });
 	await startRuntime(runtime);
-	const realSetInterval = global.setInterval;
-	const realClearInterval = global.clearInterval;
-	const created = [];
-	const cleared = [];
-	global.setInterval = (callback, ms) => {
-		const handle = realSetInterval(callback, ms);
-		created.push(handle);
-		return handle;
-	};
-	global.clearInterval = (handle) => {
-		cleared.push(handle);
-		return realClearInterval(handle);
-	};
-	try {
+	await withIntervalSpy(async ({ created, cleared }) => {
 		await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 5 * MINUTES)));
 		await shutdownRuntime(runtime);
-	} finally {
-		global.setInterval = realSetInterval;
-		global.clearInterval = realClearInterval;
-	}
-	assert.equal(created.length, 1, "arming the wait created exactly one interval");
-	assert.ok(cleared.includes(created[0]), "shutdown cleared the armed tick interval");
-	assert.equal(runtime.sent.length, 0);
+		assert.equal(created.length, 1, "arming the wait created exactly one interval");
+		assert.ok(cleared.includes(created[0].handle), "shutdown cleared the armed tick interval");
+		assert.equal(runtime.sent.length, 0);
+	});
 });
 
 test("fire clears the countdown tick: the footer status is not resurrected after the resume", async () => {

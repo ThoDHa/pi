@@ -566,7 +566,9 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 	const loaded = options.configPath !== undefined ? loadCooldownConfig(configPath) : loadCooldownConfigWithLocalOverride(configPath);
 	const config: ResolvedConfig | undefined = loaded.ok ? loaded.config : undefined;
 	const problems = loaded.ok ? [] : loaded.problems;
-	const tickMs = options.tickMs ?? MINUTE_MS;
+	// A degenerate tickMs would arm a busy loop of status writes; keep the
+	// countdown on the one-minute default instead.
+	const tickMs = options.tickMs !== undefined && isFiniteNumber(options.tickMs) && options.tickMs > 0 ? options.tickMs : MINUTE_MS;
 	const states = new Map<string, CooldownState>();
 	const timers = new Map<string, ReturnType<typeof setTimeout>>();
 	const ticks = new Map<string, ReturnType<typeof setInterval>>();
