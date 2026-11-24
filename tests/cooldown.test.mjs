@@ -1568,6 +1568,91 @@ test("a non-assistant message_end takes the early return without touching states
 	await shutdownRuntime(runtime);
 });
 
+// --- wiring: runtime auto-resume toggle -----------------------------------
+
+test("cooldown off cancels every pending wait in memory without tombstones", async () => {
+	const runtime = createRuntime({ config: twoProviderConfig() });
+	await startRuntime(runtime);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 40 * MINUTES)));
+	await messageEnd(runtime, acmeError(acmeFixture(wholeSecond(now) + 50 * MINUTES)));
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")) && runtime.statuses.has(statusKeyFor("acme-pro")), "both waits armed");
+	const appendsAtOff = runtime.appended.length;
+	await runtime.commands.get("cooldown").handler("off", runtime.ctx);
+	assert.equal(runtime.statuses.size, 0, "off clears every entry's footer segment");
+	await sleep(40);
+	assert.equal(runtime.sent.length, 0, "off cancels the timers, nothing fires");
+	assert.equal(runtime.appended.length, appendsAtOff, "the off cancel stays in memory: no tombstones");
+	await shutdownRuntime(runtime);
+});
+
+test("cooldown off blocks arming with one passive notify naming the reset time", async () => {
+	const runtime = createRuntime();
+	await startRuntime(runtime);
+	await runtime.commands.get("cooldown").handler("off", runtime.ctx);
+	const notifiesAtOff = runtime.notifies.length;
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	assert.equal(runtime.appended.length, 0, "no wait arms while off");
+	assert.equal(runtime.statuses.size, 0, "no footer while off");
+	const passives = runtime.notifies.slice(notifiesAtOff).filter((notification) => notification.level === "info" && notification.message.includes("off"));
+	assert.equal(passives.length, 1, "exactly one passive notify per matching limit error");
+	assert.ok(passives[0].message.includes("zai-glm"));
+	assert.ok(/\d\d:\d\d/.test(passives[0].message), "the parsed reset time is named");
+	await runtime.commands.get("cooldown").handler("", runtime.ctx);
+	assert.ok(runtime.notifies.at(-1).message.includes("off"), "/cooldown reports the switch state while off");
+	await shutdownRuntime(runtime);
+});
+
+test("cooldown on restores arming after off cancelled the pending wait", async () => {
+	const runtime = createRuntime();
+	await startRuntime(runtime);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 40 * MINUTES)));
+	await runtime.commands.get("cooldown").handler("off", runtime.ctx);
+	assert.equal(runtime.statuses.size, 0, "off cancels the pending wait");
+	await runtime.commands.get("cooldown").handler("on", runtime.ctx);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 50 * MINUTES)));
+	assert.equal(runtime.appended.length, 2, "the post-on 1308 arms a fresh wait");
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")), "the restored wait renders its footer segment");
+	await shutdownRuntime(runtime);
+});
+
+test("the runtime switch resets to the config default on reload and in a fresh factory", async () => {
+	const runtime = createRuntime();
+	await startRuntime(runtime);
+	await runtime.commands.get("cooldown").handler("off", runtime.ctx);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	assert.equal(runtime.appended.length, 0, "off blocks arming");
+	await startRuntime(runtime, "reload");
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	assert.equal(runtime.appended.length, 1, "reload resets the switch to the config default");
+	const fresh = createRuntime();
+	await startRuntime(fresh);
+	await messageEnd(fresh, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	assert.equal(fresh.appended.length, 1, "a fresh factory starts from the config default");
+	await shutdownRuntime(runtime);
+	await shutdownRuntime(fresh);
+});
+
+test("autoResume false starts the session with the switch off", async () => {
+	const resolved = validateCooldownConfig(rawConfig({ autoResume: false }));
+	assert.equal(resolved.ok, true);
+	assert.equal(resolved.config.autoResume, false);
+	const runtime = createRuntime({ config: rawConfig({ autoResume: false }) });
+	await startRuntime(runtime);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	assert.equal(runtime.appended.length, 0, "autoResume false disables at start");
+	assert.ok(runtime.notifies.some((notification) => notification.level === "info" && notification.message.includes("off")), "the passive notify fires");
+	await runtime.commands.get("cooldown").handler("on", runtime.ctx);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	assert.equal(runtime.appended.length, 1, "runtime on re-enables per-session despite autoResume false");
+	await shutdownRuntime(runtime);
+});
+
+test("an autoResume of the wrong type fails the existing config validation", () => {
+	const result = validateCooldownConfig(rawConfig({ autoResume: "yes" }));
+	assert.equal(result.ok, false);
+	assert.ok(result.problems.some((problem) => problem.includes("autoResume")));
+});
+
 // --- formatting -------------------------------------------------------------
 
 test("formatResumeClock renders a non-empty clock string", () => {

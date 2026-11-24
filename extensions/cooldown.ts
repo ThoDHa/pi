@@ -73,7 +73,7 @@ const MINUTE_MS = 60_000;
 const TIMEOUT_CAP_MS = 2 ** 31 - 1;
 const MAX_OFFSET_MINUTES = 840;
 const STAMP_PATTERN = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/;
-const TOP_DEFAULTS = { defaultBufferMinutes: 2, maxResumeAttempts: 5, resumeOnRestart: false } as const;
+const TOP_DEFAULTS = { defaultBufferMinutes: 2, maxResumeAttempts: 5, resumeOnRestart: false, autoResume: true } as const;
 
 /** One pending recovery: which provider entry, the parsed deadline, how many resumes it already used, and the errored model pinned at arm time. */
 export interface CooldownState {
@@ -103,6 +103,8 @@ export interface ResolvedConfig {
 	defaultBufferMinutes: number;
 	maxResumeAttempts: number;
 	resumeOnRestart: boolean;
+	/** Starting state of the runtime auto-resume switch; false only disables at session start. */
+	autoResume: boolean;
 	resumePrompt: string;
 	providers: ResolvedProviderEntry[];
 }
@@ -203,6 +205,15 @@ export function validateCooldownConfig(raw: unknown): ConfigResult {
 		}
 	}
 
+	let autoResume = TOP_DEFAULTS.autoResume;
+	if (root.autoResume !== undefined) {
+		if (typeof root.autoResume !== "boolean") {
+			problems.push(`autoResume must be a boolean, got ${JSON.stringify(root.autoResume)}`);
+		} else {
+			autoResume = root.autoResume;
+		}
+	}
+
 	let resumePrompt = DEFAULT_RESUME_PROMPT;
 	if (root.resumePrompt !== undefined) {
 		if (!nonEmptyString(root.resumePrompt)) {
@@ -298,7 +309,7 @@ export function validateCooldownConfig(raw: unknown): ConfigResult {
 	}
 
 	if (problems.length > 0) return { ok: false, problems };
-	return { ok: true, config: { defaultBufferMinutes, maxResumeAttempts, resumeOnRestart, resumePrompt, providers } };
+	return { ok: true, config: { defaultBufferMinutes, maxResumeAttempts, resumeOnRestart, autoResume, resumePrompt, providers } };
 }
 
 /** Filename of the untracked local override resolved beside the tracked default config. */
@@ -573,6 +584,10 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 	const timers = new Map<string, ReturnType<typeof setTimeout>>();
 	const ticks = new Map<string, ReturnType<typeof setInterval>>();
 	const disabled = new Set<string>();
+	// Runtime master switch, user-commanded via /cooldown off|on. Deliberately
+	// not persisted: a fresh session or /reload falls back to the config's
+	// autoResume default, per the user ruling that off must not survive.
+	let autoResumeEnabled = config?.autoResume !== false;
 	let sessionCtx: ExtensionContext | undefined;
 
 	function entryByName(entryName: string): ResolvedProviderEntry | undefined {
@@ -663,6 +678,15 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 			if (simulated && ctx.hasUI) ctx.ui.notify(`${prefix}the error text matched no configured provider entry; nothing armed`, "info");
 			return;
 		}
+		if (!autoResumeEnabled) {
+			const resetAtMs = parseResetEpochMs(entry, message.errorMessage);
+			if (ctx.hasUI) {
+				ctx.ui.notify(resetAtMs !== undefined
+					? `${prefix}auto-recovery is off; ${entry.name} limit window resets around ${formatResumeClock(resetAtMs)}; send /cooldown on to re-enable`
+					: `${prefix}auto-recovery is off; send /cooldown on to re-enable`, "info");
+			}
+			return;
+		}
 		if (disabled.has(entry.name)) {
 			if (ctx.hasUI) {
 				ctx.ui.notify(simulated
@@ -736,6 +760,7 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 		clearAllTimers();
 		states.clear();
 		disabled.clear();
+		autoResumeEnabled = config?.autoResume !== false;
 		if (config === undefined) {
 			if (ctx.hasUI) ctx.ui.notify(`cooldown extension is disabled: ${problems.join("; ")}`, "error");
 			return;
@@ -818,7 +843,8 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 		if (!ctx.hasUI) return;
 		if (states.size === 0) {
 			const suffix = disabled.size > 0 ? ` (auto-recovery disabled for ${[...disabled].join(", ")} until the next successful turn)` : "";
-			ctx.ui.notify(`cooldown: no pending usage-limit wait${suffix}`, "info");
+			const offNote = autoResumeEnabled ? "" : " (auto-recovery is off; /cooldown on re-enables)";
+			ctx.ui.notify(`cooldown: no pending usage-limit wait${suffix}${offNote}`, "info");
 			return;
 		}
 		for (const [entryName, state] of states) {
@@ -842,8 +868,21 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 		}
 	}
 
+	function disableAutoResume(ctx: ExtensionContext): void {
+		autoResumeEnabled = false;
+		for (const [entryName] of states) {
+			clearTimer(entryName);
+			if (ctx.hasUI) ctx.ui.setStatus(statusKeyFor(entryName), undefined);
+		}
+		// The cancels stay in memory on purpose, unlike /cooldown cancel's
+		// tombstones: the switch itself does not survive a restart, so a
+		// restart must still be able to re-adjudicate the untouched persistence.
+		states.clear();
+		if (ctx.hasUI) ctx.ui.notify("cooldown: auto-recovery is off for this session; pending waits cancelled; /cooldown on re-enables", "info");
+	}
+
 	pi.registerCommand("cooldown", {
-		description: "Show or cancel the pending usage-limit cooldown",
+		description: "Show, cancel, or switch the pending usage-limit cooldown",
 		handler: async (args, ctx) => {
 			if (!requireConfig(ctx)) return;
 			const arg = (args ?? "").trim().toLowerCase();
@@ -851,11 +890,20 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 				cancelPending(ctx);
 				return;
 			}
+			if (arg === "off") {
+				disableAutoResume(ctx);
+				return;
+			}
+			if (arg === "on") {
+				autoResumeEnabled = true;
+				if (ctx.hasUI) ctx.ui.notify("cooldown: auto-recovery is on for this session", "info");
+				return;
+			}
 			if (arg === "") {
 				showStatus(ctx);
 				return;
 			}
-			if (ctx.hasUI) ctx.ui.notify("cooldown: use '/cooldown' for status or '/cooldown cancel' to abort the pending wait", "info");
+			if (ctx.hasUI) ctx.ui.notify("cooldown: use '/cooldown' for status, '/cooldown off' or '/cooldown on' for the session switch, or '/cooldown cancel' to abort the pending wait", "info");
 		},
 	});
 
