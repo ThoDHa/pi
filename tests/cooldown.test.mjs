@@ -1653,6 +1653,34 @@ test("an autoResume of the wrong type fails the existing config validation", () 
 	assert.ok(result.problems.some((problem) => problem.includes("autoResume")));
 });
 
+test("autoResume false tombstones the previous session's waits at start instead of resuming them", async () => {
+	const runtime = createRuntime({ config: twoProviderConfig({ resumeOnRestart: true, autoResume: false }) });
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "zai-glm", resetAtMs: now - 5 * MINUTES, fireAtMs: now - 2 * MINUTES, attempts: 1 }));
+	runtime.branchEntries.push(persistedEntry({ state: "waiting", entryName: "acme-pro", resetAtMs: now + 60 * MINUTES, fireAtMs: now + 62 * MINUTES, attempts: 1 }));
+	await startRuntime(runtime, "resume");
+	await sleep(20);
+	assert.equal(runtime.sent.length, 0, "no resume fires in a session that starts off");
+	assert.equal(runtime.statuses.size, 0);
+	const cancels = runtime.appended.filter((append) => append.data.state === "cancelled");
+	assert.equal(cancels.length, 2, "both persisted waits land tombstones");
+	assert.ok(cancels.every((append) => append.data.gate === "autoResume"));
+	assert.ok(runtime.notifies.some((notification) => notification.message.includes("autoResume")), "the drop notify names the autoResume gate");
+	await shutdownRuntime(runtime);
+});
+
+test("while off, a non-limit error from a matching provider stays silent", async () => {
+	const runtime = createRuntime();
+	await startRuntime(runtime);
+	await runtime.commands.get("cooldown").handler("off", runtime.ctx);
+	const notifiesAtOff = runtime.notifies.length;
+	await messageEnd(runtime, { role: "assistant", stopReason: "error", errorMessage: "ECONNRESET socket hung up", provider: "zai", model: "glm-5.3" });
+	assert.equal(runtime.appended.length, 0);
+	assert.equal(runtime.notifies.length, notifiesAtOff, "no passive notify without a matched limit error");
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	assert.equal(runtime.notifies.length, notifiesAtOff + 1, "a real limit error still notifies exactly once");
+	await shutdownRuntime(runtime);
+});
+
 // --- formatting -------------------------------------------------------------
 
 test("formatResumeClock renders a non-empty clock string", () => {

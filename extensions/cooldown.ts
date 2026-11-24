@@ -128,7 +128,7 @@ export type ArmDecision =
 
 export type RestartDecision =
 	| { action: "none" }
-	| { action: "drop"; state: CooldownState; gate: "resumeOnRestart" | "fork" }
+	| { action: "drop"; state: CooldownState; gate: "resumeOnRestart" | "fork" | "autoResume" }
 	| { action: "rearm"; state: CooldownState }
 	| { action: "resume_now"; state: CooldownState };
 
@@ -595,7 +595,7 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 	}
 
 	/** Persist a superseding cancelled record; `gate` records which gate dropped the wait. */
-	function persistCancelled(state: CooldownState, gate?: "resumeOnRestart" | "fork"): void {
+	function persistCancelled(state: CooldownState, gate?: "resumeOnRestart" | "fork" | "autoResume"): void {
 		pi.appendEntry(ENTRY_TYPE, { state: "cancelled", entryName: state.entryName, fireAtMs: state.fireAtMs, attempts: state.attempts, ...(gate !== undefined ? { gate } : {}), cancelledAtMs: Date.now() });
 	}
 
@@ -679,6 +679,10 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 			return;
 		}
 		if (!autoResumeEnabled) {
+			// Only a matched limit error earns the passive notify: the off branch
+			// mirrors the arming path's own pattern gate, so unrelated errors stay
+			// as silent as they are with the switch on.
+			if (typeof message.errorMessage !== "string" || !entry.errorPattern.test(message.errorMessage)) return;
 			const resetAtMs = parseResetEpochMs(entry, message.errorMessage);
 			if (ctx.hasUI) {
 				ctx.ui.notify(resetAtMs !== undefined
@@ -773,7 +777,10 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 		// branch is the surprise the user ruled against; startup, new, and
 		// resume stay fully gated by resumeOnRestart.
 		for (const state of collectPendingWaits(ctx.sessionManager.getBranch())) {
-			const decision = planRestartResume(state, config.resumeOnRestart, Date.now(), event.reason);
+			let decision = planRestartResume(state, config.resumeOnRestart, Date.now(), event.reason);
+			if (!autoResumeEnabled && (decision.action === "rearm" || decision.action === "resume_now")) {
+				decision = { action: "drop", state: decision.state, gate: "autoResume" };
+			}
 			if (decision.action === "none") continue;
 			const entry = entryByName(decision.state.entryName);
 			if (entry === undefined) {
@@ -789,7 +796,9 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 				persistCancelled(decision.state, decision.gate);
 				if (ctx.hasUI) {
 					ctx.ui.setStatus(statusKeyFor(decision.state.entryName), undefined);
-					const gateNote = decision.gate === "fork" ? "not auto-resumed into a freshly forked session" : "not auto-resumed (resumeOnRestart: false)";
+					const gateNote = decision.gate === "fork" ? "not auto-resumed into a freshly forked session"
+						: decision.gate === "autoResume" ? "not auto-resumed (autoResume: false)"
+						: "not auto-resumed (resumeOnRestart: false)";
 					ctx.ui.notify(`cooldown: pending ${decision.state.entryName} wait from the previous session is ${gateNote}; deadline was ${formatResumeClock(decision.state.fireAtMs)}; send a message to continue`, "info");
 				}
 				continue;
