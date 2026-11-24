@@ -18,15 +18,19 @@
  * live session. Type-only imports strip out before resolution and
  * need no stubs.
  *
- * The probe pins three layers: the real subagent module graph links
+ * The probe pins four layers: the real subagent module graph links
  * and evaluates (its top level runs for real: the timeout env read,
  * the schema constants over the typebox stub, the exit hook), the
  * default export is a function and the factory completes registration
  * against a recording stub (two registerTool calls naming the subagent
- * and jobs tools, three event handlers), and the touched fence-ask and
+ * and jobs tools, three event handlers), the touched fence-ask and
  * workspace-fence modules load standalone with the unit 1-2 surface
  * present (childProvisioningEnv, the forwarding-root mint,
- * inheritedExtraRootsEnvValue, recordParentOwnGrant).
+ * inheritedExtraRootsEnvValue, recordParentOwnGrant) plus the unit
+ * 1-3 surface (the headless forward branch, the child-scoped roots
+ * build), and the fence-ask entry loads standalone and its factory
+ * registers the session lifecycle pair, the live-load discipline the
+ * incident rule demands of every loadable entry.
  */
 
 import { register } from "node:module";
@@ -137,6 +141,28 @@ check("grant-ledger carries the parent-own recorder feed", typeof grantLedger.re
 const fence = await import("../extensions/workspace-fence.ts");
 check("workspace-fence loads standalone", typeof fence.recordParentOwnGrant, "function");
 check("workspace-fence keeps the spawn composition input", typeof fence.fenceExtraRoots, "function");
+check("workspace-fence carries the headless forward branch", typeof fence.forwardHeadlessAsk, "function");
+check("workspace-fence carries the child-scoped roots build", typeof fence.childScopedAllowedRoots, "function");
+
+const fenceAskEntry = await import("../extensions/fence-ask/index.ts");
+check("the fence-ask entry loads standalone", typeof fenceAskEntry.default, "function");
+const entryRegistrations = [];
+let entryThrew = null;
+try {
+	fenceAskEntry.default({
+		on(name, handler) {
+			entryRegistrations.push(`${String(name)}:${typeof handler}`);
+		},
+	});
+} catch (error) {
+	entryThrew = error;
+}
+check("the fence-ask entry factory completes against a recording stub", entryThrew, null);
+check(
+	"the fence-ask entry registers the session lifecycle pair",
+	entryRegistrations.join(","),
+	"session_start:function,session_shutdown:function",
+);
 
 const passed = total - failed;
 console.log(`\n${passed}/${total} passed, ${failed} failed`);

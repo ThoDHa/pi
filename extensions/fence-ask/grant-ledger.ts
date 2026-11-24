@@ -39,6 +39,13 @@
  *   parent-own grant after a denial is the user's later word); a cap
  *   denial records nothing, because it judges the child's cadence, not
  *   the directory.
+ * - appliedSelfGrants: the dual-form roots this process's OWN forward
+ *   branch got granted (unit 1-3). In a dispatched child this is the
+ *   grant application surface the fence's allowed-roots build consumes;
+ *   in the parent it stays empty, because the parent's own verdicts
+ *   never consult the ledger. Proxy flows never write here either: a
+ *   proxy grant binds the grandchild token in the middle's ledger
+ *   (property 3), never the middle's own verdicts.
  *
  * Memory is in-process and process-lifetime (locked with the user,
  * sign-off Q3): grants die with the parent process, so there are no
@@ -81,7 +88,7 @@
 
 import * as os from "node:os";
 import * as path from "node:path";
-import { DEFAULT_ASK_WAIT_MS, encodePathSegment } from "./ask-wire.ts";
+import { DEFAULT_ASK_WAIT_MS, encodePathSegment, expandGrantedRoot } from "./ask-wire.ts";
 import type { DecisionVia, ForwardedDecision } from "./ask-wire.ts";
 
 /**
@@ -195,6 +202,15 @@ export interface FenceAskState {
 	/** Child token -> its admission state. */
 	pendingByChild: Map<string, ChildPendingAsks>;
 	/**
+	 * The dual-form roots THIS process's own forwarded asks got granted
+	 * (unit 1-3): the child-side forward branch appends here on a grant
+	 * and the fence's per-call allowed-roots build concats it, so the
+	 * granted directory admits from the next verdict on. Proxy flows
+	 * never write here: a proxy grant binds the grandchild token in the
+	 * middle's ledger, never the middle's own verdicts.
+	 */
+	appliedSelfGrants: string[];
+	/**
 	 * The parent session's ask-forwarding root (unit 1-2), minted once
 	 * per process at the first spawn and shared with the serving loop
 	 * through this state; null until minted. Carries no directory
@@ -270,6 +286,7 @@ export function getFenceAskState(): FenceAskState {
 		parentOwnGrants: [],
 		liveChildren: new Map(),
 		pendingByChild: new Map(),
+		appliedSelfGrants: [],
 		forwardingRoot: null,
 	};
 	return globalThis.__piFenceAskState;
@@ -288,6 +305,7 @@ export function resetFenceAskState(): void {
 	state.parentOwnGrants.length = 0;
 	state.liveChildren.clear();
 	state.pendingByChild.clear();
+	state.appliedSelfGrants.length = 0;
 	state.forwardingRoot = null;
 }
 
@@ -371,9 +389,42 @@ export function parentGrantedDirectories(): string[] {
 	return getFenceAskState().parentOwnGrants.map((grant) => grant.directory);
 }
 
-/** Every session-wide granted directory, in first-grant order. */
+/**
+ * Every session-wide granted directory, in first-grant order. ASK-DEDUP
+ * INDEX ONLY, never an inheritance source: composition reads
+ * parentGrantedDirectories (parent-own records) exclusively, so a name
+ * like this one must not be mistaken for a property-1 producer.
+ */
 export function sessionGrantedDirectories(): string[] {
 	return [...getFenceAskState().sessionWideGranted.keys()];
+}
+
+/**
+ * The dual-form roots this process's own forwarded asks got granted,
+ * in application order. The fence's factory concats these into every
+ * per-call allowed-roots build; nothing else consumes them.
+ */
+export function appliedSelfGrants(): string[] {
+	return [...getFenceAskState().appliedSelfGrants];
+}
+
+/**
+ * Apply one approved forward grant to this process's own verdicts
+ * (unit 1-3, the child-side forward branch): expand the granted root
+ * to its literal-plus-realpath dual forms (expandGrantedRoot) and add
+ * every unseen form to appliedSelfGrants, so the next verdict admits
+ * the directory under either spelling (the normalization contract's
+ * anti-livelock rule). Trusted in-process caller; the realpath is the
+ * caller's fs resolution, null when it failed. Returns the forms now
+ * stored for this root, in dual-form order.
+ */
+export function applyGrantToSelf(root: string, rootRealpath: string | null): string[] {
+	const forms = expandGrantedRoot(root, rootRealpath);
+	const applied = getFenceAskState().appliedSelfGrants;
+	for (const form of forms) {
+		if (!applied.includes(form)) applied.push(form);
+	}
+	return forms;
 }
 
 /**
@@ -484,6 +535,31 @@ export function outstandingAskForChild(childToken: string): PendingAsk | null {
 }
 
 /**
+ * Where a request id sits in the ledger, or null when no pending
+ * entry (host, queue entry, or coalesced attachment) carries it (unit
+ * 1-3, the serving tick's admit-once guard). "outstanding" means the
+ * entry currently awaits the user's ruling and must be prompted or
+ * re-prompted; "queued" means it waits behind a slot and must not be
+ * admitted again; "coalesced" means it rides a host and its decision
+ * arrives with the host's resolution. A promoted queue entry keeps
+ * its id, so the tick re-classifies it from queued to outstanding and
+ * prompts exactly then.
+ */
+export function pendingRequestLocation(requestId: string): "outstanding" | "queued" | "coalesced" | null {
+	for (const pending of getFenceAskState().pendingByChild.values()) {
+		if (pending.outstanding !== null) {
+			if (pending.outstanding.requestId === requestId) return "outstanding";
+			if (pending.outstanding.coalesced.some((entry) => entry.requestId === requestId)) return "coalesced";
+		}
+		for (const queued of pending.queue) {
+			if (queued.requestId === requestId) return "queued";
+			if (queued.coalesced.some((entry) => entry.requestId === requestId)) return "coalesced";
+		}
+	}
+	return null;
+}
+
+/**
  * How many of the child's own asks are in flight: the outstanding slot
  * plus its queue. Coalesced attachments do not count; they ride their
  * host's slot and belong to other request ids.
@@ -492,6 +568,37 @@ export function pendingAskCountForChild(childToken: string): number {
 	const pending = getFenceAskState().pendingByChild.get(childToken);
 	if (pending === undefined) return 0;
 	return pending.queue.length + (pending.outstanding === null ? 0 : 1);
+}
+
+/**
+ * Drop one pending ask WITHOUT recording deny memory (unit 1-3, the
+ * proxy-timeout semantics): the middle's proxy flow whose up-chain
+ * wait expired knows no authority ruled, so the local entry must
+ * vanish without a session-deny record and without grants, and the
+ * asker's own untouched wait bound then expires into its fail-closed
+ * timeout. Resolves the entry by its own request id or any coalesced
+ * attachment's id, evicts host and attachments (queue promotion when
+ * an outstanding slot vacates), and returns every evicted id in
+ * eviction order; an unknown id drops nothing and returns empty.
+ */
+export function dropChildAsk(requestId: string): string[] {
+	const state = getFenceAskState();
+	for (const pending of state.pendingByChild.values()) {
+		if (pending.outstanding !== null) {
+			if (pending.outstanding.requestId === requestId) {
+				return evictPendingHost({ pending, entry: pending.outstanding, queued: false });
+			}
+			if (pending.outstanding.coalesced.some((entry) => entry.requestId === requestId)) {
+				return evictPendingHost({ pending, entry: pending.outstanding, queued: false });
+			}
+		}
+		const index = pending.queue.findIndex(
+			(queued) =>
+				queued.requestId === requestId || queued.coalesced.some((entry) => entry.requestId === requestId),
+		);
+		if (index !== -1) return evictPendingHost({ pending, entry: pending.queue[index], queued: true });
+	}
+	return [];
 }
 
 function grantDecision(

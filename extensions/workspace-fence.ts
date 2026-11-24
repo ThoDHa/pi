@@ -21,9 +21,16 @@
  * answer other than Yes blocks with a reason naming the tool, the
  * resolved path, and the policy. A headless session (hasUI false)
  * blocks fail-closed with the same actionable reason plus the remedy
- * to run pi interactively. A degraded seal rides the same path: every
- * path-bearing verdict asks or blocks per the core's degradation
- * semantics. grep and find carry an optional search path that their
+ * to run pi interactively, with one exception: a dispatched child
+ * carrying ask-channel provisioning forwards the ask to its parent
+ * session through the fence-ask channel instead (unit FENCE-1-3),
+ * bounded by the locked wait bound, and applies a grant to its own
+ * verdicts on approval while every other outcome blocks fail-closed.
+ * A degraded seal rides the same path: every path-bearing verdict
+ * asks or blocks per the core's degradation semantics, and a degraded
+ * ask carries no escaping candidate, so a degraded headless child
+ * blocks without forwarding (seal degradation must never manufacture
+ * channel evidence). grep and find carry an optional search path that their
  * tools default to ".": the gate mirrors that default instead of
  * asking. The glob and pattern fields are in-scope metadata: ripgrep
  * roots --glob at the search directory and find globs within
@@ -212,6 +219,17 @@
  * into every dispatched child's PISCOPE_EXTRA_ROOTS, so a child's
  * starting scope is the parent's current granted scope; sibling
  * child-ask grants dedup at ask time and never compose silently.
+ *
+ * Unit 1-3 adds the runtime-grant consumer side for the child itself:
+ * a provisioned headless child's out-of-scope ask forwards through
+ * forwardHeadlessAsk (the fence-ask channel flow, keyed from the
+ * verdict's escaping candidate by classifyGrantCandidate and
+ * grantScopeDirectory), the approval applies to this child's own
+ * verdicts through applyGrantToSelf into appliedSelfGrants, and the
+ * factory's per-call allowed-roots build consumes that set via
+ * childScopedAllowedRoots, so the granted directory admits from the
+ * next verdict on. Denials, timeouts, and channel failures block
+ * fail-closed with the flow's actionable reason.
  */
 
 import * as fs from "node:fs";
@@ -220,9 +238,15 @@ import * as path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { grantScopeDirectory } from "./fence-ask/ask-wire.ts";
+import {
+	ASK_WAIT_ENV,
+	MAX_REASON_LENGTH,
+	grantScopeDirectory,
+	resolveAskWaitMs,
+} from "./fence-ask/ask-wire.ts";
 import type { AskCandidateForm } from "./fence-ask/ask-wire.ts";
-import { recordParentGrant } from "./fence-ask/grant-ledger.ts";
+import { appliedSelfGrants, applyGrantToSelf, recordParentGrant } from "./fence-ask/grant-ledger.ts";
+import { childProvisioningFromEnv, forwardOutOfScopeAsk } from "./fence-ask/ask-channel.ts";
 
 /**
  * Environment variable carrying extra allowed roots, colon-separated
@@ -975,7 +999,14 @@ function gatedToolPath(toolName: string, input: Record<string, unknown>): unknow
 export type PathGateDecision =
 	| { action: "pass" }
 	| { action: "ask"; title: string; denyReason: string; grantCandidate?: string }
-	| { action: "block"; reason: string };
+	| {
+			action: "block";
+			reason: string;
+			/** The escaping candidate on a headless block of a candidate-bearing ask; the factory's forward branch keys from it. Absent on degraded-seal and unusable-input blocks, which must never forward. */
+			grantCandidate?: string;
+			/** The ask verdict's policy detail, the evidence the forwarded prompt body renders. */
+			askEvidence?: string;
+	};
 
 /** Everything decidePathToolCall needs from one tool_call event. */
 export interface PathGateCall {
@@ -1021,7 +1052,12 @@ function scopeAskTitle(toolName: string, verdict: ScopeVerdict): string {
  * Shared ask-class assembly for both gates: the ask verdict becomes the
  * select title under UI (the post-prompt branches driven by approved),
  * the refusal reason under a No answer, and the refusal reason plus the
- * headless remedy as a fail-closed block without UI.
+ * headless remedy as a fail-closed block without UI. A headless block
+ * of a candidate-bearing ask also carries the candidate and the ask
+ * evidence, so the factory's forward branch can offer them to the
+ * channel; degraded-seal and unusable-input verdicts carry no escaping
+ * candidate, so their blocks cannot forward (the degraded-seal
+ * invariant: degradation never manufactures channel evidence).
  */
 function assembleGateDecision(
 	toolName: string,
@@ -1030,7 +1066,14 @@ function assembleGateDecision(
 	approved?: boolean,
 ): PathGateDecision {
 	const denyReason = scopeDenyReason(toolName, verdict);
-	if (!hasUI) return { action: "block", reason: `${denyReason}${HEADLESS_REMEDY}` };
+	if (!hasUI) {
+		return {
+			action: "block",
+			reason: `${denyReason}${HEADLESS_REMEDY}`,
+			grantCandidate: verdict.escapingCandidate,
+			askEvidence: verdict.detail,
+		};
+	}
 	if (approved === undefined) {
 		return {
 			action: "ask",
@@ -1671,6 +1714,71 @@ export function recordParentOwnGrant(candidate: unknown, now: number = Date.now(
 	return recordParentGrant(directory, now).directory;
 }
 
+function realpathOrNull(candidate: string): string | null {
+	try {
+		return fs.realpathSync(candidate);
+	} catch {
+		return null;
+	}
+}
+
+/** The allowed roots the factory builds per call: the static union plus this child's own applied forward grants. */
+export function childScopedAllowedRoots(sessionCwd: string): string[] {
+	return buildAllowedRoots(sessionCwd, [...fenceExtraRoots(), ...appliedSelfGrants()]);
+}
+
+/** Everything forwardHeadlessAsk needs for one forwarded call. */
+export interface HeadlessForwardCall {
+	/** The gated tool whose call asked (display on the parent prompt). */
+	toolName: string;
+	/** The verdict's escaping candidate, keyed per the grant-key contract. */
+	candidate: string;
+	/** The ask verdict's policy detail, rendered in the forwarded prompt body. */
+	askEvidence: string;
+	/** The child provisioning the spawn env carried. */
+	provisioning: { root: string; token: string };
+	/** The bounded wait; defaults to resolveAskWaitMs over the env override. */
+	waitMs?: number;
+	/** Poll spacing; defaults to the channel's calibrated bound. */
+	pollMs?: number;
+	/** Injectable pause for suites; defaults to a real timer. */
+	sleep?: (ms: number) => Promise<void>;
+}
+
+/** The pass or fail-closed-block outcome of one forwarded call. */
+export type HeadlessForwardDecision = { action: "pass" } | { action: "block"; reason: string };
+
+/**
+ * Run one provisioned headless child's forwarded ask (unit 1-3, the
+ * child-side consumer): derive the grant key from the escaping
+ * candidate per the form-aware grant-key contract, run the bounded
+ * channel flow, apply an approval to this child's own verdicts via
+ * applyGrantToSelf, and resolve into pass or a fail-closed block
+ * carrying the flow's actionable reason. The parent's approval binds
+ * this child only: the applied set feeds the per-call allowed-roots
+ * build (childScopedAllowedRoots), never another process's scope.
+ */
+export async function forwardHeadlessAsk(call: HeadlessForwardCall): Promise<HeadlessForwardDecision> {
+	const classified = classifyGrantCandidate(call.candidate);
+	const directory = grantScopeDirectory(call.candidate, classified.form, classified.resolvedRealpath);
+	const waitMs = call.waitMs ?? resolveAskWaitMs(process.env[ASK_WAIT_ENV]);
+	const outcome = await forwardOutOfScopeAsk({
+		root: call.provisioning.root,
+		childToken: call.provisioning.token,
+		toolName: call.toolName,
+		directory,
+		reason: `${call.candidate}: ${call.askEvidence}`.slice(0, MAX_REASON_LENGTH),
+		identityAgentName: `pid-${process.pid}`,
+		identityDispatchLabel: path.basename(process.cwd()),
+		waitMs,
+		pollMs: call.pollMs,
+		sleep: call.sleep,
+		onGrant: (grantedRoot) => applyGrantToSelf(grantedRoot, realpathOrNull(grantedRoot)),
+	});
+	if (outcome.status === "applied") return { action: "pass" };
+	return { action: "block", reason: outcome.blockReason };
+}
+
 /**
  * The extension entry point pi's loader requires (the permission-gate
  * shape): register one tool_call handler that maps the decision data
@@ -1689,14 +1797,29 @@ export default function (pi: ExtensionAPI) {
 			toolName: event.toolName,
 			input: event.input as Record<string, unknown>,
 			sessionCwd: ctx.cwd,
-			allowedRoots: buildAllowedRoots(ctx.cwd, fenceExtraRoots()),
+			allowedRoots: childScopedAllowedRoots(ctx.cwd),
 			hasUI: ctx.hasUI,
 		};
 		const decision = GATED_BASH_TOOLS.has(event.toolName)
 			? decideBashToolCall(shared)
 			: decidePathToolCall(shared);
 		if (decision.action === "pass") return undefined;
-		if (decision.action === "block") return { block: true, reason: decision.reason };
+		if (decision.action === "block") {
+			if (decision.grantCandidate !== undefined && !ctx.hasUI) {
+				const provisioning = childProvisioningFromEnv();
+				if (provisioning !== null) {
+					const forward = await forwardHeadlessAsk({
+						toolName: event.toolName,
+						candidate: decision.grantCandidate,
+						askEvidence: decision.askEvidence ?? "",
+						provisioning,
+					});
+					if (forward.action === "pass") return undefined;
+					return { block: true, reason: forward.reason };
+				}
+			}
+			return { block: true, reason: decision.reason };
+		}
 		const choice = await ctx.ui.select(decision.title, ["Yes", "No"]);
 		if (choice !== "Yes") return { block: true, reason: decision.denyReason };
 		if (decision.action === "ask") recordParentOwnGrant(decision.grantCandidate);

@@ -49,6 +49,7 @@ import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { releasePromptDir, writePromptToTempFile } from "./prompt-temp.ts";
 import { childProvisioningEnv } from "../fence-ask/ask-wire.ts";
+import { ensureForwardingServer } from "../fence-ask/serve.ts";
 import {
 	ensureForwardingRoot,
 	inheritedExtraRootsEnvValue,
@@ -449,6 +450,7 @@ async function runSingleAgent(
 		const childToken = randomUUID();
 		const dispatchCwd = cwd ?? defaultCwd;
 		const forwardingRoot = ensureForwardingRoot(parentSessionId ?? `pid-${process.pid}`, randomUUID());
+		ensureForwardingServer();
 		const inheritedRootsValue = inheritedExtraRootsEnvValue({
 			configRoots: fenceExtraRoots(),
 			overlayRoots: [],

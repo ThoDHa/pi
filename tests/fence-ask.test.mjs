@@ -66,8 +66,11 @@
  */
 
 import * as path from "node:path";
+import * as fs from "node:fs";
 import * as os from "node:os";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { pathToFileURL } from "node:url";
 import {
 	ASK_FILE_SUFFIX,
 	ASK_WAIT_ENV,
@@ -107,10 +110,13 @@ import {
 	ASK_USER_DENY_REASON,
 	ASK_USER_GRANT_REASON,
 	admitChildAsk,
+	appliedSelfGrants,
+	applyGrantToSelf,
 	childIdentity,
 	composeForwardingRootPath,
 	composeInheritedExtraRoots,
 	currentForwardingRoot,
+	dropChildAsk,
 	ensureForwardingRoot,
 	inheritedExtraRootsEnvValue,
 	expireStaleAsks,
@@ -122,6 +128,7 @@ import {
 	outstandingAskForChild,
 	parentGrantedDirectories,
 	pendingAskCountForChild,
+	pendingRequestLocation,
 	promptProvenanceForRequest,
 	recordParentGrant,
 	releaseChild,
@@ -130,6 +137,26 @@ import {
 	registerLiveChild,
 	sessionGrantedDirectories,
 } from "../extensions/fence-ask/grant-ledger.ts";
+import {
+	askPromptTitle,
+	childProvisioningFromEnv,
+	createForwardingRootDirs,
+	deleteAskFile,
+	deleteDecisionFile,
+	forwardOutOfScopeAsk,
+	readForwardedDecision,
+	requestIdsIn,
+	serveForwardingRootTick,
+	writeForwardedAsk,
+	writeForwardedDecision,
+} from "../extensions/fence-ask/ask-channel.ts";
+import {
+	SERVE_TICK_MS,
+	childProxyHandler,
+	configureForwardingServer,
+	ensureForwardingServer,
+	stopForwardingServer,
+} from "../extensions/fence-ask/serve.ts";
 
 let failed = 0;
 let total = 0;
@@ -1117,6 +1144,1066 @@ check("reset empties the pending map", sharedState.pendingByChild.size, 0);
 check("reset empties the parent-own grants", sharedState.parentOwnGrants.length, 0);
 check("reset empties the session denial map", sharedState.sessionWideDenied.size, 0);
 check("reset clears the forwarding root", sharedState.forwardingRoot, null);
+check("reset empties the applied self grants", sharedState.appliedSelfGrants.length, 0);
+
+// --- unit 1-3: the child-side applied self-grant set ----------------
+// The forward branch of a dispatched child applies an approved grant
+// to THIS process's fence verdicts through applyGrantToSelf, which
+// stores the expandGrantedRoot dual forms on the shared state so the
+// factory's per-call allowed-roots build can concat them. Proxy flows
+// (a middle serving its own root) never call it: a proxy grant binds
+// the grandchild, never the middle's own verdicts.
+
+resetFenceAskState();
+check("applied self grants start empty", appliedSelfGrants().length, 0);
+checkDeep(
+	"applyGrantToSelf stores the dual forms of a synonym-granted root",
+	applyGrantToSelf("/tmp/fence-ask-suite/granted", "/real/granted"),
+	["/tmp/fence-ask-suite/granted", "/real/granted"],
+);
+checkDeep(
+	"appliedSelfGrants exposes the stored dual forms",
+	appliedSelfGrants(),
+	["/tmp/fence-ask-suite/granted", "/real/granted"],
+);
+checkDeep(
+	"applyGrantToSelf with a null realpath stores the literal only",
+	applyGrantToSelf("/tmp/fence-ask-suite/asked", null),
+	["/tmp/fence-ask-suite/asked"],
+);
+checkDeep(
+	"applyGrantToSelf with the realpath equal to the literal stores no synonym",
+	applyGrantToSelf("/tmp/fence-ask-suite/granted", "/tmp/fence-ask-suite/granted"),
+	["/tmp/fence-ask-suite/granted"],
+);
+checkDeep(
+	"re-applying an already-applied root adds nothing",
+	appliedSelfGrants(),
+	["/tmp/fence-ask-suite/granted", "/real/granted", "/tmp/fence-ask-suite/asked"],
+);
+
+// --- unit 1-3: pendingRequestLocation and the proxy-timeout drop -------
+// The serving tick must know whether a request file's id already has a
+// ledger entry, because a promoted queue entry re-appears in requests/
+// with the same id and must be prompted, not re-admitted onto itself;
+// and a proxy whose up-chain wait expired must evict the local entry
+// WITHOUT deny memory, because no authority ruled (the asker's own
+// wait bound then expires and the asker fails closed).
+
+resetFenceAskState();
+const dropHostToken = randomUUID();
+const dropAttToken = randomUUID();
+const dropLaterToken = randomUUID();
+const dropQToken = randomUUID();
+registerLiveChild(dropHostToken, "host", "host dispatch", 10_000);
+registerLiveChild(dropAttToken, "attachment", "attachment dispatch", 10_000);
+registerLiveChild(dropLaterToken, "later", "later dispatch", 10_000);
+registerLiveChild(dropQToken, "qchild", "q dispatch", 10_000);
+const dropHostId = randomUUID();
+const dropAttId = randomUUID();
+const dropQueuedId = randomUUID();
+const dropLaterId = randomUUID();
+const dropQOutId = randomUUID();
+const dropQQueuedId = randomUUID();
+check("pendingRequestLocation is null for an unknown id", pendingRequestLocation(dropHostId), null);
+check(
+	"admit of the first ask lands it in the outstanding slot",
+	admitChildAsk(dropHostId, dropHostToken, "/opt/tools-a", 10_001).kind,
+	"outstanding",
+);
+check(
+	"a same-directory ask from another child coalesces onto the host",
+	admitChildAsk(dropAttId, dropAttToken, "/opt/tools-a", 10_002).kind,
+	"coalesced",
+);
+check(
+	"the host child's second distinct directory queues behind its slot",
+	admitChildAsk(dropQueuedId, dropHostToken, "/opt/tools-b", 10_003).kind,
+	"queued",
+);
+check(
+	"another child's ask for the queued directory coalesces onto it",
+	admitChildAsk(dropLaterId, dropLaterToken, "/opt/tools-b", 10_004).kind,
+	"coalesced",
+);
+check(
+	"an unrelated child's first ask takes its own outstanding slot",
+	admitChildAsk(dropQOutId, dropQToken, "/opt/tools-c", 10_005).kind,
+	"outstanding",
+);
+check(
+	"that child's second distinct directory queues too",
+	admitChildAsk(dropQQueuedId, dropQToken, "/opt/tools-e", 10_006).kind,
+	"queued",
+);
+check("pendingRequestLocation names the outstanding host", pendingRequestLocation(dropHostId), "outstanding");
+check(
+	"pendingRequestLocation names an outstanding attachment coalesced",
+	pendingRequestLocation(dropAttId),
+	"coalesced",
+);
+check("pendingRequestLocation names a queued entry", pendingRequestLocation(dropQueuedId), "queued");
+check("pendingRequestLocation names a queued attachment coalesced", pendingRequestLocation(dropLaterId), "coalesced");
+checkDeep(
+	"dropping the outstanding host evicts it and its attachments in order",
+	dropChildAsk(dropHostId),
+	[dropHostId, dropAttId],
+);
+check("a dropped host id resolves unknown", resolveChildAsk(dropHostId, true).kind, "unknown");
+check("a dropped attachment id resolves unknown", resolveChildAsk(dropAttId, true).kind, "unknown");
+check(
+	"the drop records no grant for the host child",
+	hasGrantForChild(dropHostToken, "/opt/tools-a"),
+	false,
+);
+check(
+	"a re-ask of the dropped directory passes the dedup checks and queues instead of denying from memory",
+	admitChildAsk(randomUUID(), dropHostToken, "/opt/tools-a", 10_007).kind,
+	"queued",
+);
+check(
+	"the host child's queue promoted into the vacated outstanding slot",
+	pendingRequestLocation(dropQueuedId),
+	"outstanding",
+);
+check("dropping an unknown id returns no evictions", dropChildAsk(randomUUID()).length, 0);
+checkDeep(
+	"dropping a promoted host by its attachment id evicts host and attachments",
+	dropChildAsk(dropLaterId),
+	[dropQueuedId, dropLaterId],
+);
+check("the dropped promoted id has no ledger location", pendingRequestLocation(dropQueuedId), null);
+checkDeep(
+	"dropping a still-queued id evicts just it",
+	dropChildAsk(dropQQueuedId),
+	[dropQQueuedId],
+);
+check("the dropped queued id has no ledger location", pendingRequestLocation(dropQQueuedId), null);
+check(
+	"the sibling outstanding slot survives a queue drop",
+	pendingRequestLocation(dropQOutId),
+	"outstanding",
+);
+resetFenceAskState();
+
+// --- unit 1-3: the ask-forwarding channel, file primitives ----------
+// ask-channel.ts is the fs-bearing half: the forwarding directory
+// creation at the locked 0700 mode (the F4 consumer obligation), the
+// atomic request/response writes, the echo-checked decision read, and
+// the id enumeration the serving tick walks.
+
+const channelRoot = path.join(os.tmpdir(), `fence-ask-suite-channel-${randomUUID()}`);
+createForwardingRootDirs(channelRoot);
+check(
+	"the forwarding root is created at mode 0700",
+	fs.statSync(channelRoot).mode & 0o777,
+	0o700,
+);
+check(
+	"the requests directory is created at mode 0700",
+	fs.statSync(path.join(channelRoot, REQUESTS_DIR_NAME)).mode & 0o777,
+	0o700,
+);
+check(
+	"the responses directory is created at mode 0700",
+	fs.statSync(path.join(channelRoot, RESPONSES_DIR_NAME)).mode & 0o777,
+	0o700,
+);
+const channelAsk = createForwardedAsk({
+	requestId: randomUUID(),
+	childToken: randomUUID(),
+	agentName: "pid-1",
+	dispatchLabel: "channel fixture",
+	toolName: "read",
+	resolvedPath: dirOut,
+	reason: "channel fixture ask",
+	askedAt: 20_000,
+});
+writeForwardedAsk(channelRoot, channelAsk);
+check(
+	"the written ask file parses back through the wire parser",
+	isValidForwardedAsk(JSON.parse(fs.readFileSync(path.join(channelRoot, REQUESTS_DIR_NAME, askFileName(channelAsk.requestId)), "utf8"))),
+	true,
+);
+checkDeep("requestIdsIn enumerates the written ask id", requestIdsIn(channelRoot), [channelAsk.requestId]);
+check("readForwardedDecision on an unanswered ask is null", readForwardedDecision(channelRoot, channelAsk.requestId, channelAsk.childToken), null);
+const channelDecision = createForwardedDecision({
+	requestId: channelAsk.requestId,
+	childToken: channelAsk.childToken,
+	decision: "grant",
+	grantedRoot: dirOut,
+	via: "user",
+	reason: ASK_USER_GRANT_REASON,
+	decidedAt: 21_000,
+});
+writeForwardedDecision(channelRoot, channelDecision);
+checkDeep(
+	"readForwardedDecision returns a matching decision",
+	readForwardedDecision(channelRoot, channelAsk.requestId, channelAsk.childToken),
+	channelDecision,
+);
+check(
+	"readForwardedDecision refuses another child's token echo",
+	readForwardedDecision(channelRoot, channelAsk.requestId, randomUUID()),
+	null,
+);
+check(
+	"readForwardedDecision on a missing response file is null",
+	readForwardedDecision(channelRoot, randomUUID(), channelAsk.childToken),
+	null,
+);
+check(
+	"writeForwardedAsk refuses an invalid ask",
+	(() => {
+		try {
+			writeForwardedAsk(channelRoot, { ...channelAsk, requestId: "not-a-uuid" });
+			return "no throw";
+		} catch (error) {
+			return error instanceof TypeError ? "TypeError" : "wrong error";
+		}
+	})(),
+	"TypeError",
+);
+checkDeep(
+	"atomic writes leave no temporary leftovers",
+	fs.readdirSync(path.join(channelRoot, REQUESTS_DIR_NAME)).length,
+	1,
+);
+deleteDecisionFile(channelRoot, channelDecision.requestId);
+check(
+	"deleteDecisionFile removes the response file",
+	fs.readdirSync(path.join(channelRoot, RESPONSES_DIR_NAME)).length,
+	0,
+);
+deleteAskFile(channelRoot, channelAsk.requestId);
+deleteAskFile(channelRoot, channelAsk.requestId);
+check("a repeated deleteAskFile is a no-op", requestIdsIn(channelRoot).length, 0);
+fs.rmSync(channelRoot, { recursive: true, force: true });
+
+// --- unit 1-3: child provisioning from the spawn env ----------------
+
+const provisioningEnv = {
+	[CHILD_ASK_ROOT_ENV]: path.join(os.tmpdir(), "fence-ask-suite-root"),
+	[CHILD_ASK_TOKEN_ENV]: randomUUID(),
+};
+checkDeep(
+	"childProvisioningFromEnv reads both spawn keys",
+	childProvisioningFromEnv(provisioningEnv),
+	{ root: provisioningEnv[CHILD_ASK_ROOT_ENV], token: provisioningEnv[CHILD_ASK_TOKEN_ENV] },
+);
+check(
+	"childProvisioningFromEnv rejects a missing root",
+	childProvisioningFromEnv({ [CHILD_ASK_TOKEN_ENV]: randomUUID() }),
+	null,
+);
+check(
+	"childProvisioningFromEnv rejects a relative root",
+	childProvisioningFromEnv({ [CHILD_ASK_ROOT_ENV]: "rel/root", [CHILD_ASK_TOKEN_ENV]: randomUUID() }),
+	null,
+);
+check(
+	"childProvisioningFromEnv rejects a missing token",
+	childProvisioningFromEnv({ [CHILD_ASK_ROOT_ENV]: provisioningEnv[CHILD_ASK_ROOT_ENV] }),
+	null,
+);
+check(
+	"childProvisioningFromEnv rejects an empty token",
+	childProvisioningFromEnv({ [CHILD_ASK_ROOT_ENV]: provisioningEnv[CHILD_ASK_ROOT_ENV], [CHILD_ASK_TOKEN_ENV]: "" }),
+	null,
+);
+
+// --- unit 1-3: the child-side forward flow ---------------------------
+// forwardOutOfScopeAsk writes the ask, polls the bounded wait, and
+// resolves into applied, denied, timeout, or failed. Timeout removes
+// the request file best-effort; a decision read is consumed best-
+// effort; an applied flow calls onGrant exactly once with the granted
+// root; every fail-closed reason names the tool, the directory, and
+// the closed posture.
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+async function waitFor(predicate, timeoutMs = 5_000, step = 10) {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		const value = predicate();
+		if (value) return value;
+		await sleep(step);
+	}
+	return null;
+}
+const flowRoot = path.join(os.tmpdir(), `fence-ask-suite-flow-${randomUUID()}`);
+createForwardingRootDirs(flowRoot);
+const flowToken = randomUUID();
+const flowDir = "/opt/flow-target";
+{
+	const grantCalls = [];
+	const timeoutOutcome = await forwardOutOfScopeAsk({
+		root: flowRoot,
+		childToken: flowToken,
+		toolName: "read",
+		directory: flowDir,
+		reason: "timeout fixture",
+		identityAgentName: "pid-2",
+		identityDispatchLabel: "flow fixture",
+		waitMs: 80,
+		pollMs: 20,
+		onGrant: (root) => grantCalls.push(root),
+	});
+	check("an unanswered ask times out", timeoutOutcome.status, "timeout");
+	checkContains("the timeout reason names the tool", timeoutOutcome.blockReason, "read");
+	checkContains("the timeout reason names the directory", timeoutOutcome.blockReason, flowDir);
+	checkContains("the timeout reason names the wait bound", timeoutOutcome.blockReason, "80");
+	checkContains("the timeout reason states the fail-closed posture", timeoutOutcome.blockReason, "fails closed");
+	check("the timeout never grants", grantCalls.length, 0);
+	check(
+		"the timed-out request file is removed",
+		requestIdsIn(flowRoot).length,
+		0,
+	);
+}
+{
+	const grantCalls = [];
+	const denyToken = randomUUID();
+	const denyFlow = forwardOutOfScopeAsk({
+		root: flowRoot,
+		childToken: denyToken,
+		toolName: "bash",
+		directory: flowDir,
+		reason: "deny fixture",
+		identityAgentName: "pid-3",
+		identityDispatchLabel: "flow fixture",
+		waitMs: 5_000,
+		pollMs: 10,
+		onGrant: (root) => grantCalls.push(root),
+	});
+	const denyId = await waitFor(() => requestIdsIn(flowRoot)[0] ?? null);
+	writeForwardedDecision(
+		flowRoot,
+		createForwardedDecision({
+			requestId: denyId,
+			childToken: denyToken,
+			decision: "deny",
+			grantedRoot: null,
+			via: "user",
+			reason: ASK_USER_DENY_REASON,
+			decidedAt: 22_000,
+		}),
+	);
+	const denyOutcome = await denyFlow;
+	check("a user denial resolves denied", denyOutcome.status, "denied");
+	checkContains("the deny reason carries the via", denyOutcome.blockReason, "user");
+	checkContains("the deny reason carries the decision reason", denyOutcome.blockReason, ASK_USER_DENY_REASON);
+	checkContains("the deny reason states the fail-closed posture", denyOutcome.blockReason, "fails closed");
+	check("a denial never grants", grantCalls.length, 0);
+	check("the consumed response file is removed", fs.readdirSync(path.join(flowRoot, RESPONSES_DIR_NAME)).length, 0);
+	deleteAskFile(flowRoot, denyId);
+}
+{
+	const grantCalls = [];
+	const grantToken = randomUUID();
+	const grantFlow = forwardOutOfScopeAsk({
+		root: flowRoot,
+		childToken: grantToken,
+		toolName: "read",
+		directory: flowDir,
+		reason: "grant fixture",
+		identityAgentName: "pid-4",
+		identityDispatchLabel: "flow fixture",
+		waitMs: 5_000,
+		pollMs: 10,
+		onGrant: (root) => grantCalls.push(root),
+	});
+	const grantId = await waitFor(() => requestIdsIn(flowRoot)[0] ?? null);
+	writeForwardedDecision(
+		flowRoot,
+		createForwardedDecision({
+			requestId: grantId,
+			childToken: grantToken,
+			decision: "grant",
+			grantedRoot: flowDir,
+			via: "user",
+			reason: ASK_USER_GRANT_REASON,
+			decidedAt: 23_000,
+		}),
+	);
+	const grantOutcome = await grantFlow;
+	check("a user grant resolves applied", grantOutcome.status, "applied");
+	check("the applied flow grants exactly once", grantCalls.join(","), flowDir);
+	check("the consumed response file is removed after a grant", fs.readdirSync(path.join(flowRoot, RESPONSES_DIR_NAME)).length, 0);
+	deleteAskFile(flowRoot, grantId);
+}
+{
+	const grantCalls = [];
+	const foreignToken = randomUUID();
+	const foreignFlow = forwardOutOfScopeAsk({
+		root: flowRoot,
+		childToken: foreignToken,
+		toolName: "read",
+		directory: flowDir,
+		reason: "foreign decision fixture",
+		identityAgentName: "pid-5",
+		identityDispatchLabel: "flow fixture",
+		waitMs: 80,
+		pollMs: 20,
+		onGrant: (root) => grantCalls.push(root),
+	});
+	const foreignId = await waitFor(() => requestIdsIn(flowRoot)[0] ?? null);
+	writeForwardedDecision(
+		flowRoot,
+		createForwardedDecision({
+			requestId: foreignId,
+			childToken: randomUUID(),
+			decision: "grant",
+			grantedRoot: flowDir,
+			via: "user",
+			reason: ASK_USER_GRANT_REASON,
+			decidedAt: 24_000,
+		}),
+	);
+	const foreignOutcome = await foreignFlow;
+	check("a decision with a mismatched token echo never applies", foreignOutcome.status, "timeout");
+	check("a mismatched-echo decision never grants", grantCalls.length, 0);
+	check("the mismatched decision file is left for the sweep", fs.readdirSync(path.join(flowRoot, RESPONSES_DIR_NAME)).length, 1);
+}
+fs.rmSync(flowRoot, { recursive: true, force: true });
+
+// --- unit 1-3: serving tick, the four properties end to end ----------
+// One in-process harness drives both roles through the real channel on
+// a real forwarding root: scripted child flows write real request
+// files; the tick admits, prompts through an injected handler with
+// registry-bound provenance, resolves, and writes responses the flows
+// consume. The nine dispatch pins live here.
+
+resetFenceAskState();
+const tickRoot = path.join(os.tmpdir(), `fence-ask-suite-tick-${randomUUID()}`);
+createForwardingRootDirs(tickRoot);
+const e2eChildA = randomUUID();
+const e2eChildB = randomUUID();
+const e2eChildZ = randomUUID();
+const e2eChildD = randomUUID();
+registerLiveChild(e2eChildA, "worker-alpha", "alpha dispatch", 30_000);
+registerLiveChild(e2eChildB, "worker-beta", "beta dispatch", 30_000);
+registerLiveChild(e2eChildZ, "worker-zombie", "zombie dispatch", 30_000);
+registerLiveChild(e2eChildD, "worker-delta", "delta dispatch", 30_000);
+const promptLog = [];
+function makeHandler(script) {
+	return async (ask, provenance) => {
+		promptLog.push({ ask, provenance, answer: script });
+		return script;
+	};
+}
+const tickOptions = { root: tickRoot, handler: null, now: () => 40_000, maxAge: 1_000 };
+async function runTick(overrides = {}) {
+	return serveForwardingRootTick({ ...tickOptions, ...overrides });
+}
+async function startFlow(token, directory, toolName, grantSink) {
+	return forwardOutOfScopeAsk({
+		root: tickRoot,
+		childToken: token,
+		toolName,
+		directory,
+		reason: `e2e ask for ${directory}`,
+		identityAgentName: `pid-${token.slice(0, 4)}`,
+		identityDispatchLabel: "e2e",
+		waitMs: 3_000,
+		pollMs: 10,
+		onGrant: (granted) => grantSink.push(granted),
+	});
+}
+
+// property 2 + F5: a child asks, the parent is prompted with the
+// registry identity and the resolved path; a Yes applies to the asking
+// child only.
+promptLog.length = 0;
+const grantsA = [];
+const flowA = startFlow(e2eChildA, "/opt/e2e-alpha", "read", grantsA);
+await waitFor(() => requestIdsIn(tickRoot).length === 1);
+await runTick({ handler: makeHandler(true), now: () => 40_100 });
+const outcomeA = await flowA;
+check("the asking child's flow resolves applied", outcomeA.status, "applied");
+check("the grant reaches the asking child", grantsA.join(","), "/opt/e2e-alpha");
+check("the grant is recorded for the asking child", hasGrantForChild(e2eChildA, "/opt/e2e-alpha"), true);
+check("the prompt names the registry agent name", promptLog[0] ? promptLog[0].provenance.agentName : "none", "worker-alpha");
+check("the prompt names the registry dispatch label", promptLog[0] ? promptLog[0].provenance.dispatchLabel : "none", "alpha dispatch");
+check("the prompt carries the ledger directory", promptLog[0] ? promptLog[0].provenance.directory : "none", "/opt/e2e-alpha");
+check(
+	"the prompt never trusts the child-asserted identity",
+	promptLog[0] ? promptLog[0].provenance.agentName !== "pid-" + e2eChildA.slice(0, 4) : false,
+	true,
+);
+check("exactly one prompt ran", promptLog.length, 1);
+check("the resolved request file is gone", requestIdsIn(tickRoot).length, 0);
+check("the consumed response file is gone", fs.readdirSync(path.join(tickRoot, RESPONSES_DIR_NAME)).length, 0);
+
+// property 3 + 4: a second child asking the same directory resolves
+// granted-dedup with no user round-trip, and the grant stays per-child.
+const grantsB = [];
+const flowB = startFlow(e2eChildB, "/opt/e2e-alpha", "read", grantsB);
+await waitFor(() => requestIdsIn(tickRoot).length === 1);
+await runTick({ handler: makeHandler(true), now: () => 40_200 });
+const outcomeB = await flowB;
+check("the second child's same-directory ask resolves applied", outcomeB.status, "applied");
+check("the dedup decision carries the session-dedup via", outcomeB.decision ? outcomeB.decision.via : "none", "session-dedup");
+check("the dedup resolution prompts nothing", promptLog.length, 1);
+check("the second child holds its own grant record", hasGrantForChild(e2eChildB, "/opt/e2e-alpha"), true);
+check("the grants stay per-child rows", grantsForChild(e2eChildB).length, 1);
+
+// property 1: a parent-own grant composes into a later child's scope;
+// sibling child-ask grants never do.
+resetFenceAskState();
+registerLiveChild(e2eChildA, "worker-alpha", "alpha dispatch", 30_000);
+check(
+	"a sibling child-ask grant is absent from spawn composition",
+	inheritedExtraRootsEnvValue({
+		configRoots: [],
+		overlayRoots: [],
+		envRoots: [],
+		parentGrantRoots: parentGrantedDirectories(),
+		parentSessionCwd: "/session",
+		dispatchCwd: "/session",
+	}).includes("/opt/e2e-alpha"),
+	false,
+);
+recordParentGrant("/opt/parent-own", 50_000);
+check(
+	"a parent-own grant composes into a later child's scope",
+	inheritedExtraRootsEnvValue({
+		configRoots: [],
+		overlayRoots: [],
+		envRoots: [],
+		parentGrantRoots: parentGrantedDirectories(),
+		parentSessionCwd: "/session",
+		dispatchCwd: "/session",
+	}).includes("/opt/parent-own"),
+	true,
+);
+
+// F3 at channel level: an admitted ask with no prompting surface
+// pends until the staleness sweep evicts it and removes its request
+// file; a fresh ask for the same directory then re-hosts and re-prompts.
+resetFenceAskState();
+promptLog.length = 0;
+registerLiveChild(e2eChildZ, "worker-zombie", "zombie dispatch", 60_000);
+registerLiveChild(e2eChildD, "worker-delta", "delta dispatch", 60_000);
+const zombieRequest = createForwardedAsk({
+	requestId: randomUUID(),
+	childToken: e2eChildZ,
+	agentName: "pid-z",
+	dispatchLabel: "zombie",
+	toolName: "read",
+	resolvedPath: "/opt/e2e-zombie",
+	reason: "zombie ask",
+	askedAt: 60_000,
+});
+writeForwardedAsk(tickRoot, zombieRequest);
+const pendZombie = await runTick({ handler: null, now: () => 60_100 });
+check("an ask with no prompting surface pends without prompting", pendZombie.prompted, 0);
+check("the pended entry keeps its request file", requestIdsIn(tickRoot).length, 1);
+await runTick({ handler: null, now: () => 60_100 + 1_500 });
+check("the staleness sweep evicted the zombie entry and file", requestIdsIn(tickRoot).length, 0);
+const freshFlow = startFlow(e2eChildD, "/opt/e2e-zombie", "read", []);
+await waitFor(() => requestIdsIn(tickRoot).length === 1);
+await runTick({ handler: makeHandler(true), now: () => 60_100 + 1_600 });
+const freshOutcome = await freshFlow;
+check("a fresh ask after zombie eviction re-hosts and re-prompts", promptLog.length, 1);
+check("the fresh ask resolves applied", freshOutcome.status, "applied");
+check("the fresh prompt names the new child", promptLog[0] ? promptLog[0].provenance.agentName : "none", "worker-delta");
+
+// the Q5 cap ladder at channel level: a null-handler admission pass
+// lands one outstanding, three queued, and the fifth cap-denied; the
+// ruling passes then promote and rule one at a time.
+resetFenceAskState();
+promptLog.length = 0;
+const ladderToken = randomUUID();
+registerLiveChild(ladderToken, "ladder", "ladder dispatch", 70_000);
+const ladderGrants = [];
+const ladderDirs = ["/opt/ladder-1", "/opt/ladder-2", "/opt/ladder-3", "/opt/ladder-4", "/opt/ladder-5"];
+const ladderFlows = ladderDirs.map((directory) => startFlow(ladderToken, directory, "read", ladderGrants));
+await waitFor(() => requestIdsIn(tickRoot).length === 5);
+const admitPass = await runTick({ handler: null, now: () => 70_100 });
+check("the admission pass prompted nothing", admitPass.prompted, 0);
+check("the admission pass denied exactly one by the cap", admitPass.servedDeny, 1);
+check("the cap-denied ask never held its file", requestIdsIn(tickRoot).length, 4);
+await runTick({ handler: makeHandler(true), now: () => 70_200 });
+await runTick({ handler: makeHandler(true), now: () => 70_300 });
+await runTick({ handler: makeHandler(true), now: () => 70_400 });
+await runTick({ handler: makeHandler(true), now: () => 70_500 });
+const ladderOutcomes = await Promise.all(ladderFlows);
+const ladderDenied = ladderOutcomes.filter((outcome) => outcome.status === "denied");
+const ladderApplied = ladderOutcomes.filter((outcome) => outcome.status === "applied");
+check("four ladder asks applied through the promotion ladder", ladderApplied.length, 4);
+check("exactly one ladder ask was denied", ladderDenied.length, 1);
+check("the cap deny carries the cap via", ladderDenied[0] && ladderDenied[0].decision ? ladderDenied[0].decision.via : "none", "cap");
+checkContains("the cap deny carries the policy reason", ladderDenied[0] ? ladderDenied[0].blockReason : "", ASK_CAP_DENY_REASON);
+check("each ruling prompted exactly once", promptLog.length, 4);
+check("the cap denial carried no grant", ladderGrants.length, 4);
+
+// coalescing across children: both flows ride one prompt and both apply.
+resetFenceAskState();
+promptLog.length = 0;
+const coToken1 = randomUUID();
+const coToken2 = randomUUID();
+registerLiveChild(coToken1, "co-one", "co one dispatch", 80_000);
+registerLiveChild(coToken2, "co-two", "co two dispatch", 80_000);
+const coGrants1 = [];
+const coGrants2 = [];
+const coFlow1 = startFlow(coToken1, "/opt/co-shared", "read", coGrants1);
+const coFlow2 = startFlow(coToken2, "/opt/co-shared", "read", coGrants2);
+await waitFor(() => requestIdsIn(tickRoot).length === 2);
+await runTick({ handler: makeHandler(true), now: () => 80_100 });
+const coOutcome1 = await coFlow1;
+const coOutcome2 = await coFlow2;
+check("the coalesced pair prompts once", promptLog.length, 1);
+check("the host flow applied", coOutcome1.status, "applied");
+check("the attached flow applied", coOutcome2.status, "applied");
+check("both children hold the grant", hasGrantForChild(coToken2, "/opt/co-shared"), true);
+
+// an unavailable handler drops the entry without deny memory; a null
+// handler (no prompting surface) leaves the entry pending for staleness.
+resetFenceAskState();
+promptLog.length = 0;
+const unToken = randomUUID();
+registerLiveChild(unToken, "unavailable", "unavailable dispatch", 90_000);
+const unFlow = startFlow(unToken, "/opt/unavailable", "read", []);
+await waitFor(() => requestIdsIn(tickRoot).length === 1);
+const dropTick = await runTick({ handler: async () => null, now: () => 90_100 });
+check("an unavailable ruling drops the entry", dropTick.dropped, 1);
+const unOutcome = await unFlow;
+check("the dropped ask's flow times out fail-closed", unOutcome.status, "timeout");
+check("the drop leaves the directory re-askable", pendingRequestLocation(randomUUID()), null);
+const reAskFlow = startFlow(unToken, "/opt/unavailable", "read", []);
+await waitFor(() => requestIdsIn(tickRoot).length === 1);
+await runTick({ handler: makeHandler(true), now: () => 90_200 });
+check("the re-ask prompts again instead of denying from memory", promptLog.length, 1);
+await reAskFlow;
+resetFenceAskState();
+registerLiveChild(unToken, "unavailable", "unavailable dispatch", 90_000);
+const pendFlow = startFlow(unToken, "/opt/pending", "read", []);
+await waitFor(() => requestIdsIn(tickRoot).length === 1);
+const pendTick = await runTick({ handler: null, now: () => 90_300 });
+check("a null handler prompts nothing", pendTick.prompted, 0);
+check("a null handler drops nothing", pendTick.dropped, 0);
+check("the pending entry survives for staleness", requestIdsIn(tickRoot).length, 1);
+await runTick({ handler: null, now: () => 90_300 + 1_500 });
+check("staleness eventually evicts an unserved entry", requestIdsIn(tickRoot).length, 0);
+const pendOutcome = await pendFlow;
+check("the unserved ask's flow times out", pendOutcome.status, "timeout");
+
+// orphan file sweeps: garbage in requests/ and stale responses go;
+// young files and files with live ledger entries stay.
+const garbageId = randomUUID();
+fs.writeFileSync(path.join(tickRoot, REQUESTS_DIR_NAME, `${garbageId}.json`), "{not json");
+fs.utimesSync(path.join(tickRoot, REQUESTS_DIR_NAME, `${garbageId}.json`), 0, 0);
+const youngGarbageId = randomUUID();
+fs.writeFileSync(path.join(tickRoot, REQUESTS_DIR_NAME, `${youngGarbageId}.json`), "{also not json");
+const staleResponseId = randomUUID();
+fs.writeFileSync(path.join(tickRoot, RESPONSES_DIR_NAME, `${staleResponseId}.json`), "{}");
+fs.utimesSync(path.join(tickRoot, RESPONSES_DIR_NAME, `${staleResponseId}.json`), 0, 0);
+const sweepTick = await runTick({ handler: null, now: () => 90_300 + 2_000 });
+check("ancient unparseable request garbage is swept", fs.existsSync(path.join(tickRoot, REQUESTS_DIR_NAME, `${garbageId}.json`)), false);
+check("young unparseable request garbage is left", fs.existsSync(path.join(tickRoot, REQUESTS_DIR_NAME, `${youngGarbageId}.json`)), true);
+check("ancient response files are swept", fs.existsSync(path.join(tickRoot, RESPONSES_DIR_NAME, `${staleResponseId}.json`)), false);
+fs.rmSync(tickRoot, { recursive: true, force: true });
+resetFenceAskState();
+
+// the F5 prompt title names the child, the resolved path, and the ask.
+const titleText = askPromptTitle(
+	createForwardedAsk({
+		requestId: randomUUID(),
+		childToken: randomUUID(),
+		agentName: "spoofed-name",
+		dispatchLabel: "wire label",
+		toolName: "read",
+		resolvedPath: "/opt/title-target",
+		reason: "title fixture reason",
+		askedAt: 100_000,
+	}),
+	{ requestId: randomUUID(), childToken: randomUUID(), agentName: "worker-registry", dispatchLabel: "registry label", directory: "/opt/title-target" },
+);
+checkContains("the prompt title names the tool", titleText, "read");
+checkContains("the prompt title names the registry agent", titleText, "worker-registry");
+checkContains("the prompt title names the registry dispatch label", titleText, "registry label");
+checkContains("the prompt title names the resolved path", titleText, "/opt/title-target");
+checkContains("the prompt title carries the ask evidence", titleText, "title fixture reason");
+checkContains("the prompt title asks for the ruling", titleText, "Allow?");
+
+// --- unit 1-3: the cross-process harness pin ----------------------
+// A real node child process plays the child role against a real root
+// the in-test tick serves; a second driver plays the nested middle:
+// it mints its own root, serves it with the real proxy handler, and a
+// grandchild flow inside the driver proxies up through the chain. The
+// process boundary is the point: env provisioning, file handoff, and
+// ledger scoping behave exactly as dispatched sessions experience.
+
+const e2eRepoRoot = path.resolve(import.meta.dirname, "..");
+async function runDriver(source, extraEnv, deadlineMs = 30_000) {
+	const driverPath = path.join(os.tmpdir(), `fence-ask-driver-${randomUUID()}.mjs`);
+	fs.writeFileSync(driverPath, source);
+	try {
+		const result = await new Promise((resolve) => {
+			const child = spawn(process.execPath, [driverPath], {
+				env: { ...process.env, ...extraEnv },
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			let stdout = "";
+			let stderr = "";
+			const killer = setTimeout(() => child.kill("SIGKILL"), deadlineMs);
+			child.stdout.on("data", (chunk) => {
+				stdout += chunk;
+			});
+			child.stderr.on("data", (chunk) => {
+				stderr += chunk;
+			});
+			child.on("close", (code) => {
+				clearTimeout(killer);
+				resolve({ code, stdout, stderr });
+			});
+		});
+		return { ...result, driverPath };
+	} finally {
+		fs.rmSync(driverPath, { force: true });
+	}
+}
+
+// cross-process child: a real node process plays the dispatched child
+// against a real root the in-test tick serves; the parent-side ledger
+// records the grant for the dispatched token.
+{
+	resetFenceAskState();
+	const procRoot = path.join(os.tmpdir(), `fence-ask-suite-proc-${randomUUID()}`);
+	createForwardingRootDirs(procRoot);
+	const procToken = randomUUID();
+	registerLiveChild(procToken, "proc-child", "proc dispatch", 110_000);
+	const procPrompt = [];
+	const driverSource = `
+const { forwardOutOfScopeAsk } = await import(${JSON.stringify(pathToFileURL(path.join(e2eRepoRoot, "extensions", "fence-ask", "ask-channel.ts")).href)});
+const outcome = await forwardOutOfScopeAsk({
+	root: ${JSON.stringify(procRoot)},
+	childToken: ${JSON.stringify(procToken)},
+	toolName: "read",
+	directory: "/opt/proc-target",
+	reason: "proc fixture",
+	identityAgentName: "driver",
+	identityDispatchLabel: "proc",
+	waitMs: 20000,
+	pollMs: 10,
+});
+console.log(JSON.stringify({ status: outcome.status, via: outcome.decision ? outcome.decision.via : null }));
+`;
+	const driverRun = runDriver(driverSource, {}, 30_000);
+	await waitFor(() => requestIdsIn(procRoot).length === 1);
+	await serveForwardingRootTick({
+		root: procRoot,
+		handler: async (ask, provenance) => {
+			procPrompt.push({ ask, provenance });
+			return true;
+		},
+		now: () => 110_100,
+		maxAge: 60_000,
+	});
+	const driverResult = await driverRun;
+	check("the cross-process driver exited cleanly", driverResult.code, 0);
+	const driverJson = JSON.parse(driverResult.stdout.trim().split("\n").pop());
+	check("the cross-process driver applied", driverJson.status, "applied");
+	check("the cross-process decision carries the user via", driverJson.via, "user");
+	check(
+		"the parent's ledger recorded the grant for the dispatched token",
+		hasGrantForChild(procToken, "/opt/proc-target"),
+		true,
+	);
+	check("the in-test tick prompted exactly once", procPrompt.length, 1);
+	check(
+		"the in-test prompt named the dispatched identity",
+		procPrompt[0] ? procPrompt[0].provenance.agentName : "none",
+		"proc-child",
+	);
+	fs.rmSync(procRoot, { recursive: true, force: true });
+	resetFenceAskState();
+}
+
+// nested dispatch: the driver is the middle; its own minted root is
+// served by the real server with the real proxy handler; the
+// grandchild flow inside the driver proxies up to the test's root, and
+// the grant binds the grandchild in the middle's ledger, never the
+// middle's own verdicts.
+{
+	resetFenceAskState();
+	const topRoot = path.join(os.tmpdir(), `fence-ask-suite-nested-${randomUUID()}`);
+	createForwardingRootDirs(topRoot);
+	const middleToken = randomUUID();
+	registerLiveChild(middleToken, "middle-child", "middle dispatch", 120_000);
+	const topPrompt = [];
+	const nestedTickOptions = {
+		root: topRoot,
+		handler: async (ask, provenance) => {
+			topPrompt.push({ ask, provenance });
+			return true;
+		},
+		now: () => 120_100,
+		maxAge: 60_000,
+	};
+	const driverSource = `
+const ledgerPath = ${JSON.stringify(pathToFileURL(path.join(e2eRepoRoot, "extensions", "fence-ask", "grant-ledger.ts")).href)};
+const channelPath = ${JSON.stringify(pathToFileURL(path.join(e2eRepoRoot, "extensions", "fence-ask", "ask-channel.ts")).href)};
+const servePath = ${JSON.stringify(pathToFileURL(path.join(e2eRepoRoot, "extensions", "fence-ask", "serve.ts")).href)};
+const { ensureForwardingRoot, registerLiveChild, appliedSelfGrants, grantsForChild } = await import(ledgerPath);
+const { forwardOutOfScopeAsk } = await import(channelPath);
+const { configureForwardingServer, ensureForwardingServer, childProxyHandler } = await import(servePath);
+const grandchildToken = crypto.randomUUID();
+const middleRoot = ensureForwardingRoot("driver-session", crypto.randomUUID());
+configureForwardingServer({ resolveHandler: childProxyHandler, tickMs: 10 });
+ensureForwardingServer();
+registerLiveChild(grandchildToken, "nested-worker", "nested dispatch", 1);
+const outcome = await forwardOutOfScopeAsk({
+	root: middleRoot,
+	childToken: grandchildToken,
+	toolName: "write",
+	directory: "/opt/nested-target",
+	reason: "nested grandchild ask",
+	identityAgentName: "nested-driver",
+	identityDispatchLabel: "nested",
+	waitMs: 20000,
+	pollMs: 10,
+	onGrant: () => {},
+});
+console.log(JSON.stringify({
+	status: outcome.status,
+	middleApplied: appliedSelfGrants().length,
+	grandchildGrant: grantsForChild(grandchildToken).join(","),
+	middleRoot,
+}));
+process.exit(0);
+`;
+	const driverPromise = runDriver(
+		driverSource,
+		{
+			[CHILD_ASK_ROOT_ENV]: topRoot,
+			[CHILD_ASK_TOKEN_ENV]: middleToken,
+		},
+		30_000,
+	);
+	const proxyAppeared = await waitFor(() => requestIdsIn(topRoot).length === 1, 20_000);
+	await serveForwardingRootTick({ ...nestedTickOptions });
+	const driverResult = await driverPromise;
+	check("the nested driver exited cleanly", driverResult.code, 0);
+	const nestedJson = JSON.parse(driverResult.stdout.trim().split("\n").pop());
+	check("the grandchild flow applied through the chain", nestedJson.status, "applied");
+	check("the middle's own verdict set stays empty", nestedJson.middleApplied, 0);
+	check("the grant binds the grandchild in the middle's ledger", nestedJson.grandchildGrant, "/opt/nested-target");
+	check("the proxy ask reached the top root", proxyAppeared !== null, true);
+	check("the top prompted once for the middle's token", topPrompt.length, 1);
+	check("the top prompt names the middle's registry identity", topPrompt[0] ? topPrompt[0].provenance.agentName : "none", "middle-child");
+	check("the top prompt carries the proxy reason naming the grandchild", topPrompt[0] ? topPrompt[0].ask.reason.includes("nested-worker") : false, true);
+	check("the top records the grant for the middle token only", hasGrantForChild(middleToken, "/opt/nested-target"), true);
+	fs.rmSync(topRoot, { recursive: true, force: true });
+	fs.rmSync(nestedJson.middleRoot, { recursive: true, force: true });
+	resetFenceAskState();
+}
+
+// --- unit 1-3: the proxy handler composition ----------------------
+// childProxyHandler is the middle's ruling surface: null without
+// provisioning, and otherwise a forward-up flow under this process's
+// own token with the grandchild named in the reason.
+
+resetFenceAskState();
+{
+	const savedRoot = process.env[CHILD_ASK_ROOT_ENV];
+	const savedToken = process.env[CHILD_ASK_TOKEN_ENV];
+	delete process.env[CHILD_ASK_ROOT_ENV];
+	delete process.env[CHILD_ASK_TOKEN_ENV];
+	check("childProxyHandler without provisioning is null", childProxyHandler(), null);
+	const proxyRoot = path.join(os.tmpdir(), `fence-ask-suite-proxy-${randomUUID()}`);
+	createForwardingRootDirs(proxyRoot);
+	const proxyToken = randomUUID();
+	registerLiveChild(proxyToken, "proxy-mid", "proxy mid dispatch", 140_000);
+	process.env[CHILD_ASK_ROOT_ENV] = proxyRoot;
+	process.env[CHILD_ASK_TOKEN_ENV] = proxyToken;
+	const proxyHandler = childProxyHandler({ pollMs: 10 });
+	check("childProxyHandler with provisioning composes", typeof proxyHandler, "function");
+	const proxyPrompt = [];
+	const proxyAsk = createForwardedAsk({
+		requestId: randomUUID(),
+		childToken: randomUUID(),
+		agentName: "grandchild-wire",
+		dispatchLabel: "grandchild wire label",
+		toolName: "read",
+		resolvedPath: "/opt/proxy-x",
+		reason: "grandchild evidence",
+		askedAt: 140_000,
+	});
+	const proxyProvenance = {
+		requestId: proxyAsk.requestId,
+		childToken: randomUUID(),
+		agentName: "nested-worker",
+		dispatchLabel: "nested dispatch",
+		directory: "/opt/proxy-x",
+	};
+	const grantRuling = proxyHandler(proxyAsk, proxyProvenance);
+	await waitFor(() => requestIdsIn(proxyRoot).length === 1);
+	await serveForwardingRootTick({
+		root: proxyRoot,
+		handler: async (ask, provenance) => {
+			proxyPrompt.push({ ask, provenance });
+			return true;
+		},
+		now: () => 140_100,
+		maxAge: 60_000,
+	});
+	check("the proxy grant resolves true", await grantRuling, true);
+	check("the proxy ask rode the middle's token", proxyPrompt[0] ? proxyPrompt[0].provenance.agentName : "none", "proxy-mid");
+	checkContains("the proxy reason names the grandchild", proxyPrompt[0] ? proxyPrompt[0].ask.reason : "", "nested-worker");
+	checkContains("the proxy reason names the directory", proxyPrompt[0] ? proxyPrompt[0].ask.reason : "", "/opt/proxy-x");
+	const denyAsk = createForwardedAsk({
+		...proxyAsk,
+		requestId: randomUUID(),
+		resolvedPath: "/opt/proxy-y",
+	});
+	const denyProvenance = { ...proxyProvenance, requestId: denyAsk.requestId, directory: "/opt/proxy-y" };
+	const denyRuling = proxyHandler(denyAsk, denyProvenance);
+	await waitFor(() => requestIdsIn(proxyRoot).length === 1);
+	await serveForwardingRootTick({
+		root: proxyRoot,
+		handler: async () => false,
+		now: () => 140_200,
+		maxAge: 60_000,
+	});
+	check("the proxy deny resolves false", await denyRuling, false);
+	if (typeof savedRoot === "string") process.env[CHILD_ASK_ROOT_ENV] = savedRoot;
+	if (typeof savedToken === "string") process.env[CHILD_ASK_TOKEN_ENV] = savedToken;
+	fs.rmSync(proxyRoot, { recursive: true, force: true });
+}
+resetFenceAskState();
+
+// --- unit 1-3: the serving server lifecycle --------------------------
+// The server is the process-global timer wrapper: idempotent start,
+// tick-driven sweeps, and a stop that clears the timer and removes the
+// root this process created (the session_shutdown obligation).
+
+resetFenceAskState();
+{
+	const serverRoot = ensureForwardingRoot("server-suite", randomUUID());
+	configureForwardingServer({ resolveHandler: () => null, tickMs: 20 });
+	ensureForwardingServer();
+	check("the server created the minted root", fs.existsSync(serverRoot), true);
+	check("the created root carries the 0700 mode", fs.statSync(serverRoot).mode & 0o777, 0o700);
+	ensureForwardingServer();
+	stopForwardingServer({ removeRoot: true });
+	check("the stop removed the created root", fs.existsSync(serverRoot), false);
+	check("a stop without a start is a no-op", stopForwardingServer({ removeRoot: true }), undefined);
+}
+resetFenceAskState();
+
+// --- unit 1-3: the live entry point ----------------------------------
+// The entry is the loadable factory (the incident rule's entry-point
+// shape): session_start configures the per-tick ruling-surface
+// resolver with the documented role selection, session_shutdown stops
+// the server and removes the root this process created. The resolver
+// is read back through the globalThis-converged server handle, the
+// same object the tick consumes.
+
+const entryModule = await import("../extensions/fence-ask/index.ts");
+check("the fence-ask entry default export is a factory function", typeof entryModule.default, "function");
+const entryRegistered = [];
+entryModule.default({
+	on(name, handler) {
+		entryRegistered.push({ name, handler });
+	},
+});
+check("the entry registers exactly two handlers", entryRegistered.length, 2);
+check("the entry registers on session_start", entryRegistered[0] ? entryRegistered[0].name : "none", "session_start");
+check("the entry registers on session_shutdown", entryRegistered[1] ? entryRegistered[1].name : "none", "session_shutdown");
+
+resetFenceAskState();
+{
+	const entryServerRoot = ensureForwardingRoot("entry-suite", randomUUID());
+	const entryUiCalls = [];
+	const entryUiCtx = {
+		hasUI: true,
+		ui: {
+			select: async (title, choices) => {
+				entryUiCalls.push({ title, choices });
+				return "Yes";
+			},
+		},
+	};
+	const savedEntryRoot = process.env[CHILD_ASK_ROOT_ENV];
+	const savedEntryToken = process.env[CHILD_ASK_TOKEN_ENV];
+	const savedEntryWait = process.env[ASK_WAIT_ENV];
+	process.env[ASK_WAIT_ENV] = "150";
+	try {
+		// role selection 1: a provisioned process proxies up regardless of
+		// UI. The resolver's returned surface must be the proxy: invoking
+		// it writes a request file into the provisioning root and never
+		// prompts the local UI.
+		process.env[CHILD_ASK_ROOT_ENV] = entryServerRoot;
+		process.env[CHILD_ASK_TOKEN_ENV] = randomUUID();
+		await entryRegistered[0].handler({}, entryUiCtx);
+		const provisionedResolver = globalThis.__piFenceAskServer.resolveHandler();
+		check("the entry resolver returns a surface for a provisioned process", typeof provisionedResolver, "function");
+		const roleProbe = provisionedResolver(
+			createForwardedAsk({
+				requestId: randomUUID(),
+				childToken: randomUUID(),
+				agentName: "role-wire",
+				dispatchLabel: "role wire label",
+				toolName: "read",
+				resolvedPath: "/opt/role-probe",
+				reason: "role probe evidence",
+				askedAt: 310_000,
+			}),
+			{ requestId: randomUUID(), childToken: randomUUID(), agentName: "role-registry", dispatchLabel: "role registry label", directory: "/opt/role-probe" },
+		);
+		await waitFor(() => requestIdsIn(entryServerRoot).length === 1);
+		check("the provisioned surface proxies without prompting the local UI", entryUiCalls.length, 0);
+		check("the abandoned proxy flow times out fail-closed", await roleProbe, null);
+		check("the proxy flow's timed-out request file is gone", requestIdsIn(entryServerRoot).length, 0);
+
+		// role selection 2: a session UI prompts through the captured ctx
+		delete process.env[CHILD_ASK_ROOT_ENV];
+		delete process.env[CHILD_ASK_TOKEN_ENV];
+		await entryRegistered[0].handler({}, entryUiCtx);
+		const uiResolver = globalThis.__piFenceAskServer.resolveHandler();
+		check("the entry resolver returns a prompting surface for a UI session", typeof uiResolver, "function");
+		const uiAsk = createForwardedAsk({
+			requestId: randomUUID(),
+			childToken: randomUUID(),
+			agentName: "entry-wire",
+			dispatchLabel: "entry wire label",
+			toolName: "read",
+			resolvedPath: "/opt/entry-x",
+			reason: "entry fixture evidence",
+			askedAt: 300_000,
+		});
+		const uiProvenance = { requestId: uiAsk.requestId, childToken: uiAsk.childToken, agentName: "entry-registry", dispatchLabel: "entry registry label", directory: "/opt/entry-x" };
+		const uiAnswer = uiResolver(uiAsk, uiProvenance);
+		check("the UI ruling prompts exactly once", entryUiCalls.length, 1);
+		checkContains("the UI ruling names the registry agent", entryUiCalls[0] ? entryUiCalls[0].title : "", "entry-registry");
+		checkContains("the UI ruling names the directory", entryUiCalls[0] ? entryUiCalls[0].title : "", "/opt/entry-x");
+		checkDeep("the UI ruling offers Yes and No", entryUiCalls[0] ? entryUiCalls[0].choices : [], ["Yes", "No"]);
+		check("a Yes ruling resolves true", await uiAnswer, true);
+
+		// role selection 3: neither surface pends for staleness
+		await entryRegistered[0].handler({}, { hasUI: false, ui: undefined });
+		check("the entry resolver returns null without any surface", globalThis.__piFenceAskServer.resolveHandler(), null);
+
+		// session_shutdown stops the server and removes the created root
+		configureForwardingServer({ resolveHandler: () => null });
+		ensureForwardingServer();
+		check("the shutdown fixture started the server", globalThis.__piFenceAskServer.timer !== null, true);
+		await entryRegistered[1].handler({}, entryUiCtx);
+		check("the session shutdown cleared the timer", globalThis.__piFenceAskServer.timer, null);
+		check("the session shutdown removed the created root", fs.existsSync(entryServerRoot), false);
+	} finally {
+		if (typeof savedEntryRoot === "string") process.env[CHILD_ASK_ROOT_ENV] = savedEntryRoot;
+		else delete process.env[CHILD_ASK_ROOT_ENV];
+		if (typeof savedEntryToken === "string") process.env[CHILD_ASK_TOKEN_ENV] = savedEntryToken;
+		else delete process.env[CHILD_ASK_TOKEN_ENV];
+		if (typeof savedEntryWait === "string") process.env[ASK_WAIT_ENV] = savedEntryWait;
+		else delete process.env[ASK_WAIT_ENV];
+		stopForwardingServer({ removeRoot: true });
+		resetFenceAskState();
+	}
+}
+resetFenceAskState();
 
 // ---------------------------------------------------------------------
 

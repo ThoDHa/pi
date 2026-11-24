@@ -91,12 +91,28 @@
  * approved out-of-scope handler call records the derived grant into
  * the fence-ask ledger and refusals, headless blocks, and repeat
  * approvals record nothing.
+ *
+ * The unit 1-3 headless forward branch is pinned the same three ways:
+ * the decision data (a candidate-bearing headless block carries
+ * grantCandidate and askEvidence for the factory's forward branch;
+ * degraded-seal and substitution blocks carry neither candidate, so
+ * they block without forwarding); forwardHeadlessAsk against the real
+ * channel (an applied grant passes the call, lands the dual-form root
+ * in appliedSelfGrants, admits through childScopedAllowedRoots, keys
+ * form-aware with the candidate and evidence in the prompt body, and
+ * denials, timeouts, and channel failures block fail-closed naming
+ * tool, directory, and posture); and the factory wiring end to end,
+ * where a provisioned headless child's out-of-scope call forwards,
+ * the ruling maps onto pass or block, the grant feeds the next
+ * verdict with no second round-trip, a candidate-less ask never
+ * writes a request file, and an unprovisioned call keeps the plain
+ * headless remedy block.
  */
 
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import cwdScopeGate, {
 	EXTRA_ROOTS_ENV,
@@ -123,12 +139,16 @@ import cwdScopeGate, {
 	resetFenceExtraRoots,
 	resetSessionSeal,
 	resolveRunningRelease,
+	childScopedAllowedRoots,
+	forwardHeadlessAsk,
 	resolveScopeTarget,
 	recordParentOwnGrant,
 	scanBashCommand,
 	sessionSealState,
 } from "../extensions/workspace-fence.ts";
-import { inheritedExtraRootsEnvValue, parentGrantedDirectories, resetFenceAskState } from "../extensions/fence-ask/grant-ledger.ts";
+import { appliedSelfGrants, inheritedExtraRootsEnvValue, parentGrantedDirectories, registerLiveChild, resetFenceAskState } from "../extensions/fence-ask/grant-ledger.ts";
+import { ASK_WAIT_ENV, CHILD_ASK_ROOT_ENV, CHILD_ASK_TOKEN_ENV } from "../extensions/fence-ask/ask-wire.ts";
+import { createForwardingRootDirs, deleteAskFile, requestIdsIn, serveForwardingRootTick } from "../extensions/fence-ask/ask-channel.ts";
 
 let failed = 0;
 let total = 0;
@@ -2238,6 +2258,314 @@ try {
 	resetFenceAskState();
 } finally {
 	fs.rmSync(fixtureRoot, { recursive: true, force: true });
+}
+
+// --- unit 1-3: the headless forward branch --------------------------
+// A provisioned headless child's out-of-scope ask forwards up the
+// channel instead of failing closed. The decision data carries the
+// candidate and evidence so the factory can forward; degraded-seal and
+// unusable-input asks carry neither field, so they block without ever
+// touching the channel. forwardHeadlessAsk runs the bounded flow with
+// the form-aware grant key and applies a grant to this child's own
+// verdicts; the factory handler maps the outcome onto pass or block,
+// and its per-call allowed-roots build consumes appliedSelfGrants.
+
+const fwdCwd = fs.mkdtempSync(path.join(os.tmpdir(), "fence-fwd-suite-"));
+const fwdFixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fence-fwd-fixture-"));
+const fwdTmp = path.join(fwdFixtureRoot, "tmp");
+fs.mkdirSync(fwdTmp);
+const fwdCleanSeal = { degraded: false, reasons: [] };
+const fwdDegradedSeal = { degraded: true, reasons: ["fixture drift"] };
+const fwdRoots = buildAllowedRoots(fwdCwd, [], fwdTmp);
+const forwardRoot = path.join(os.tmpdir(), `fence-fwd-root-${randomUUID()}`);
+createForwardingRootDirs(forwardRoot);
+const forwardToken = randomUUID();
+registerLiveChild(forwardToken, "fwd-worker", "fwd dispatch", 200_000);
+const fwdSavedWait = process.env[ASK_WAIT_ENV];
+const fwdSavedAskRoot = process.env[CHILD_ASK_ROOT_ENV];
+const fwdSavedAskToken = process.env[CHILD_ASK_TOKEN_ENV];
+process.env[CHILD_ASK_ROOT_ENV] = forwardRoot;
+process.env[CHILD_ASK_TOKEN_ENV] = forwardToken;
+
+function fwdSleep(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+async function fwdWaitFor(predicate, timeoutMs = 5_000, step = 10) {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		const value = predicate();
+		if (value) return value;
+		await fwdSleep(step);
+	}
+	return null;
+}
+
+try {
+	// decision data: the headless block of a candidate-bearing ask
+	// carries the candidate and the evidence; degraded and unusable
+	// asks carry neither, so the factory branch cannot reach the
+	// channel for them.
+	const fwdPathHeadless = decidePathToolCall({
+		toolName: "read",
+		input: { path: "/etc/hostname" },
+		sessionCwd: fwdCwd,
+		allowedRoots: fwdRoots,
+		hasUI: false,
+		seal: fwdCleanSeal,
+	});
+	check("a headless path block carries the grant candidate", fwdPathHeadless.grantCandidate, "/etc/hostname");
+	check(
+		"a headless path block carries the ask evidence",
+		typeof fwdPathHeadless.askEvidence === "string" && fwdPathHeadless.askEvidence.length > 0,
+		true,
+	);
+	checkContains("the ask evidence explains the policy breach", fwdPathHeadless.askEvidence ?? "", "allowed");
+	const fwdBashHeadless = decideBashToolCall({
+		toolName: "bash",
+		input: { command: "cat /etc/hostname" },
+		sessionCwd: fwdCwd,
+		allowedRoots: fwdRoots,
+		hasUI: false,
+		seal: fwdCleanSeal,
+	});
+	check("a headless bash operand block carries the grant candidate", fwdBashHeadless.grantCandidate, "/etc/hostname");
+	check(
+		"a headless bash operand block carries the ask evidence",
+		typeof fwdBashHeadless.askEvidence === "string" && fwdBashHeadless.askEvidence.length > 0,
+		true,
+	);
+	const fwdDegradedPath = decidePathToolCall({
+		toolName: "read",
+		input: { path: "/etc/hostname" },
+		sessionCwd: fwdCwd,
+		allowedRoots: fwdRoots,
+		hasUI: false,
+		seal: fwdDegradedSeal,
+	});
+	check("a degraded headless block carries no grant candidate", fwdDegradedPath.grantCandidate, undefined);
+	checkContains("a degraded headless block still explains itself", fwdDegradedPath.askEvidence ?? "", "degraded");
+	const fwdDegradedBash = decideBashToolCall({
+		toolName: "bash",
+		input: { command: "cat /etc/hostname" },
+		sessionCwd: fwdCwd,
+		allowedRoots: fwdRoots,
+		hasUI: false,
+		seal: fwdDegradedSeal,
+	});
+	check("a degraded headless bash block carries no grant candidate", fwdDegradedBash.grantCandidate, undefined);
+	const fwdSubstitution = decideBashToolCall({
+		toolName: "bash",
+		input: { command: "echo $HOME/secret" },
+		sessionCwd: fwdCwd,
+		allowedRoots: fwdRoots,
+		hasUI: false,
+		seal: fwdCleanSeal,
+	});
+	check("a substitution headless block carries no grant candidate", fwdSubstitution.grantCandidate, undefined);
+	checkContains("a substitution headless block still explains itself", fwdSubstitution.askEvidence ?? "", "expansion");
+
+	// forwardHeadlessAsk applied: the served grant passes the call,
+	// lands the dual-form root in appliedSelfGrants, and the derived
+	// key is form-aware. A file candidate keys its parent directory.
+	resetFenceAskState();
+	registerLiveChild(forwardToken, "fwd-worker", "fwd dispatch", 200_000);
+	const fwdSeen = [];
+	const fwdServed = (async () => {
+		await fwdWaitFor(() => requestIdsIn(forwardRoot).length === 1);
+		await serveForwardingRootTick({
+			root: forwardRoot,
+			handler: async (ask, provenance) => {
+				fwdSeen.push({ ask, provenance });
+				return true;
+			},
+			maxAge: 60_000,
+		});
+	})();
+	const fwdApplied = await forwardHeadlessAsk({
+		toolName: "read",
+		candidate: "/etc/hostname",
+		askEvidence: "the fixture evidence text",
+		provisioning: { root: forwardRoot, token: forwardToken },
+		waitMs: 10_000,
+		pollMs: 20,
+	});
+	await fwdServed;
+	check("an applied forward passes the call", fwdApplied.action, "pass");
+	check(
+		"the applied grant lands in appliedSelfGrants",
+		appliedSelfGrants().includes("/etc"),
+		true,
+	);
+	check(
+		"the granted directory admits through the child-scoped roots",
+		resolveScopeTarget(fwdCwd, childScopedAllowedRoots(fwdCwd), "/etc/hostname", os.homedir(), fwdCleanSeal).scope,
+		"allow",
+	);
+	check(
+		"the forwarded ask keys the parent directory of a file candidate",
+		fwdSeen[0] ? fwdSeen[0].ask.resolvedPath : "none",
+		"/etc",
+	);
+	checkContains("the forwarded ask reason names the candidate", fwdSeen[0] ? fwdSeen[0].ask.reason : "", "/etc/hostname");
+	checkContains("the forwarded ask reason carries the evidence", fwdSeen[0] ? fwdSeen[0].ask.reason : "", "the fixture evidence text");
+	check("the forwarded ask rides this child's token", fwdSeen[0] ? fwdSeen[0].ask.childToken : "none", forwardToken);
+	check(
+		"the prompt provenance names the registry identity, not the wire",
+		fwdSeen[0] ? fwdSeen[0].provenance.agentName : "none",
+		"fwd-worker",
+	);
+
+	// forwardHeadlessAsk denied: the block names the via, the
+	// directory, and the fail-closed posture.
+	resetFenceAskState();
+	registerLiveChild(forwardToken, "fwd-worker", "fwd dispatch", 200_100);
+	const fwdDenyServed = (async () => {
+		await fwdWaitFor(() => requestIdsIn(forwardRoot).length === 1);
+		await serveForwardingRootTick({ root: forwardRoot, handler: async () => false, maxAge: 60_000 });
+	})();
+	const fwdDenied = await forwardHeadlessAsk({
+		toolName: "write",
+		candidate: "/var/log/fwd-denied.txt",
+		askEvidence: "denial fixture evidence",
+		provisioning: { root: forwardRoot, token: forwardToken },
+		waitMs: 10_000,
+		pollMs: 20,
+	});
+	await fwdDenyServed;
+	check("a denied forward blocks", fwdDenied.action, "block");
+	checkContains("the deny block names the via", fwdDenied.reason ?? "", "user");
+	checkContains("the deny block names the directory", fwdDenied.reason ?? "", "/var/log");
+	checkContains("the deny block states the fail-closed posture", fwdDenied.reason ?? "", "fails closed");
+	check(
+		"a denial lands nothing in appliedSelfGrants",
+		appliedSelfGrants().length,
+		0,
+	);
+
+	// forwardHeadlessAsk timeout: no serving surface, the explicit
+	// wait bound is honored, and the block is fail-closed.
+	const fwdTimedOut = await forwardHeadlessAsk({
+		toolName: "read",
+		candidate: "/usr/share",
+		askEvidence: "timeout fixture evidence",
+		provisioning: { root: forwardRoot, token: forwardToken },
+		waitMs: 120,
+		pollMs: 20,
+	});
+	check("an unserved forward times out into a block", fwdTimedOut.action, "block");
+	checkContains("the timeout block names the wait bound", fwdTimedOut.reason ?? "", "120");
+	checkContains("the timeout block names the directory", fwdTimedOut.reason ?? "", "/usr/share");
+	checkContains("the timeout block states the fail-closed posture", fwdTimedOut.reason ?? "", "fails closed");
+	deleteAskFile(forwardRoot, requestIdsIn(forwardRoot)[0] ?? "");
+
+	// forwardHeadlessAsk failed: an unusable channel root fails closed
+	// with the channel-unusable reason instead of throwing.
+	const fwdBrokenRoot = path.join(os.tmpdir(), `fence-fwd-broken-${randomUUID()}`);
+	fs.writeFileSync(fwdBrokenRoot, "not a directory");
+	const fwdFailed = await forwardHeadlessAsk({
+		toolName: "read",
+		candidate: "/etc/hostname",
+		askEvidence: "failed fixture evidence",
+		provisioning: { root: fwdBrokenRoot, token: forwardToken },
+		waitMs: 500,
+		pollMs: 20,
+	});
+	check("a channel failure blocks", fwdFailed.action, "block");
+	checkContains("the failed block names the unusable channel", fwdFailed.reason ?? "", "unusable");
+	checkContains("the failed block states the fail-closed posture", fwdFailed.reason ?? "", "fails closed");
+	fs.rmSync(fwdBrokenRoot, { force: true });
+
+	// factory wiring: a provisioned headless child's out-of-scope call
+	// forwards, and the ruling maps onto pass or block through the
+	// live handler. The granted directory then admits through the
+	// handler's own per-call allowed-roots build.
+	const fwdRegistered = [];
+	const fwdStubPi = {
+		on(name, fwdHandler) {
+			fwdRegistered.push({ name, handler: fwdHandler });
+		},
+	};
+	cwdScopeGate(fwdStubPi);
+	const fwdHandler = fwdRegistered[0].handler;
+	const fwdCtx = { cwd: fwdCwd, hasUI: false, ui: { select: async () => "Yes" } };
+
+	resetFenceAskState();
+	registerLiveChild(forwardToken, "fwd-worker", "fwd dispatch", 201_000);
+	process.env[ASK_WAIT_ENV] = "10000";
+	const fwdGrantCall = fwdHandler({ toolName: "read", input: { path: "/etc/hostname" } }, fwdCtx);
+	const fwdGrantServed = (async () => {
+		await fwdWaitFor(() => requestIdsIn(forwardRoot).length === 1);
+		await serveForwardingRootTick({ root: forwardRoot, handler: async () => true, maxAge: 60_000 });
+	})();
+	check("a granted forward passes through the live handler", await fwdGrantCall, undefined);
+	await fwdGrantServed;
+	check(
+		"the handler's granted root feeds the next verdict",
+		resolveScopeTarget(fwdCwd, childScopedAllowedRoots(fwdCwd), "/etc/hostname", os.homedir(), fwdCleanSeal).scope,
+		"allow",
+	);
+	check(
+		"the granted call passes again with no second round-trip",
+		await fwdHandler({ toolName: "read", input: { path: "/etc/hostname" } }, fwdCtx),
+		undefined,
+	);
+	check("the granted re-call wrote no request file", requestIdsIn(forwardRoot).length, 0);
+
+	resetFenceAskState();
+	registerLiveChild(forwardToken, "fwd-worker", "fwd dispatch", 201_100);
+	const fwdHandlerDenyCall = fwdHandler({ toolName: "read", input: { path: "/usr/local" } }, fwdCtx);
+	const fwdHandlerDenyServed = (async () => {
+		await fwdWaitFor(() => requestIdsIn(forwardRoot).length === 1);
+		await serveForwardingRootTick({ root: forwardRoot, handler: async () => false, maxAge: 60_000 });
+	})();
+	const fwdDenyResult = await fwdHandlerDenyCall;
+	await fwdHandlerDenyServed;
+	check("a denied forward blocks through the live handler", fwdDenyResult && fwdDenyResult.block, true);
+	checkContains("the handler deny names the via", fwdDenyResult ? fwdDenyResult.reason : "", "user");
+
+	resetFenceAskState();
+	registerLiveChild(forwardToken, "fwd-worker", "fwd dispatch", 201_200);
+	process.env[ASK_WAIT_ENV] = "150";
+	const fwdTimeoutResult = await fwdHandler({ toolName: "read", input: { path: "/usr/share" } }, fwdCtx);
+	check("an unserved forward blocks through the live handler", fwdTimeoutResult && fwdTimeoutResult.block, true);
+	checkContains("the handler timeout names the bound", fwdTimeoutResult ? fwdTimeoutResult.reason : "", "150");
+
+	deleteAskFile(forwardRoot, requestIdsIn(forwardRoot)[0] ?? "");
+
+	// guards: a candidate-less ask never writes a request file even
+	// when provisioning is present, and without provisioning the
+	// headless block keeps today's remedy posture.
+	resetFenceAskState();
+	registerLiveChild(forwardToken, "fwd-worker", "fwd dispatch", 201_300);
+	process.env[ASK_WAIT_ENV] = "10000";
+	const fwdGuardResult = await fwdHandler(
+		{ toolName: "bash", input: { command: "echo $HOME/secret" } },
+		fwdCtx,
+	);
+	check("a candidate-less ask blocks without forwarding", fwdGuardResult && fwdGuardResult.block, true);
+	check("the candidate-less ask wrote no request file", requestIdsIn(forwardRoot).length, 0);
+	delete process.env[CHILD_ASK_ROOT_ENV];
+	delete process.env[CHILD_ASK_TOKEN_ENV];
+	const fwdUnprovisioned = await fwdHandler({ toolName: "read", input: { path: "/etc/hostname" } }, fwdCtx);
+	check("an unprovisioned headless call still blocks", fwdUnprovisioned && fwdUnprovisioned.block, true);
+	checkContains(
+		"the unprovisioned block keeps the interactive remedy",
+		fwdUnprovisioned ? fwdUnprovisioned.reason : "",
+		"no interactive UI",
+	);
+	check("the unprovisioned call wrote no request file", requestIdsIn(forwardRoot).length, 0);
+} finally {
+	if (typeof fwdSavedWait === "string") process.env[ASK_WAIT_ENV] = fwdSavedWait;
+	else delete process.env[ASK_WAIT_ENV];
+	if (typeof fwdSavedAskRoot === "string") process.env[CHILD_ASK_ROOT_ENV] = fwdSavedAskRoot;
+	else delete process.env[CHILD_ASK_ROOT_ENV];
+	if (typeof fwdSavedAskToken === "string") process.env[CHILD_ASK_TOKEN_ENV] = fwdSavedAskToken;
+	else delete process.env[CHILD_ASK_TOKEN_ENV];
+	resetFenceAskState();
+	resetFenceExtraRoots();
+	fs.rmSync(forwardRoot, { recursive: true, force: true });
+	fs.rmSync(fwdFixtureRoot, { recursive: true, force: true });
+	fs.rmSync(fwdCwd, { recursive: true, force: true });
 }
 
 const passed = total - failed;

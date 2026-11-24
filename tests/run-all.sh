@@ -25,7 +25,7 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 
-NODE_SUITES="cooldown manager-body-pin permission-gate shim-convention subagent-dispatch-registry subagent-prompt-temp workspace-fence periscope-activity-filter periscope-detail-scroll periscope-navigator-detail periscope-navigator-tree periscope-strip-render periscope-task-label periscope-transcript-thinking"
+NODE_SUITES="cooldown fence-ask manager-body-pin permission-gate shim-convention subagent-dispatch-registry subagent-module-load subagent-prompt-temp workspace-fence periscope-activity-filter periscope-detail-scroll periscope-navigator-detail periscope-navigator-tree periscope-strip-render periscope-task-label periscope-transcript-thinking"
 SHELL_SUITES="task-storage-isolation/run-suite.sh task-storage-isolation/run-adversarial.sh"
 
 for suite in $NODE_SUITES; do
