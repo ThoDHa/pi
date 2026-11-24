@@ -45,7 +45,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -457,6 +457,23 @@ test("an explicit configPath bypasses the local lookup entirely", async () => {
 	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
 	assert.equal(lastAppend(runtime).data.state, "waiting", "the tracked file's provider armed");
 	await shutdownRuntime(runtime);
+});
+
+test("session_start announces when the local override wins the config lookup", async () => {
+	const localPath = path.join(path.dirname(new URL(import.meta.url).pathname), "..", "extensions", "cooldown.local.json");
+	writeFileSync(localPath, JSON.stringify(rawConfig({ defaultBufferMinutes: 9 })));
+	try {
+		const runtime = createRuntime();
+		await startRuntime(runtime);
+		assert.ok(runtime.notifies.some((notification) => notification.level === "info" && notification.message.includes("cooldown config") && notification.message.includes("cooldown.local.json") && notification.message.includes("override")), "the origin notify names the local path as the active config");
+		await shutdownRuntime(runtime);
+	} finally {
+		rmSync(localPath, { force: true });
+	}
+	const fresh = createRuntime();
+	await startRuntime(fresh);
+	assert.ok(!fresh.notifies.some((notification) => notification.message.includes("override")), "no origin notify when the local file is absent");
+	await shutdownRuntime(fresh);
 });
 
 // --- entry matching -----------------------------------------------------
@@ -1474,6 +1491,37 @@ test("simulating over a simulated wait still arms and extends", async () => {
 	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")));
 });
 
+/** Broad-earlier + narrow-later same-provider overlap: every real zai error resolves to the broad first entry. */
+function overlappingConfig() {
+	const broad = { ...rawConfig().providers[0], name: "zai-all", match: { provider: "zai" } };
+	const narrow = { ...rawConfig().providers[0], name: "zai-glm45", match: { provider: "zai", model: "glm-4.5" } };
+	return rawConfig({ providers: [broad, narrow] });
+}
+
+test("simulate refuses at the entry the arming path resolves to and never overwrites real provenance", async () => {
+	const runtime = createRuntime({ config: overlappingConfig() });
+	await startRuntime(runtime);
+	await messageEnd(runtime, assistantError(fixture1308(wholeSecond(now) + 30 * MINUTES)));
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-all")), "the real wait arms on the broad first-match entry");
+	const statusBefore = runtime.statuses.get(statusKeyFor("zai-all"));
+	const appendsBefore = runtime.appended.length;
+	const notifiesBefore = runtime.notifies.length;
+	await runtime.commands.get("cooldown-simulate").handler(`zai-glm45 ${fixture1308(wholeSecond(now) + 90 * MINUTES)}`, runtime.ctx);
+	assert.ok(runtime.notifies.length > notifiesBefore, "the refusal notifies");
+	const refusal = runtime.notifies.at(-1).message;
+	assert.ok(refusal.includes("zai-all"), "the refusal names the resolved entry, not the named one");
+	assert.ok(refusal.includes("/cooldown cancel"), "the refusal names the cancel path");
+	assert.equal(runtime.appended.length, appendsBefore, "no new persisted record");
+	assert.equal(runtime.appended[appendsBefore - 1].data.simulated, undefined, "the real wait's persisted provenance stays real");
+	assert.equal(runtime.statuses.get(statusKeyFor("zai-all")), statusBefore, "the real deadline is untouched");
+	await sleep(150);
+	assert.equal(runtime.sent.length, 0);
+	await startRuntime(runtime, "reload");
+	assert.ok(runtime.notifies.some((notification) => notification.message.includes("re-armed pending zai-all")), "the real wait survives the refused simulate and re-arms on reload");
+	assert.ok(runtime.statuses.has(statusKeyFor("zai-all")));
+	await shutdownRuntime(runtime);
+});
+
 // --- wiring: live countdown -----------------------------------------------
 
 test("the armed footer status shows the live countdown with the resume budget", async () => {
@@ -1578,6 +1626,7 @@ test("cooldown off cancels every pending wait in memory without tombstones", asy
 	assert.ok(runtime.statuses.has(statusKeyFor("zai-glm")) && runtime.statuses.has(statusKeyFor("acme-pro")), "both waits armed");
 	const appendsAtOff = runtime.appended.length;
 	await runtime.commands.get("cooldown").handler("off", runtime.ctx);
+	assert.ok(runtime.notifies.some((notification) => notification.message.includes("cancelled") && notification.message.includes("return") && notification.message.includes("reload") && notification.message.includes("restart")), "the off notify states the cancelled waits return after reload or restart");
 	assert.equal(runtime.statuses.size, 0, "off clears every entry's footer segment");
 	await sleep(40);
 	assert.equal(runtime.sent.length, 0, "off cancels the timers, nothing fires");

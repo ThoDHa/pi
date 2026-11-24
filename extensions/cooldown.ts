@@ -109,7 +109,7 @@ export interface ResolvedConfig {
 	providers: ResolvedProviderEntry[];
 }
 
-export type ConfigResult = { ok: true; config: ResolvedConfig } | { ok: false; problems: string[] };
+export type ConfigResult = { ok: true; config: ResolvedConfig; localOverridePath?: string } | { ok: false; problems: string[] };
 
 /** Structural view of the message fields detection needs; AssistantMessage satisfies it. */
 export interface LimitErrorMessage {
@@ -344,10 +344,11 @@ export function loadCooldownConfig(filePath: string): ConfigResult {
  * valid replaces the tracked default wholesale with no field merge,
  * invalid (unreadable, broken JSON, schema problems) leaves the caller
  * inert with problems naming the local path, and an absent local file
- * loads the tracked default exactly as before. An explicit configPath
- * bypasses this lookup entirely, so tests and pointed setups stay
- * deterministic; the local file itself stays untracked by the
- * extensions default-deny gitignore.
+ * loads the tracked default exactly as before. A local win sets
+ * localOverridePath so session_start can surface which file is active.
+ * An explicit configPath bypasses this lookup entirely, so tests and
+ * pointed setups stay deterministic; the local file itself stays
+ * untracked by the extensions default-deny gitignore.
  */
 export function loadCooldownConfigWithLocalOverride(defaultPath: string): ConfigResult {
 	const localPath = path.join(path.dirname(defaultPath), LOCAL_CONFIG_FILENAME);
@@ -367,7 +368,7 @@ export function loadCooldownConfigWithLocalOverride(defaultPath: string): Config
 		return { ok: false, problems: [`cooldown config: ${localPath} is not valid JSON: ${reason}`] };
 	}
 	const result = validateCooldownConfig(raw);
-	if (result.ok) return result;
+	if (result.ok) return { ok: true, config: result.config, localOverridePath: localPath };
 	return { ok: false, problems: result.problems.map((problem) => `${localPath}: ${problem}`) };
 }
 
@@ -532,7 +533,10 @@ function isCooldownEntry(entry: unknown): entry is { type: string; customType: s
  * fired/capped/resolved records, simulated waits, and malformed records
  * all decide their own name as no-wait, keeping the single-slot scan's
  * double-fire and durability guarantees per name; a record with no
- * readable entryName is unattributable and cannot decide any name.
+ * readable entryName is unattributable and cannot decide any name —
+ * that skip is intended: runtime writes always carry entryName, so a
+ * nameless record is hand-made garbage and must not suppress a real
+ * wait.
  * Returns the waits in branch order so restart adjudication and its
  * notifies stay deterministic.
  */
@@ -576,6 +580,7 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 	const configPath = options.configPath ?? path.join(path.dirname(fileURLToPath(import.meta.url)), "cooldown.json");
 	const loaded = options.configPath !== undefined ? loadCooldownConfig(configPath) : loadCooldownConfigWithLocalOverride(configPath);
 	const config: ResolvedConfig | undefined = loaded.ok ? loaded.config : undefined;
+	const localOverridePath = loaded.ok ? loaded.localOverridePath : undefined;
 	const problems = loaded.ok ? [] : loaded.problems;
 	// A degenerate tickMs would arm a busy loop of status writes; keep the
 	// countdown on the one-minute default instead.
@@ -769,6 +774,9 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 			if (ctx.hasUI) ctx.ui.notify(`cooldown extension is disabled: ${problems.join("; ")}`, "error");
 			return;
 		}
+		if (localOverridePath !== undefined && ctx.hasUI) {
+			ctx.ui.notify(`cooldown config: ${localOverridePath} overrides the tracked default`, "info");
+		}
 		// Reload bypasses resumeOnRestart in both directions: the armed timer
 		// would have fired on its own had /reload not replaced it, so re-arm or
 		// resume-now restores exactly the behavior the process would have
@@ -887,7 +895,7 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 		// tombstones: the switch itself does not survive a restart, so a
 		// restart must still be able to re-adjudicate the untouched persistence.
 		states.clear();
-		if (ctx.hasUI) ctx.ui.notify("cooldown: auto-recovery is off for this session; pending waits cancelled; /cooldown on re-enables", "info");
+		if (ctx.hasUI) ctx.ui.notify("cooldown: auto-recovery is off for this session; pending waits cancelled; they return after a reload or restart; /cooldown on re-enables", "info");
 	}
 
 	pi.registerCommand("cooldown", {
@@ -938,9 +946,14 @@ export default function cooldownExtension(pi: ExtensionAPI, options: CooldownExt
 				if (ctx.hasUI) ctx.ui.notify("cooldown-simulate: pass the provider error text after the entry name", "info");
 				return;
 			}
-			const live = states.get(entry.name);
+			// The mutation target is whatever the real arming path resolves from
+			// this entry's match, not the named entry itself: overlapping
+			// same-provider patterns put the live real wait on a broader earlier
+			// entry, and that wait is what a simulation would move.
+			const target = findCooldownEntry(config, entry.match.provider, entry.match.model) ?? entry;
+			const live = states.get(target.name);
 			if (live !== undefined && live.simulated !== true) {
-				if (ctx.hasUI) ctx.ui.notify(`cooldown-simulate: ${entry.name} already holds a live usage-limit wait; simulating would move the real deadline, so cancel it first with /cooldown cancel`, "warning");
+				if (ctx.hasUI) ctx.ui.notify(`cooldown-simulate: ${target.name} already holds a live usage-limit wait; simulating would move the real deadline, so cancel it first with /cooldown cancel`, "warning");
 				return;
 			}
 			handleLimitError(ctx, { role: "assistant", stopReason: "error", errorMessage: text, provider: entry.match.provider, model: entry.match.model }, true);
