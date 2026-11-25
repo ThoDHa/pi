@@ -113,7 +113,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import cwdScopeGate, {
 	EXTRA_ROOTS_ENV,
 	FENCE_CONFIG_FILE,
@@ -149,6 +149,8 @@ import cwdScopeGate, {
 import { appliedSelfGrants, inheritedExtraRootsEnvValue, parentGrantedDirectories, registerLiveChild, resetFenceAskState } from "../extensions/fence-ask/grant-ledger.ts";
 import { ASK_WAIT_ENV, CHILD_ASK_ROOT_ENV, CHILD_ASK_TOKEN_ENV } from "../extensions/fence-ask/ask-wire.ts";
 import { createForwardingRootDirs, deleteAskFile, requestIdsIn, serveForwardingRootTick } from "../extensions/fence-ask/ask-channel.ts";
+import { loadBashParser, memoizeAsyncWithRetry } from "../extensions/fence-ast/bash-parser.ts";
+import { GRAMMAR_ARTIFACT_FILES, GRAMMAR_DIGEST_PINS } from "../extensions/fence-ast/grammar-pins.ts";
 
 let failed = 0;
 let total = 0;
@@ -2566,6 +2568,114 @@ try {
 	fs.rmSync(forwardRoot, { recursive: true, force: true });
 	fs.rmSync(fwdFixtureRoot, { recursive: true, force: true });
 	fs.rmSync(fwdCwd, { recursive: true, force: true });
+}
+
+// --- PISCOPE-2-1: the fence-ast parser infrastructure --------------
+// The bash pass's parser infrastructure is a sibling package under
+// extensions/, importable by relative path and invisible to pi's
+// extension auto-discovery, whose subdirectory rule reads exactly
+// three entry shapes: a package.json with a pi.extensions manifest,
+// index.ts, and index.js (pi's dist/core/extensions/loader.js
+// resolveExtensionEntries, one level deep, no recursion). fence-ast
+// carries none of them, so nothing in the package is loadable until
+// the fence itself imports it (unit PISCOPE-2-2). The pins cover the
+// undiscovered-by-loader negative probe, the vendored artifacts'
+// SHA-256 pins with a mutated-fixture red, and the loader's init,
+// retry, and memoization contract (the GPS shape the module docstring
+// carries).
+
+const fenceAstDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "extensions", "fence-ast");
+const fenceAstVendorDir = path.join(fenceAstDir, "vendor");
+
+check("fence-ast exists for the infrastructure pins to cover", fs.existsSync(fenceAstDir), true);
+check("fence-ast carries no index.ts for the loader to discover", fs.existsSync(path.join(fenceAstDir, "index.ts")), false);
+check("fence-ast carries no index.js for the loader to discover", fs.existsSync(path.join(fenceAstDir, "index.js")), false);
+check("fence-ast carries no package.json manifest for the loader to discover", fs.existsSync(path.join(fenceAstDir, "package.json")), false);
+for (const artifact of GRAMMAR_ARTIFACT_FILES) {
+	check(`the vendored ${artifact} is present`, fs.existsSync(path.join(fenceAstVendorDir, artifact)), true);
+}
+check("the web-tree-sitter license text is vendored", fs.existsSync(path.join(fenceAstVendorDir, "web-tree-sitter.LICENSE")), true);
+check("the tree-sitter-bash license text is vendored", fs.existsSync(path.join(fenceAstVendorDir, "tree-sitter-bash.LICENSE")), true);
+check("the vendor attribution record is present", fs.existsSync(path.join(fenceAstVendorDir, "ATTRIBUTION.md")), true);
+check("the loader entry bash-parser.ts is present", fs.existsSync(path.join(fenceAstDir, "bash-parser.ts")), true);
+check("the pins surface grammar-pins.ts is present", fs.existsSync(path.join(fenceAstDir, "grammar-pins.ts")), true);
+
+check("every vendored artifact carries a digest pin", GRAMMAR_ARTIFACT_FILES.every((artifact) => typeof GRAMMAR_DIGEST_PINS[artifact] === "string"), true);
+check("the digest pin set covers exactly the vendored artifact list", Object.keys(GRAMMAR_DIGEST_PINS).length === GRAMMAR_ARTIFACT_FILES.length, true);
+for (const artifact of GRAMMAR_ARTIFACT_FILES) {
+	check(
+		`the vendored ${artifact} hashes to its recorded pin`,
+		computeFileDigest(path.join(fenceAstVendorDir, artifact)),
+		GRAMMAR_DIGEST_PINS[artifact],
+	);
+}
+{
+	const mutationFixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "fence-ast-mutation-"));
+	try {
+		const artifact = "web-tree-sitter.wasm";
+		const source = path.join(fenceAstVendorDir, artifact);
+		const pristine = path.join(mutationFixtureDir, "pristine.wasm");
+		const mutated = path.join(mutationFixtureDir, "mutated.wasm");
+		const bytes = fs.readFileSync(source);
+		fs.writeFileSync(pristine, bytes);
+		const flipped = Buffer.from(bytes);
+		flipped[Math.floor(flipped.length / 2)] ^= 0xff;
+		fs.writeFileSync(mutated, flipped);
+		check("the mutation fixture's unmutated copy hashes to the pin", computeFileDigest(pristine), GRAMMAR_DIGEST_PINS[artifact]);
+		check("a mutated fixture fails the digest comparison the seal will apply", computeFileDigest(mutated) === GRAMMAR_DIGEST_PINS[artifact], false);
+	} finally {
+		fs.rmSync(mutationFixtureDir, { recursive: true, force: true });
+	}
+}
+
+const bashParser = await loadBashParser();
+check("the loader resolves a parser with a parse function", typeof bashParser.parse === "function", true);
+{
+	const tree = bashParser.parse("cat /etc/secrets");
+	check("a real command parses to a program root", tree?.rootNode.type, "program");
+	check("a clean command's parse carries no error", tree?.rootNode.hasError, false);
+	tree.delete();
+}
+{
+	const tree = bashParser.parse("FOO=/etc/passwd cat");
+	const commandNode = tree?.rootNode.child(0);
+	check("the bash grammar is live: the root command parses", commandNode?.type, "command");
+	const childTypes = [];
+	for (let i = 0; i < (commandNode?.childCount ?? 0); i++) {
+		const child = commandNode.child(i);
+		if (child) childTypes.push(child.type);
+	}
+	check("an assignment prefix parses as variable_assignment inside the command", childTypes.includes("variable_assignment"), true);
+	tree.delete();
+}
+{
+	const tree = bashParser.parse("echo 'unterminated");
+	check("an unterminated quote parses with the error flag set", tree?.rootNode.hasError, true);
+	tree.delete();
+}
+check("repeat loads resolve to the same memoized parser instance", (await loadBashParser()) === bashParser, true);
+{
+	const [firstConcurrent, secondConcurrent] = await Promise.all([loadBashParser(), loadBashParser()]);
+	check("concurrent callers share one parser instance", firstConcurrent === bashParser && secondConcurrent === bashParser, true);
+}
+{
+	let factoryRuns = 0;
+	const retrying = memoizeAsyncWithRetry(async () => {
+		factoryRuns += 1;
+		if (factoryRuns === 1) throw new Error("transient wasm load failure");
+		return { marker: factoryRuns };
+	});
+	let firstCallRejected = false;
+	try {
+		await retrying();
+	} catch {
+		firstCallRejected = true;
+	}
+	check("a failing first load rejects instead of throwing synchronously", firstCallRejected, true);
+	const retried = await retrying();
+	check("a rejected load is dropped and the next call retries the factory", factoryRuns === 2, true);
+	check("the retried load resolves the fresh factory result", retried?.marker, 2);
+	check("a resolved load stays memoized without re-running the factory", factoryRuns === 2 && (await retrying()) === retried, true);
 }
 
 const passed = total - failed;
