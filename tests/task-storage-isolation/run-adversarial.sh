@@ -32,10 +32,9 @@
 #
 # Degradation contract: with ISOLATION_ALLOW_DEGRADED=1 (set by the
 # container verify chain, which has no bwrap and no model gateway) the
-# machine-probe columns and LLM-dependent sections are announced as
-# skipped and the suite gates on what ran; without the flag a missing
-# tool fails the suite loudly. Enforced labels are decided by full-mode
-# host runs only.
+# machine-probe columns are announced as skipped and the suite gates on
+# what ran; without the flag a missing tool fails the suite loudly.
+# Enforced labels are decided by full-mode host runs only.
 #
 # Exit contract: non-zero unless every check passed; on failure the run
 # directory is kept and its path printed.

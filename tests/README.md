@@ -49,14 +49,16 @@ writes under channel attribution, and masked-read denials in the same
 child session. The opencode counterpart of this gate lives in the
 dotfiles repo with the opencode enforcement column.
 
-Known posture: on this host the run needs PISCOPE_EXTRA_ROOTS to cover
-this repo (the masked child runs the deployed cwd-scope gate), and its
-sanctioned-write leg is currently red at source: the hosted service
-resolves the board from its cwd under a minimal environment by design,
-while the current tasks CLI never resolves local .tasks directories
-(central-store resolution), so the fixture's writes refuse with
-NO_BOARD. The denial, read, and child-probe legs pass. See the
-PIRELOC-1 record for the analysis.
+Fixture posture: the hosted service hands its CLI a minimal
+environment (PATH/HOME/TASKS_SESSION) by design and the tasks CLI
+resolves no local .tasks tree, so the suite provides the fixture board
+through the family's fixture launcher (a PATH shim that execs the real
+CLI with the TASKS_DIR pin for its cwd, the same shape run-suite.sh
+uses). The suite exports PISCOPE_EXTRA_ROOTS covering
+extensions/ for the parent session so the masked child's cwd-scope
+gate admits the channel client at its repo path (the child's /tmp is
+a tmpfs, so the client cannot ride inside the fixture repo). The
+operator needs no environment setup.
 
 ## Known environmental reds
 
@@ -64,8 +66,8 @@ tests/condensed-footer.test.mjs and tests/periscope-view.test.mjs fail
 in provisioning on hosts where no pi installation carrying
 @earendil-works/pi-tui can be located up-tree from `which pi`
 (tests/provision-pi-tui.mjs). That is environmental, not a regression;
-they are excluded from run-all.sh for that reason and run standalone
-where the shim provisions.
+run-all.sh names both in its explicit exclusion list for that reason,
+and they run standalone where the shim provisions.
 
 ## Manager-body regeneration flow (manual, cross-repo by design)
 

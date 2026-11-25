@@ -44,6 +44,9 @@ const bodyDigest = (() => {
 })();
 
 let failed = 0;
+let checks = 0;
+
+checks++;
 if (embeddedDigest === undefined) {
 	failed++;
 	console.log("FAIL  manager-mode.ts embeds a well-formed PINNED_BODY_DIGEST");
@@ -52,20 +55,29 @@ if (embeddedDigest === undefined) {
 } else {
 	console.log("ok    manager-mode.ts embeds a well-formed PINNED_BODY_DIGEST");
 }
-if (embeddedDigest === undefined || bodyDigest === undefined) {
+
+checks++;
+if (bodyDigest === undefined) {
 	failed++;
 	console.log("FAIL  extensions/manager-body.md is readable for the pin check");
 	console.log("      expected: the sidecar readable beside manager-mode.ts");
-} else if (bodyDigest !== embeddedDigest) {
-	failed++;
-	console.log("FAIL  manager-body.md digest matches the embedded pin");
-	console.log(`      expected: ${embeddedDigest}`);
-	console.log(`      actual  : ${bodyDigest}`);
-	console.log("      refresh extensions/manager-body.md and PINNED_BODY_DIGEST together");
+	console.log("      actual  : unreadable or missing");
 } else {
-	console.log("ok    manager-body.md digest matches the embedded pin");
+	console.log("ok    extensions/manager-body.md is readable for the pin check");
 }
 
-const passed = 2 - failed;
-console.log(`\n${passed}/2 passed, ${failed} failed`);
+if (embeddedDigest !== undefined && bodyDigest !== undefined) {
+	checks++;
+	if (bodyDigest !== embeddedDigest) {
+		failed++;
+		console.log("FAIL  manager-body.md digest matches the embedded pin");
+		console.log(`      expected: ${embeddedDigest}`);
+		console.log(`      actual  : ${bodyDigest}`);
+		console.log("      refresh extensions/manager-body.md and PINNED_BODY_DIGEST together");
+	} else {
+		console.log("ok    manager-body.md digest matches the embedded pin");
+	}
+}
+
+console.log(`\n${checks - failed}/${checks} passed, ${failed} failed`);
 if (failed > 0) process.exitCode = 1;

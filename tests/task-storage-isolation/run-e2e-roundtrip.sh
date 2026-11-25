@@ -28,6 +28,17 @@
 # overrides the model; the default is the fleet worker model
 # (zai/glm-5.3-flash).
 #
+# Fixture board posture: the hosted service hands its CLI a minimal
+# environment (PATH/HOME/TASKS_SESSION) by design, the tasks CLI
+# resolves no local .tasks tree, and its store chain reaches only the
+# host dev root, so the suite provides the fixture board the family's
+# standard way (run-suite.sh's fixture launcher): a PATH shim that
+# execs the real CLI with the TASKS_DIR pin for its cwd. The masked
+# child's cwd-scope gate sees the channel client through
+# PISCOPE_EXTRA_ROOTS, exported here so the run is self-sufficient
+# (the child's /tmp is a tmpfs, so the client must stay at its repo
+# path to be visible under the root read-only bind).
+#
 # pi credential lane: the wrap never binds auth.json (or sessions/) into
 # the masked child, so the child authenticates from the environment
 # (providers.md env lane, ZAI_API_KEY for the zai provider). The script
@@ -53,7 +64,9 @@ case ":$PATH:" in
 	*":$HOME/.local/bin:"*) ;;
 	*) PATH="$HOME/.local/bin:$PATH" ;;
 esac
+command -v tasks >/dev/null || fail_fast "tasks CLI not on PATH"
 TASKS_BIN="$(command -v tasks)"
+[[ -x "$TASKS_BIN" ]] || fail_fast "tasks CLI resolved from PATH is not executable: $TASKS_BIN"
 
 # The EXIT handler is inline as a workaround: the natural form is a
 # named cleanup() referenced by the trap, but shellcheck 0.11.0 cannot
@@ -90,10 +103,8 @@ RUN="$(mktemp -d /tmp/task-e2e-roundtrip.XXXXXX)"
 
 command -v pi >/dev/null || fail_fast "pi not installed"
 command -v bwrap >/dev/null || fail_fast "bwrap not installed"
-command -v tasks >/dev/null || fail_fast "tasks CLI not on PATH"
 command -v git >/dev/null || fail_fast "git not installed"
 [[ -d "$HOME/.pi/agent/extensions/subagent" ]] || fail_fast "vendored subagent extension not found"
-[[ -x "$TASKS_BIN" ]] || fail_fast "repo tasks CLI missing at $TASKS_BIN"
 
 # The masked child authenticates from the environment (the wrap never
 # binds the credential store): an ambient ZAI_API_KEY wins, otherwise
@@ -186,6 +197,17 @@ run="$RUN/pi"
 	fi
 
 	client="$REPO_ROOT/extensions/task-storage-isolation-client.py"
+	shim="$run/bin"
+	mkdir -p "$shim"
+	cat >"$shim/tasks" <<LAUNCHER
+#!/usr/bin/env bash
+# Fixture board pin: a /tmp scratch board resolves only through the
+# explicit TASKS_DIR override, so the service exec carries the pin for
+# its cwd (the fixture repo root).
+exec env TASKS_DIR="\$PWD/.tasks" "$TASKS_BIN" "\$@"
+LAUNCHER
+	chmod +x "$shim/tasks"
+
 	CHILD_TASK="$(cat <<EOF
 Run these commands from the current directory, one at a time, and build your final message strictly from their results. Output one block per label: the label, then that command's full stdout or its full error text verbatim.
 CMD1: cat .tasks/reports/secret.md
@@ -206,6 +228,8 @@ EOF
 		export PI_TASK_STORAGE_AGENT_DIR="$agent"
 		export PI_TASK_STORAGE_ISOLATION=1
 		export TASKS_SESSION=e2e-manager
+		export PATH="$shim:$PATH"
+		export PISCOPE_EXTRA_ROOTS="$REPO_ROOT/extensions"
 		exec timeout 480 pi --mode json -p --no-session --no-extensions \
 			-e "$agent/extensions/subagent/index.ts" \
 			-e "$REPO_ROOT/extensions/task-storage-isolation.ts" \

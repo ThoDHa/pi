@@ -100,6 +100,11 @@ echo "=== 3. patched extension copy (bwrap seam behind env activation) ==="
 EXT_COPY="$RUN/ext"
 python3 "$SUITE_DIR/lib/patch-subagent.py" \
 	"$HOME/.pi/agent/extensions/subagent" "$EXT_COPY" >/dev/null
+# The staged index imports sibling modules from the fence-ask family
+# (ask-wire, serve, grant-ledger) and the workspace-fence module, so
+# those stage beside ext/.
+cp -r "$HOME/.pi/agent/extensions/fence-ask" "$RUN/fence-ask"
+cp "$HOME/.pi/agent/extensions/workspace-fence.ts" "$RUN/workspace-fence.ts"
 PI_NM="$HOME/.nvm/versions/node/v24.22.0/lib/node_modules/@earendil-works/pi-coding-agent/node_modules"
 mkdir -p "$EXT_COPY/node_modules/@earendil-works"
 for pkg in pi-agent-core pi-ai pi-coding-agent pi-tui; do
@@ -133,6 +138,10 @@ export SKELETON_BWRAP_TRUST_FILE="$RUN/trust.json"
 echo '{}' >"$SKELETON_BWRAP_TRUST_FILE"
 (
 	cd "$FIXTURE"
+	# The masked child's cwd-scope gate must admit the uds-client
+	# operand at its repo path, so the run widens its own child scope
+	# instead of relying on the operator's environment.
+	export PISCOPE_EXTRA_ROOTS="$SUITE_DIR/lib"
 	timeout 300 pi --mode json -p --no-session --no-extensions \
 		-e "$EXT_COPY/index.ts" --model "$MODEL" \
 		"$PARENT_PROMPT" >"$PARENT_OUT" 2>"$RUN/parent.err"

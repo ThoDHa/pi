@@ -10,13 +10,13 @@
 #   bash tests/task-storage-isolation/run-skeleton.sh
 #   bash tests/task-storage-isolation/run-e2e-roundtrip.sh
 #
-# Also absent: tests/condensed-footer.test.mjs and
-# tests/periscope-view.test.mjs. Both depend on the repo-local
-# @earendil-works/pi-tui shim that tests/provision-pi-tui.mjs provisions
-# by walking up from `which pi`; on hosts where no pi installation
-# carrying that package is locatable the two fail in provisioning, which
-# is environmental, not a regression. Run them standalone on a host where
-# the shim provisions.
+# Node suites are discovered from tests/*.test.mjs, so a new suite is
+# covered by default. The exclusions below are conscious, not an
+# oversight: both depend on the repo-local @earendil-works/pi-tui shim
+# that tests/provision-pi-tui.mjs provisions by walking up from
+# `which pi`; on hosts where no pi installation carrying that package is
+# locatable they fail in provisioning, which is environmental, not a
+# regression. Run them standalone on a host where the shim provisions.
 #
 # Known postures: the moved shell suites degrade per their own contracts
 # (ISOLATION_ALLOW_DEGRADED=1 gates tool-dependent sections), so run-all
@@ -25,7 +25,17 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 
-NODE_SUITES="cooldown cooldown-invariant fence-ask manager-body-pin permission-gate shim-convention subagent-dispatch-registry subagent-module-load subagent-prompt-temp workspace-fence periscope-activity-filter periscope-detail-scroll periscope-navigator-detail periscope-navigator-tree periscope-strip-render periscope-task-label periscope-transcript-thinking"
+EXCLUDED_NODE_SUITES="condensed-footer periscope-view"
+NODE_SUITES=""
+for suite_path in tests/*.test.mjs; do
+	[[ -e "$suite_path" ]] || continue
+	suite="${suite_path#tests/}"
+	suite="${suite%.test.mjs}"
+	case " $EXCLUDED_NODE_SUITES " in
+		*" $suite "*) continue ;;
+	esac
+	NODE_SUITES="$NODE_SUITES $suite"
+done
 SHELL_SUITES="task-storage-isolation/run-suite.sh task-storage-isolation/run-adversarial.sh"
 
 for suite in $NODE_SUITES; do
