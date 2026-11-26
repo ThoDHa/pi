@@ -36,74 +36,62 @@
  * roots --glob at the search directory and find globs within
  * searchPath, so that text filters inside the already-resolved
  * directory and cannot name an access point outside it. The handler
- * also covers bash through a recall-limited lexical scope pass adapted
- * from permission-gate's scanner conventions (adapted, not imported;
- * permission-gate stays untouched): one quote-and-escape-aware
- * tokenizer is the single grammar for both substitution detection and
- * operand extraction. Operands, redirect targets, and assignment RHS
- * are extracted from its walk of the raw command, so quoting does not
- * exempt them: cat "/etc/passwd" asks exactly as cat /etc/passwd does,
- * and multi-word quoted text splits into pieces for extraction, so a
- * prose sentence naming an out-of-scope path asks. Executor shapes
- * are detected as tokens over the same walker segments: a shell
- * (bash, zsh, sh, dash, ksh), su, or ssh token whose directory
- * prefix strips away lexically (/bin/bash, ./sh, /bin/su; no
+ * also covers bash through an AST-backed detection layer
+ * (extensions/fence-ast/bash-scan.ts, unit PISCOPE-2-2 of PISCOPE-2):
+ * the command parses through the vendored tree-sitter-bash grammar
+ * (fence-ast, whose artifacts verify against their recorded digest
+ * pins before any vendored byte loads, through a memoized loader with
+ * a bounded init budget and reject-and-retry semantics), and the walk
+ * reads the tree instead of modeling quote grammar. Substitution is
+ * the presence of an expansion node ($, ${}, $(), $(( )), backticks,
+ * process substitution, the ANSI-C $'...' form), so quoting stops
+ * being a guess: cat "/etc/passwd" asks exactly as cat /etc/passwd
+ * does, an escaped quote cannot hide a substitution
+ * (echo \' && cat "$HOME/secrets" asks, while echo \' alone passes),
+ * an escaped dollar is literal, and single quotes are inert because
+ * bash provably cannot expand inside them. Operands extract from
+ * argument pieces (a quoted multi-word payload splits into pieces, so
+ * a path named inside quoted prose gates), from file_redirect
+ * destinations wherever they sit (a segment-head redirect cannot pass
+ * as a would-be executable; a redirect attached to a heredoc
+ * statement still extracts, the tree-quirk correction), from a
+ * prefix variable_assignment's value (a lone assignment only sets a
+ * variable and opens nothing), and from cd/pushd targets regardless
+ * of spelling, while a bare cd, cd -, or an option-only cd asks:
+ * home, OLDPWD, and the directory stack are shell state. A mid-word
+ * backslash-newline continuation joins exactly as bash joins it (the
+ * grammar splits the word; the walk re-joins it when the backslash
+ * abuts the word). Data-null and process-internal devices (/dev/null,
+ * /dev/zero, /dev/stdin, /dev/stdout, /dev/stderr, /dev/fd/N) stay
+ * exempt from bash operand verdicts only, never from the path tools,
+ * and /dev/tty stays gated because it reads user input. Executor
+ * shapes are command_name identity (a bash/zsh/sh/dash/ksh, su, or
+ * ssh token whose directory prefix strips away lexically; no
  * filesystem resolution, so a missing path still gates) followed by
- * a combined-flag token carrying -c, glued-value forms included
- * (-cpayload and -c'payload' are one token whose text continues past
- * the flag, and bash takes that remainder as the command string), or
- * the exact token eval; and a command/env/nohup/nice/timeout wrapper
- * (identity stripped the same way) preceding an executor shape in a
- * segment floors the call to ask without scanning through, because
- * the wrapper re-executes its arguments. A quoted prose mention of
- * bash -c is one word, not the shell token, and no quote grammar
- * besides the walker exists anywhere in the
- * module. The pass extracts operands wherever they sit and resolves them through
+ * a -c-carrying flag, glued forms included, or the exact token eval;
+ * a command/env/nohup/nice/timeout/exec wrapper preceding an executor
+ * shape in one command floors the call to ask, because the wrapper
+ * re-executes its arguments. A quoted prose mention of bash -c is
+ * argument data, not the shell token, so it neither triggers nor
+ * hides an executor shape, and an escaped quote cannot hide one
+ * (echo \' ; bash -c 'cat "$HOME/secrets"' asks). Heredocs,
+ * comments, grouping, and braces parse to verdicts (sanctioned
+ * narrowing, Decision Log answer to Blocks Q3): a comment is inert,
+ * a plain heredoc body names no operand, while an interpolating body
+ * still asks (its expansion runs). The bail class is parse health: an
+ * ERROR-bearing parse asks. Sed's script positional and expression-
+ * flag values are structurally skipped (the pattern-first adaptation
+ * of permission-gate's PATTERN_FIRST_COMMANDS, scoped to sed), which
+ * closes the EXT-34 false-positive class: a sed range is an argument,
+ * not a garbage absolute path, while real file operands after the
+ * script keep gating. The bash decision is async at the handler seam
+ * (the factory stays synchronous; the parser loads lazily on the
+ * first gated bash call): parser unavailability, a digest mismatch,
+ * or an expired init budget asks every bash call through the
+ * decision boundary, never a silent allow and never a load failure of
+ * the extension itself. Extracted operands resolve through
  * resolveScopeTarget with the same allowlist and the same degraded-
- * seal posture: path-like words after a segment's command word
- * (absolute and ~ paths, relative operands carrying a separator, bare
- * ..); the value side of an =-bearing word, including a segment-
- * leading one that prefixes further words, because the assignment
- * prefix hands the value to the command's environment exactly as env
- * does (a lone assignment segment only sets a variable and opens
- * nothing); the word following a redirect operator (<, >, >>, <>, >|,
- * &>, &>>), extracted regardless of position so a segment-head
- * redirect cannot pass as a would-be executable; and the argument of a
- * cd or pushd token wherever it sits, regardless of spelling, so bare
- * and symlinked names route through the core, while a bare cd, cd -,
- * or an option-only cd asks: home, OLDPWD, and the directory stack are
- * shell state the scanner cannot resolve. Backslash-newline
- * continuations are removed the way bash removes them, so a glued
- * continuation line cannot hide an absolute operand behind the join.
- * Data-null and process-internal devices (/dev/null, /dev/zero,
- * /dev/stdin, /dev/stdout, /dev/stderr, /dev/fd/N) are exempt from
- * bash operand verdicts only, never from the path tools: a write to
- * them discards and a read returns nothing that carries scope, while
- * /dev/tty stays gated because it reads user input. A command carrying
- * $ or a backtick outside single quotes asks without scanning: the
- * walker honors backslash escapes, so an escaped quote is a literal
- * apostrophe rather than a span opener (echo \' && cat "$HOME/secrets"
- * asks, while echo \' alone passes) and an escaped dollar is literal
- * rather than live; single quotes stay exempt because bash provably
- * cannot expand inside them, while double-quoted or unquoted
- * substitution asks, as does the ANSI-C $'...' form whose $ sits
- * outside the quoted span. An executor invocation (a
- * bash/zsh/sh/dash/ksh, su, or ssh token under lexical path-stripped
- * identity followed by a -c-carrying combined flag in the same
- * segment, glued-value forms included, or the exact token eval) is
- * the exception: a child shell re-evaluates the payload, so its $
- * gates even inside its quotes and its payload additionally scans
- * with quotes as separators. An interposition wrapper (command, env,
- * nohup, nice, timeout, under the same identity strip) preceding an
- * executor shape floors the call to ask: the wrapper re-executes its
- * arguments and the scan does not model what it will run. Detection
- * is token-based over the walker's segments, so an escaped
- * quote cannot hide the executor (echo \' ; bash -c 'cat
- * "$HOME/secrets"' asks) while a quoted prose mention of bash -c is
- * not one. Unmodeled syntax characters (comments,
- * grouping parentheses, brace expansion) ask in plain text and inside
- * double quotes; they stay literal only inside single quotes. So do
- * heredocs, unterminated quotes, and trailing escapes. In-scope and
+ * seal posture. In-scope and
  * relative-only commands run unprompted.
  * powershell stays ungated: the Windows twin is a deferred unit.
  *
@@ -124,21 +112,28 @@
  * post-handler validation hook, and no installed sibling mutates
  * input today.
  *
- * The bash pass is recall-limited and its bypass residual is accepted
- * knowingly, stated here because it is the extension's only shell-
- * facing layer: runtime-assembled paths (variables, substitution and
- * expansion results, output feeding a later command), glob
- * enumerations, and operand spellings the extraction tests do not
- * recognize are invisible to a lexical scan. Syntax the scan does not
- * model asks instead of guessing; a command that stays inside the
- * modeled grammar while naming no literal out-of-scope path can
- * still reach one. Executor and wrapper recognition is likewise a
- * modeled-shape list, not a proof: invocation spellings outside the
- * pinned classes (an executor or wrapper identity the lists do not
- * carry, alias- or function-hidden invocations) may pass until the
- * parser migration (PISCOPE-2) replaces this lexical neighborhood
- * with a parsed view of the command; the pinned classes are the
- * contract here, and no closure beyond them is claimed. The command's own executable (the leading word, absolute
+ * The bash pass parses with tree-sitter-bash since PISCOPE-2-2, and
+ * its residual is stated here because it is the extension's only
+ * shell-facing layer: the walk visits the positions where bash
+ * materializes paths (argument tokens, assignment and declaration
+ * values including array elements, redirect destinations, cd and
+ * pushd targets) and extracts operands from the path-like text those
+ * positions carry, while substitution reads as the presence of an
+ * expansion node anywhere in the parsed tree - one position-blind
+ * traversal with no skip list - so every position bash expands in
+ * (command names included) asks. Expansion results, runtime-assembled paths, and output feeding a
+ * later command stay invisible, and their presence asks; alias-,
+ * function-, and PATH-resolution outcomes are equally invisible (an
+ * alias hiding an invocation spelling is shell state the parse cannot
+ * see). Spellings the extraction does not treat as operands stay
+ * ungated where bash treats them as data, and the pattern-first skip
+ * covers sed only: slash-carrying grep/rg/awk pattern arguments still
+ * surface as operands and ask (over-ask direction) until their own
+ * rows join the skip table. Executor and wrapper recognition remains a
+ * modeled-shape list, not a proof:
+ * invocation spellings outside the pinned classes may pass, the
+ * pinned classes are the contract, and no closure beyond them is
+ * claimed. The command's own executable (the leading word, absolute
  * or PATH-resolved) is not treated as a file operand: binary lookup is
  * outside the model, as it already is for every ungated bare command
  * name.
@@ -255,6 +250,8 @@ import {
 } from "./fence-ask/ask-wire.ts";
 import type { AskCandidateForm } from "./fence-ask/ask-wire.ts";
 import { appliedSelfGrants, applyGrantToSelf, recordParentGrant } from "./fence-ask/grant-ledger.ts";
+import { runBashScan } from "./fence-ast/bash-scan.ts";
+import type { BashScanResult } from "./fence-ast/bash-scan.ts";
 import { childProvisioningFromEnv, forwardOutOfScopeAsk } from "./fence-ask/ask-channel.ts";
 
 /**
@@ -1133,404 +1130,34 @@ export function decidePathToolCall(call: PathGateCall): PathGateDecision {
  */
 export const GATED_BASH_TOOLS: ReadonlySet<string> = new Set(["bash"]);
 
-/**
- * One scanned word: its quote/escape-stripped text, whether any part
- * came from quotes or escapes, whether whitespace arrived from inside
- * quotes (so extraction splits the text into pieces), and whether it
- * follows a redirect operator (redirect targets extract regardless of
- * their position).
- */
-interface BashWord {
-	text: string;
-	quoted: boolean;
-	quoteSplit?: boolean;
-	redirectTarget?: boolean;
-}
-
-/** Raw-text carriers of expansion the scanner cannot see through: $ expansions and backticks. */
-const bashSubstitutionChars = /[$`]/;
-
-/** Shell executables whose -c payload a child shell re-evaluates. */
-const BASH_EXECUTOR_SHELLS: ReadonlySet<string> = new Set(["bash", "zsh", "sh", "dash", "ksh"]);
-
-/**
- * Wrappers whose arguments the gate cannot see through: command and
- * env re-execute their arguments through PATH lookup, and nohup,
- * nice, and timeout exec their program directly; when one of them
- * precedes an executor shape in a segment the scan floors to ask
- * instead of modeling what the wrapper will run.
- */
-const BASH_INTERPOSER_WORDS: ReadonlySet<string> = new Set(["command", "env", "nohup", "nice", "timeout"]);
-
-/**
- * A combined-flag token carrying -c, glued-value forms included:
- * bash takes a short option's cluster remainder as the value, so
- * -cpayload, -c'payload', and -c"payload" all arrive at the walker as
- * one token whose text continues past the flag (bash -lc matches;
- * so does -cu, an inert-junk over-ask accepted fail-safe).
- */
-const bashExecutorFlag = /^-[a-zA-Z]*c/;
-
-/**
- * Lexically strip a token's directory prefix (the tail after the
- * last slash) so executor and wrapper identity matches across
- * path-qualified spellings (/bin/bash, ./sh, ~/bin/su). Deliberately
- * no filesystem resolution: a missing /bin/bash still gates, because
- * the ask posture keys on the invocation shape, not executable
- * existence.
- */
-function bashExecutorTokenIdentity(token: string): string {
-	const slash = token.lastIndexOf("/");
-	return slash === -1 ? token : token.slice(slash + 1);
-}
-
-const bashWordSeparator = /[ \t]/;
-const bashQuotedWhitespace = /[ \t\n]/;
-// Bash command separators: `;` ends a command, `&` backgrounds one, `|` pipes, `\n` ends a line; CR is an ordinary word character to bash.
-const bashSegmentSeparator = /[;&|\n]/;
-// Bash syntax the scan refuses to model: `#` comments swallow the rest of the line, `(` `)` group and substitute processes, `{` `}` brace-expand one word into many.
-const bashUnmodeledChars = /[#(){}]/;
-
-/**
- * Tokenize one command text into words across top-level `;` `&` `|`
- * newline segments, honoring quotes and backslash escapes. This walker
- * is the module's single quote grammar: it reports substitution (a $
- * or backtick anywhere bash would expand one - top-level or inside
- * double quotes, escapes honored, single-quoted text exempt because
- * bash cannot expand there), bails on the unmodeled syntax characters
- * in plain and double-quoted text (they stay literal only inside
- * single quotes), and marks words whose whitespace arrived from inside
- * quotes so extraction can split them into pieces. Single `<`
- * and `>` act as word boundaries and mark the following word as a
- * redirect target; an operator tail arriving while a target is still
- * pending (`>|`, and a stray separator on a malformed redirect) keeps
- * the segment, so the target cannot slip out as the next segment's
- * executable. A heredoc leader (`<<`) bails the scan instead: heredoc
- * bodies are arbitrary input text. The unmodeled syntax characters
- * bail too, as do unterminated quotes and trailing escapes.
- * Backslash-newline is consumed as bash consumes it: the escape pair
- * vanishes in place, so a mid-word continuation joins into one word
- * exactly as bash joins it, and a continuation after a word boundary
- * starts a fresh word, in top-level and double-quoted text alike. With
- * splitQuotes set (the executor raw-text scan), quote characters act
- * as word boundaries so payload words split out of quoted strings.
- */
-function scanBashWords(
-	text: string,
-	splitQuotes: boolean,
-): { segments: BashWord[][]; bail: boolean; substitution: boolean } {
-	const segments: BashWord[][] = [];
-	let words: BashWord[] = [];
-	let word: BashWord = { text: "", quoted: false };
-	let bail = false;
-	let substitution = false;
-	let quote: "none" | "single" | "double" = "none";
-	let pendingRedirect = false;
-
-	const endWord = (): void => {
-		if (word.text.length > 0 || word.quoted) {
-			if (pendingRedirect) {
-				word.redirectTarget = true;
-				pendingRedirect = false;
-			}
-			words.push(word);
-		}
-		word = { text: "", quoted: false };
-	};
-	const endSegment = (): void => {
-		endWord();
-		pendingRedirect = false;
-		if (words.length > 0) {
-			segments.push(words);
-			words = [];
-		}
-	};
-
-	for (let i = 0; i < text.length; i++) {
-		const ch = text[i];
-		if (quote === "single") {
-			if (ch === "'") quote = "none";
-			else {
-				if (bashQuotedWhitespace.test(ch)) word.quoteSplit = true;
-				word.text += ch;
-			}
-		} else if (quote === "double") {
-			if (ch === '"') quote = "none";
-			else if (ch === "\\" && i + 1 < text.length) {
-				if (text[i + 1] === "\n") {
-					i++;
-					continue;
-				}
-				word.text += text[++i];
-				word.quoted = true;
-			} else if (bashUnmodeledChars.test(ch)) {
-				bail = true;
-				break;
-			} else {
-				if (ch === "$" || ch === "`") substitution = true;
-				if (bashQuotedWhitespace.test(ch)) word.quoteSplit = true;
-				word.text += ch;
-			}
-		} else if ((ch === "'" || ch === '"') && !splitQuotes) {
-			word.quoted = true;
-			quote = ch === "'" ? "single" : "double";
-		} else if (splitQuotes && (ch === "'" || ch === '"')) {
-			endWord();
-		} else if (ch === "\\") {
-			if (i + 1 >= text.length) {
-				bail = true;
-				break;
-			}
-			const escaped = text[++i];
-			if (escaped === "\n") continue;
-			word.text += escaped;
-			word.quoted = true;
-		} else if (ch === "<" && text[i + 1] === "<") {
-			bail = true;
-			break;
-		} else if (ch === "<" || ch === ">") {
-			endWord();
-			pendingRedirect = true;
-		} else if (bashWordSeparator.test(ch)) {
-			endWord();
-		} else if (pendingRedirect && bashSegmentSeparator.test(ch)) {
-			continue;
-		} else if (bashSegmentSeparator.test(ch)) {
-			endSegment();
-		} else if (bashUnmodeledChars.test(ch)) {
-			bail = true;
-			break;
-		} else {
-			if (ch === "$" || ch === "`") substitution = true;
-			word.text += ch;
-		}
-	}
-	if (quote !== "none") bail = true;
-	endSegment();
-	return { segments, bail, substitution };
-}
-
-/**
- * Token-based executor detection within one segment, from `from` on:
- * a shell (bash, zsh, sh, dash, ksh), su, or ssh token whose
- * path-stripped identity matches, followed anywhere later in the
- * segment by a combined-flag token carrying -c (glued-value forms
- * included: bash -c'payload' is one token whose text continues past
- * the flag), or the exact token eval (a builtin has no path-qualified
- * spelling). Segment scope matches the executor regex's separator
- * exclusion (a ; & | newline ends the shape); the walker's quote
- * state means a quoted prose mention of bash -c is one word, not the
- * shell token, and an escaped quote is a literal character inside a
- * word, so neither can produce or hide a shape.
- */
-function segmentCarriesExecutorShape(words: BashWord[], from: number): boolean {
-	for (let index = from; index < words.length; index++) {
-		const token = words[index].text;
-		if (token === "eval") return true;
-		const identity = bashExecutorTokenIdentity(token);
-		if (identity === "ssh") return true;
-		if (BASH_EXECUTOR_SHELLS.has(identity) || identity === "su") {
-			for (let next = index + 1; next < words.length; next++) {
-				if (bashExecutorFlag.test(words[next].text)) return true;
-			}
-		}
-	}
-	return false;
-}
-
-function segmentsIncludeExecutorShape(segments: BashWord[][]): boolean {
-	for (const words of segments) {
-		if (segmentCarriesExecutorShape(words, 0)) return true;
-	}
-	return false;
-}
-
-/**
- * The interposition floor: the raw spelling of the first wrapper
- * (command, env, nohup, nice, timeout, identity matched after the
- * same lexical path-prefix strip) that precedes an executor shape in
- * its segment, or null when none does. The wrapper re-executes its
- * arguments in ways the scanner does not model (PATH re-lookup,
- * child-shell re-evaluation), so the shape floors to ask instead of
- * being seen through; the wrapper's own common flags and arguments
- * (nice -n 5, timeout 30) sit between it and the shape naturally.
- */
-function segmentInterposerFloor(segments: BashWord[][]): string | null {
-	for (const words of segments) {
-		for (let index = 0; index < words.length; index++) {
-			if (!BASH_INTERPOSER_WORDS.has(bashExecutorTokenIdentity(words[index].text))) continue;
-			if (segmentCarriesExecutorShape(words, index + 1)) return words[index].text;
-		}
-	}
-	return null;
-}
-
-function isPathLikeBashWord(text: string): boolean {
-	if (text.startsWith("/")) return true;
-	if (text.startsWith("~")) return true;
-	if (text === "..") return true;
-	return text.includes("/");
-}
-
-const cdOldpwdAskDetail =
-	"cd/pushd to - targets $OLDPWD, which the scanner cannot resolve; approve interactively or spell the absolute path";
-const cdUnresolvableAskDetail =
-	"the cd/pushd target is the shell's home directory or directory stack, which the scanner cannot resolve; approve interactively or spell the absolute path";
-
-/**
- * Collect the bash scope pass's path candidates from scanned segments,
- * in order, deduped: path-like words after a segment's command word
- * (the executable itself is not a file operand; PATH lookup is outside
- * the model); the value side of an =-bearing word (option and
- * environment values are the argv access points; the full word is kept
- * too so a traversal-carrying spelling like ../x=y still asks),
- * including a segment-leading assignment that prefixes further words,
- * because the prefix hands the value to the command's environment
- * exactly as env does (a lone assignment segment only sets a variable
- * and opens nothing); redirect targets, extracted wherever they sit
- * because a segment-head one would otherwise read as the executable;
- * and the argument of a cd or pushd token wherever it sits, regardless
- * of spelling, because bare and symlinked names are the cd escape
- * class. A word whose whitespace arrived from inside quotes (quoted
- * prose, a quoted multi-word payload) splits into whitespace pieces
- * for this extraction, so a path named inside quoted prose gates;
- * cd/pushd targets and redirect targets stay whole words (a target is
- * one shell word). Returns the operands plus cdAsk, set when a cd/pushd names no
- * lexically resolvable target (bare cd, -, option-only): home, OLDPWD,
- * and the directory stack are shell state, so the call asks instead of
- * guessing.
- */
-function collectBashOperands(segments: BashWord[][]): { operands: string[]; cdAsk: string | null } {
-	const operands: string[] = [];
-	const seen = new Set<string>();
-	const push = (operand: string): void => {
-		if (!seen.has(operand)) {
-			seen.add(operand);
-			operands.push(operand);
-		}
-	};
-	const piecesOf = (word: BashWord, text: string): string[] =>
-		word.quoteSplit ? text.split(/\s+/).filter((piece) => piece.length > 0) : [text];
-	let cdAsk: string | null = null;
-	for (const words of segments) {
-		for (let index = 1; index < words.length; index++) {
-			const word = words[index];
-			for (const text of piecesOf(word, word.text)) {
-				if (isPathLikeBashWord(text)) push(text);
-				const eq = text.indexOf("=");
-				if (eq > 0) {
-					const value = text.slice(eq + 1);
-					if (isPathLikeBashWord(value)) push(value);
-				}
-			}
-		}
-		if (words.length > 1) {
-			const leading = words[0];
-			const eq = leading.text.indexOf("=");
-			if (eq > 0) {
-				for (const piece of piecesOf(leading, leading.text.slice(eq + 1))) {
-					if (isPathLikeBashWord(piece)) push(piece);
-				}
-			}
-		}
-		for (const word of words) {
-			if (word.redirectTarget) push(word.text);
-		}
-		for (let index = 0; index < words.length; index++) {
-			const token = words[index].text;
-			if (token !== "cd" && token !== "pushd") continue;
-			let resolved = false;
-			for (let next = index + 1; next < words.length; next++) {
-				const target = words[next].text;
-				if (target === "cd" || target === "pushd") break;
-				if (target === "-") {
-					if (cdAsk === null) cdAsk = cdOldpwdAskDetail;
-					break;
-				}
-				if (target.startsWith("-")) continue;
-				push(target);
-				resolved = true;
-				break;
-			}
-			if (!resolved && cdAsk === null) cdAsk = cdUnresolvableAskDetail;
-		}
-	}
-	return { operands, cdAsk };
-}
-
 /** The bash scope pass's extraction stage for one command, as pure data. */
-export interface BashScanResult {
-	/** The walker met $ expansion or a backtick anywhere bash would expand one (escapes honored; single-quoted text exempt except under executor shapes). */
-	substitution: boolean;
-	/** An executor invocation (a shell/su/ssh token under lexical path-stripped identity with a -c-carrying flag, glued forms included, or eval) appears as tokens in the walker's segments. */
-	executor: boolean;
-	/** The wrapper spelling when an executor shape rides behind command/env/nohup/nice/timeout in one segment: the scan cannot see through it, so the call floors to ask. */
-	interposed: string | null;
-	/** The scan met syntax it refuses to model. */
-	bail: boolean;
-	/** Set when a cd/pushd names no lexically resolvable target (bare cd, -, option-only). */
-	cdAsk: string | null;
-	/** Path-like operands in scan order, deduped; empty under substitution or bail. */
-	operands: string[];
-}
+export type { BashScanResult };
 
 /**
- * Pure extraction stage of the bash scope pass (permission-gate's
- * scanner conventions adapted, not imported). One walker walk of the
- * raw command produces everything: substitution (a $ or backtick
- * anywhere bash would expand one, escapes honored, single-quoted text
- * exempt) short-circuits before any modeling; unmodeled syntax bails;
- * operands, redirect targets, cd/pushd targets, and quoted pieces all
- * extract from the same segments. Executor invocations (a shell, su,
- * or ssh token under lexical path-stripped identity followed by a
- * -c-carrying flag, glued forms included, or the exact token eval)
- * are the exception to the single-quote exemption: a child shell
- * re-evaluates the payload, so their quotes only defer expansion and
- * the raw text is tested for $ directly; they additionally scan with
- * quotes as separators so payload words split out of quoted strings.
- * The executor shape itself is detected token-wise over the same
- * segments, so a quoted prose mention of bash -c is one word, not the
- * shell token, and an escaped quote cannot hide an executor. A
- * command/env/nohup/nice/timeout wrapper preceding an executor shape
- * short-circuits the scan with the wrapper named: the call floors to
- * ask, because the wrapper re-executes its arguments.
+ * Pure extraction stage of the bash scope pass, produced by the AST
+ * walk in ./fence-ast/bash-scan.ts (the lexical walker this export
+ * once carried retired with the PISCOPE-2-2 swap). The exported shape
+ * is the consumer contract: substitution is expansion-node presence
+ * anywhere in the tree (one position-blind traversal), operands are
+ * argument pieces, executor payload words (the child shell's own word
+ * split of a quoted payload at an executor shape), whole
+ * file_redirect destinations, assignment and declaration values,
+ * stdin-script heredoc body and here-string words under a
+ * shell/su/ssh/eval head, and cd/pushd targets, executor detection reads
+ * command_name identity plus the -c flag shape, interposition reads
+ * wrapper identities, envVector names an env-var-carried execution
+ * vector assigned in any posture or carried by an env spelling, and
+ * the bail flag is the parse's own health (ERROR trees). The walk runs
+ * on every call through the memoized parser (withBashParse releases
+ * the tree on every path); a parser-unavailable load REJECTS rather
+ * than returning a guess, so the consumer boundary decides the
+ * fail-safe ask.
  */
-export function scanBashCommand(command: string): BashScanResult {
+export async function scanBashCommand(command: string): Promise<BashScanResult> {
 	if (typeof command !== "string") {
-		return { substitution: false, executor: false, bail: true, cdAsk: null, operands: [], interposed: null };
+		return { substitution: false, executor: false, bail: true, envVector: null, cdAsk: null, operands: [], interposed: null };
 	}
-	const main = scanBashWords(command, false);
-	const executor = segmentsIncludeExecutorShape(main.segments);
-	const interposed = segmentInterposerFloor(main.segments);
-	if (interposed !== null) {
-		return { substitution: main.substitution, executor, bail: main.bail, cdAsk: null, operands: [], interposed };
-	}
-	if (main.substitution && !executor) {
-		return { substitution: true, executor: false, bail: true, cdAsk: null, operands: [], interposed: null };
-	}
-	if (executor && bashSubstitutionChars.test(command)) {
-		return { substitution: true, executor: false, bail: true, cdAsk: null, operands: [], interposed: null };
-	}
-	const mainCollected = collectBashOperands(main.segments);
-	const collected = mainCollected.operands;
-	let cdAsk = mainCollected.cdAsk;
-	let bail = main.bail;
-	if (executor) {
-		const rawSplit = scanBashWords(command, true);
-		const rawCollected = collectBashOperands(rawSplit.segments);
-		collected.push(...rawCollected.operands);
-		if (cdAsk === null) cdAsk = rawCollected.cdAsk;
-		bail = bail || rawSplit.bail;
-	}
-	const operands: string[] = [];
-	const seen = new Set<string>();
-	for (const operand of collected) {
-		if (!seen.has(operand)) {
-			seen.add(operand);
-			operands.push(operand);
-		}
-	}
-	return { substitution: false, executor, bail, cdAsk, operands, interposed: null };
+	return runBashScan(command);
 }
 
 /** Glob metacharacters whose expansion a lexical scan cannot enumerate. */
@@ -1621,6 +1248,8 @@ export interface BashGateCall {
 	seal?: SealState;
 	/** Tilde-expansion home; defaults to the real home. */
 	home?: string;
+	/** Suite injection of the AST scan; omitted runs the real scanBashCommand. The rejection path is the parser-unavailable fail-safe ask. */
+	scan?: (command: string) => Promise<BashScanResult>;
 }
 
 /**
@@ -1628,17 +1257,24 @@ export interface BashGateCall {
  * path gate's ask/block machinery: a degraded seal asks every bash call
  * (a shell command is a potential path bearer and the resolution parity
  * its operands rely on is unproven); a non-string command or session
- * cwd asks fail-closed; a substitution-bearing command asks (the
- * scanner cannot see expansion results); unmodeled syntax asks; a
- * cd/pushd naming no lexically resolvable target asks (home, OLDPWD,
- * and the directory stack are shell state); an executor shape riding
- * behind a command/env/nohup/nice/timeout wrapper asks without
- * scanning through (the wrapper re-executes its arguments);
+ * cwd asks fail-closed; an AST walk whose tree carries substitution
+ * asks (the walk cannot see expansion results); an ERROR-bearing parse
+ * asks (the bail class is parse health); parser unavailability (a
+ * load failure, a digest mismatch, or an expired init budget) asks
+ * through the boundary below, never a silent allow; a cd/pushd naming
+ * no lexically resolvable target asks (home, OLDPWD, and the directory
+ * stack are shell state); an assignment or env spelling carrying a
+ * hijackable execution vector (PROMPT_COMMAND, BASH_ENV, ZDOTDIR,
+ * ENV, LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH, PS4, PATH) asks
+ * regardless of the value's shape (the shell or its loader runs them
+ * on a schedule the scanner cannot evaluate); an executor shape
+ * riding behind a command/env/nohup/nice/timeout/exec wrapper asks
+ * without scanning through (the wrapper re-executes its arguments);
  * otherwise every extracted operand resolves through the verdict core
  * and the first ask wins. A command with no asking operand passes
  * untouched.
  */
-export function decideBashToolCall(call: BashGateCall): PathGateDecision {
+export async function decideBashToolCall(call: BashGateCall): Promise<PathGateDecision> {
 	if (!GATED_BASH_TOOLS.has(call.toolName)) return { action: "pass" };
 	const effectiveSeal = call.seal ?? sessionSealState();
 	const home = call.home ?? os.homedir();
@@ -1654,15 +1290,25 @@ export function decideBashToolCall(call: BashGateCall): PathGateDecision {
 	if (typeof call.input.command !== "string" || call.input.command.length === 0) {
 		return askBash("command is not a usable string; refusing to guess");
 	}
-	const scan = scanBashCommand(call.input.command);
+	let scan: BashScanResult;
+	try {
+		scan = await (call.scan ?? scanBashCommand)(call.input.command);
+	} catch (error) {
+		return askBash(
+			`the bash command parser is unavailable (${error instanceof Error ? error.message : String(error)}); the scope pass refuses to guess; approve interactively or retry the call`,
+		);
+	}
 	if (scan.interposed !== null) {
 		return askBash(`the command routes an executor invocation through ${scan.interposed}, which re-executes its arguments in ways the scan cannot see through; approve interactively or drop the wrapper`);
 	}
 	if (scan.substitution) {
-		return askBash("command carries $ expansion or a backtick whose result the scanner cannot see; the scope pass biases toward asking");
+		return askBash("command carries an expansion whose result the scanner cannot see; the scope pass biases toward asking");
 	}
 	if (scan.bail) {
-		return askBash("command uses syntax the scope scan does not model (heredocs, comments, grouping, brace expansion, or broken quoting); the scope pass biases toward asking");
+		return askBash("the command did not parse cleanly (a syntax error or broken quoting); the scope pass biases toward asking");
+	}
+	if (scan.envVector) {
+		return askBash(`command assigns ${scan.envVector}, a variable the shell or its loader consumes for deferred or indirect execution (prompt hook, startup file, startup directory, preloaded library, audit module, library search path, trace output, executable lookup), which the scanner cannot evaluate; approve interactively or drop the assignment`);
 	}
 	if (scan.cdAsk) {
 		return askBash(scan.cdAsk);
@@ -1810,7 +1456,7 @@ export default function (pi: ExtensionAPI) {
 			hasUI: ctx.hasUI,
 		};
 		const decision = GATED_BASH_TOOLS.has(event.toolName)
-			? decideBashToolCall(shared)
+			? await decideBashToolCall(shared)
 			: decidePathToolCall(shared);
 		if (decision.action === "pass") return undefined;
 		if (decision.action === "block") {

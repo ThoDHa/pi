@@ -3,14 +3,20 @@
  * parser artifacts (extensions/fence-ast/vendor/), unit PISCOPE-2-1.
  *
  * The fence is a security control and these artifacts are third-party
- * derived binaries inside that trust base, so their bytes are pinned
- * the same way the pi-release seal pins the replicated dist files: a
- * hash whose meaning is "this exact vendored artifact was reviewed and
- * sanctioned". Unit PISCOPE-2-3 folds these pins into SealState with
- * the identical degradation semantics: on drift or an unreadable
- * artifact every bash verdict degrades to ask-mode (never throws,
- * never silently allows), while path verdicts stay governed by the
- * release pins.
+ * executable code inside that trust base (an ESM engine entry that
+ * runs at import time plus two wasm artifacts whose load path can
+ * evaluate embedded JS sections), so their bytes are pinned the same
+ * way the pi-release seal pins the replicated dist files: a hash whose
+ * meaning is "this exact vendored artifact was reviewed and
+ * sanctioned". The registry-anchored provenance record these pins
+ * trace to lives in vendor/ATTRIBUTION.md (dist.integrity and tarball
+ * hashes), and unit PISCOPE-2-2 wired the runtime enforcement: the
+ * loader verifies every artifact against these pins before any
+ * vendored byte imports, so a mismatch or unreadable artifact rejects
+ * to ask-mode instead of executing drifted bytes. Unit PISCOPE-2-3
+ * folds the same pins into SealState with identical degradation
+ * semantics (never throws, never silently allows), while path verdicts
+ * stay governed by the release pins.
  *
  * Keys are file names relative to the vendor/ directory, so a pin set
  * travels with the directory it describes. Recomputing a pin after a

@@ -63,20 +63,22 @@
  * REAL seal once per process (memoized), while explicit injection is
  * honored verbatim.
  *
- * The bash scope pass (unit 1-3) is exercised the same way:
- * scanBashCommand pins the recall-limited extraction (tokenizer-based
- * extraction from the raw command: quoted operands, redirect targets,
- * and assignment RHS gate; quoted prose splits into pieces;
- * substitution flags with the single-quote narrowing and escape-
- * literal semantics; unmodeled-syntax flags in plain and double-quoted
- * text; executor payload splitting and token-based executor-shape
- * detection; redirect-target extraction;
- * cd/pushd target extraction; continuation removal; assignment-prefix
- * RHS), decideBashToolCall pins its verdict classes
- * (in-scope pass, out-of-scope ask, substitution bias, unmodeled bail,
- * tilde-user and glob-traversal overrides, device exemption, degraded-
- * seal ask, headless block), and the factory handler maps bash events
- * onto the shared ask/block machinery.
+ * The bash scope pass (unit 1-3, detection layer swapped to the
+ * tree-sitter AST by PISCOPE-2-2) is exercised the same way:
+ * scanBashCommand pins the AST extraction (substitution is the
+ * presence of expansion nodes with the single-quote narrowing and
+ * escape-literal semantics; operands extract from word/string pieces,
+ * redirect targets, and assignment RHS; quoted prose splits into
+ * pieces; executor shapes are command_name identity plus the -c flag
+ * shape; interposition floors on wrapper identities; ERROR-bearing
+ * parses bail; heredocs, comments, grouping, and braces parse to
+ * verdicts), decideBashToolCall pins its verdict classes
+ * (in-scope pass, out-of-scope ask, substitution bias, ERROR-tree
+ * bail, parser-unavailable ask, tilde-user and glob-traversal
+ * overrides, device exemption, degraded-seal ask, headless block),
+ * the sed pattern-first skip pins the EXT-34 incident closure, and
+ * the factory handler maps bash events onto the shared ask/block
+ * machinery through the async decision seam.
  *
  * The unit 1-2 parent-own grant recorder is pinned at three depths:
  * recordParentOwnGrant's classification classes against real fixture
@@ -149,7 +151,14 @@ import cwdScopeGate, {
 import { appliedSelfGrants, inheritedExtraRootsEnvValue, parentGrantedDirectories, registerLiveChild, resetFenceAskState } from "../extensions/fence-ask/grant-ledger.ts";
 import { ASK_WAIT_ENV, CHILD_ASK_ROOT_ENV, CHILD_ASK_TOKEN_ENV } from "../extensions/fence-ask/ask-wire.ts";
 import { createForwardingRootDirs, deleteAskFile, requestIdsIn, serveForwardingRootTick } from "../extensions/fence-ask/ask-channel.ts";
-import { loadBashParser, memoizeAsyncWithRetry } from "../extensions/fence-ast/bash-parser.ts";
+import {
+	BASH_PARSER_INIT_TIMEOUT_MS,
+	loadBashParser,
+	memoizeAsyncWithRetry,
+	verifyGrammarArtifacts,
+	withBashParse,
+	withInitBudget,
+} from "../extensions/fence-ast/bash-parser.ts";
 import { GRAMMAR_ARTIFACT_FILES, GRAMMAR_DIGEST_PINS } from "../extensions/fence-ast/grammar-pins.ts";
 
 let failed = 0;
@@ -1360,19 +1369,24 @@ try {
 		resetSessionSeal();
 	}
 
-	// --- unit 1-3: bash scope pass (recall-limited lexical scan) ---------
+	// --- unit 1-3: bash scope pass (AST-backed extraction, PISCOPE-2-2) --
 	// The tool_call surface extends to bash: path-like operands and cd
 	// targets resolve through the same verdict core as the path tools,
-	// substitution-bearing commands and unmodeled syntax bias toward
-	// asking (the scanner cannot see expansion results or model every
-	// grammar), and in-scope or relative-only commands run unprompted.
-	// The bash pass generalizes permission-gate's scanner conventions
-	// (executor dual-scan, raw payload splitting) but carries its own
-	// single quote walker, and executor detection is token-based over
-	// the walker's segments under lexical path-stripped identity (R4),
-	// with glued -c forms and an interposition floor over
-	// command/env/nohup/nice/timeout (R5; Decision Log "User ruling C");
-	// permission-gate stays untouched.
+	// substitution-bearing commands bias toward asking (a parsed tree
+	// cannot see expansion results either), and in-scope or relative-only
+	// commands run unprompted. The detection layer is a tree-sitter-bash
+	// AST walk (extensions/fence-ast/bash-scan.ts) behind the exported
+	// BashScanResult contract the lexical walker used to produce:
+	// substitution is expansion-node presence, operands are argument
+	// pieces plus redirect targets and assignment RHS, executor detection
+	// reads command_name identity plus the -c flag shape under lexical
+	// path-stripped identity (R4), glued -c forms included, and an
+	// interposition floor covers command/env/nohup/nice/timeout (R5;
+	// Decision Log "User ruling C"); permission-gate stays untouched.
+	// Deliberate semantic flips from the lexical scan, each sanctioned in
+	// the Decision Log (answer to Blocks Q3, 2026-11-25 09:40): heredocs,
+	// comments, grouping, and braces now parse and run unprompted, while
+	// ERROR-bearing parses still bail to ask.
 	check("bash gated tool set covers exactly bash", [...GATED_BASH_TOOLS].sort().join(","), "bash");
 
 	const bashGate = (overrides = {}) =>
@@ -1387,135 +1401,135 @@ try {
 		});
 
 	// pass-through: in-scope and relative-only commands never prompt
-	check("bash decider passes non-bash tools", bashGate({ toolName: "read" }).action, "pass");
+	check("bash decider passes non-bash tools", (await bashGate({ toolName: "read" })).action, "pass");
 	check(
 		"powershell passes ungated (deferred)",
-		bashGate({ toolName: "powershell", input: { command: "cat /etc/passwd" } }).action,
+		(await bashGate({ toolName: "powershell", input: { command: "cat /etc/passwd" } })).action,
 		"pass",
 	);
-	check("bare-word-only command passes", bashGate({ input: { command: "echo hello" } }).action, "pass");
-	check("git status passes", bashGate({ input: { command: "git status --short" } }).action, "pass");
-	check("relative-only operand passes", bashGate({ input: { command: "cat inside/file.txt" } }).action, "pass");
-	check("cd within the cwd subtree passes", bashGate({ input: { command: "cd inside" } }).action, "pass");
+	check("bare-word-only command passes", (await bashGate({ input: { command: "echo hello" } })).action, "pass");
+	check("git status passes", (await bashGate({ input: { command: "git status --short" } })).action, "pass");
+	check("relative-only operand passes", (await bashGate({ input: { command: "cat inside/file.txt" } })).action, "pass");
+	check("cd within the cwd subtree passes", (await bashGate({ input: { command: "cd inside" } })).action, "pass");
 	check(
 		"in-scope redirect target passes",
-		bashGate({ input: { command: "echo done > inside/log.txt" } }).action,
+		(await bashGate({ input: { command: "echo done > inside/log.txt" } })).action,
 		"pass",
 	);
-	check("absolute command word is not a path operand", bashGate({ input: { command: "/bin/echo hi" } }).action, "pass");
+	check("absolute command word is not a path operand", (await bashGate({ input: { command: "/bin/echo hi" } })).action, "pass");
 	check(
 		"assignment-prefix RHS outside asks (the env form's argv access point)",
-		bashGate({ input: { command: "OUT=/etc/capture.txt run" } }).action,
+		(await bashGate({ input: { command: "OUT=/etc/capture.txt run" } })).action,
 		"ask",
 	);
 	check(
 		"lone assignment segment passes (bash only sets the variable)",
-		bashGate({ input: { command: "X=/etc/capture.txt" } }).action,
+		(await bashGate({ input: { command: "X=/etc/capture.txt" } })).action,
 		"pass",
 	);
-	check("in-scope glob operand passes", bashGate({ input: { command: "cat inside/*.txt" } }).action, "pass");
+	check("in-scope glob operand passes", (await bashGate({ input: { command: "cat inside/*.txt" } })).action, "pass");
 	check(
 		"in-scope executor payload passes",
-		bashGate({ input: { command: "bash -c 'cat inside/file.txt'" } }).action,
+		(await bashGate({ input: { command: "bash -c 'cat inside/file.txt'" } })).action,
 		"pass",
 	);
 
 	// ask: out-of-scope operands and cd targets through the verdict core
-	const bashOut = bashGate({ input: { command: "cat /etc/passwd" } });
+	const bashOut = (await bashGate({ input: { command: "cat /etc/passwd" } }));
 	check("out-of-scope absolute operand asks", bashOut.action, "ask");
 	checkContains("bash ask title names the tool", bashOut.title, "bash");
 	checkContains("bash ask title names the resolved path", bashOut.title, "/etc/passwd");
 	checkContains("bash ask title ends in the prompt", bashOut.title, "Allow?");
 	checkContains("bash denial reason names the policy", bashOut.denyReason, EXTRA_ROOTS_ENV);
-	check("cd outside the cwd subtree asks", bashGate({ input: { command: "cd /etc" } }).action, "ask");
-	check("cd to tilde home asks", bashGate({ input: { command: "cd ~" } }).action, "ask");
+	check("cd outside the cwd subtree asks", (await bashGate({ input: { command: "cd /etc" } })).action, "ask");
+	check("cd to tilde home asks", (await bashGate({ input: { command: "cd ~" } })).action, "ask");
 	// F2: cd/pushd targets extract regardless of spelling, so bare and
 	// symlinked names route through the core; unresolvable targets ask
 	check(
 		"cd through a bare symlinked name asks",
-		bashGate({ input: { command: "cd link-out" } }).action,
+		(await bashGate({ input: { command: "cd link-out" } })).action,
 		"ask",
 	);
 	check(
 		"pushd through a bare symlinked name asks",
-		bashGate({ input: { command: "pushd link-out" } }).action,
+		(await bashGate({ input: { command: "pushd link-out" } })).action,
 		"ask",
 	);
-	check("bare cd asks (home is not lexically resolvable)", bashGate({ input: { command: "cd" } }).action, "ask");
+	check("bare cd asks (home is not lexically resolvable)", (await bashGate({ input: { command: "cd" } })).action, "ask");
 	check(
 		"cd - asks (OLDPWD is not lexically resolvable)",
-		bashGate({ input: { command: "cd -" } }).action,
+		(await bashGate({ input: { command: "cd -" } })).action,
 		"ask",
 	);
-	check("cd .. asks (the parent of the session cwd)", bashGate({ input: { command: "cd .." } }).action, "ask");
-	check("pushd within the cwd subtree passes", bashGate({ input: { command: "pushd inside" } }).action, "pass");
+	check("cd .. asks (the parent of the session cwd)", (await bashGate({ input: { command: "cd .." } })).action, "ask");
+	check("pushd within the cwd subtree passes", (await bashGate({ input: { command: "pushd inside" } })).action, "pass");
 	check(
 		"cd option-qualified in-scope target passes",
-		bashGate({ input: { command: "cd -L inside" } }).action,
+		(await bashGate({ input: { command: "cd -L inside" } })).action,
 		"pass",
 	);
 	check(
 		"dotdot escape via relative operand asks",
-		bashGate({ input: { command: "cat ../outside/target.txt" } }).action,
+		(await bashGate({ input: { command: "cat ../outside/target.txt" } })).action,
 		"ask",
 	);
 	check(
 		"bash operand through a planted symlink asks (verdict core reuse)",
-		bashGate({ input: { command: "cat link-out/sub/target.txt" } }).action,
+		(await bashGate({ input: { command: "cat link-out/sub/target.txt" } })).action,
 		"ask",
 	);
-	check("absolute option value outside asks", bashGate({ input: { command: "tool --config=/etc/app.conf" } }).action, "ask");
+	check("absolute option value outside asks", (await bashGate({ input: { command: "tool --config=/etc/app.conf" } })).action, "ask");
 	check(
 		"env-carried argv value outside asks",
-		bashGate({ input: { command: "env OUT=/etc/capture.txt run" } }).action,
+		(await bashGate({ input: { command: "env OUT=/etc/capture.txt run" } })).action,
 		"ask",
 	);
-	check("option value in scope passes", bashGate({ input: { command: "tool --config=inside/app.conf" } }).action, "pass");
+	check("option value in scope passes", (await bashGate({ input: { command: "tool --config=inside/app.conf" } })).action, "pass");
 	// DC-1: process-internal and data-null devices exempt from bash
 	// operand verdicts only; the path tools still resolve them
 	check(
 		"redirect to /dev/null passes (data-null device, bash-only exemption)",
-		bashGate({ input: { command: "make 2>/dev/null" } }).action,
+		(await bashGate({ input: { command: "make 2>/dev/null" } })).action,
 		"pass",
 	);
 	check(
 		"write redirect to /dev/null passes",
-		bashGate({ input: { command: "echo done > /dev/null" } }).action,
+		(await bashGate({ input: { command: "echo done > /dev/null" } })).action,
 		"pass",
 	);
 	check(
 		"reading /dev/null passes (device as source)",
-		bashGate({ input: { command: "cat /dev/null" } }).action,
+		(await bashGate({ input: { command: "cat /dev/null" } })).action,
 		"pass",
 	);
 	check(
 		"fd-device redirect passes",
-		bashGate({ input: { command: "echo done > /dev/fd/3" } }).action,
+		(await bashGate({ input: { command: "echo done > /dev/fd/3" } })).action,
 		"pass",
 	);
 	check(
 		"/dev/tty stays gated (it reads user input)",
-		bashGate({ input: { command: "cat /dev/tty" } }).action,
+		(await bashGate({ input: { command: "cat /dev/tty" } })).action,
 		"ask",
 	);
 	check(
 		"arbitrary device nodes stay gated",
-		bashGate({ input: { command: "cat /dev/sda" } }).action,
+		(await bashGate({ input: { command: "cat /dev/sda" } })).action,
 		"ask",
 	);
 	check(
 		"reading /dev/stdin passes (process-internal stream, same class as stdout/stderr)",
-		bashGate({ input: { command: "cat /dev/stdin" } }).action,
+		(await bashGate({ input: { command: "cat /dev/stdin" } })).action,
 		"pass",
 	);
 	check(
 		"redirect source /dev/stdin passes",
-		bashGate({ input: { command: "tr a b < /dev/stdin" } }).action,
+		(await bashGate({ input: { command: "tr a b < /dev/stdin" } })).action,
 		"pass",
 	);
 	check(
 		"redirect to an out-of-scope file still asks",
-		bashGate({ input: { command: "> /etc/capture.txt" } }).action,
+		(await bashGate({ input: { command: "> /etc/capture.txt" } })).action,
 		"ask",
 	);
 	check(
@@ -1528,42 +1542,47 @@ try {
 	// would otherwise read as the executable and pass silently
 	check(
 		"redirect-only command at segment head asks",
-		bashGate({ input: { command: `> ${outFile}` } }).action,
+		(await bashGate({ input: { command: `> ${outFile}` } })).action,
 		"ask",
 	);
 	check(
 		"append redirect at segment head asks",
-		bashGate({ input: { command: `echo ok; >> ${outFile}` } }).action,
+		(await bashGate({ input: { command: `echo ok; >> ${outFile}` } })).action,
 		"ask",
 	);
 	check(
 		"read-write redirect at segment head asks",
-		bashGate({ input: { command: `<> ${outFile}` } }).action,
+		(await bashGate({ input: { command: `<> ${outFile}` } })).action,
 		"ask",
 	);
 	check(
 		"background stream redirect after a command asks",
-		bashGate({ input: { command: `make &> ${outFile}` } }).action,
+		(await bashGate({ input: { command: `make &> ${outFile}` } })).action,
 		"ask",
 	);
 	check(
 		"fd duplication stays inert",
-		bashGate({ input: { command: "echo ok 2>&1" } }).action,
+		(await bashGate({ input: { command: "echo ok 2>&1" } })).action,
+		"pass",
+	);
+	check(
+		"input fd duplication stays inert",
+		(await bashGate({ input: { command: "cat <&0" } })).action,
 		"pass",
 	);
 
 	// substitution bias: the scanner cannot see expansion results
 	check(
 		"command substitution biases toward ask",
-		bashGate({ input: { command: "echo $(cat inside/file.txt)" } }).action,
+		(await bashGate({ input: { command: "echo $(cat inside/file.txt)" } })).action,
 		"ask",
 	);
-	check("backtick substitution biases toward ask", bashGate({ input: { command: "cat `ls inside`" } }).action, "ask");
-	check("process substitution asks", bashGate({ input: { command: "cat <(cat inside/file.txt)" } }).action, "ask");
-	check("bare variable expansion biases toward ask", bashGate({ input: { command: "cat $HOME/notes" } }).action, "ask");
+	check("backtick substitution biases toward ask", (await bashGate({ input: { command: "cat `ls inside`" } })).action, "ask");
+	check("process substitution asks", (await bashGate({ input: { command: "cat <(cat inside/file.txt)" } })).action, "ask");
+	check("bare variable expansion biases toward ask", (await bashGate({ input: { command: "cat $HOME/notes" } })).action, "ask");
 	check(
 		"variable inside quotes biases toward ask",
-		bashGate({ input: { command: 'cat "$HOME/notes"' } }).action,
+		(await bashGate({ input: { command: 'cat "$HOME/notes"' } })).action,
 		"ask",
 	);
 
@@ -1571,32 +1590,32 @@ try {
 	// double-quoted and unquoted $ and the ANSI-C form still gate
 	check(
 		"single-quoted awk program passes (bash cannot expand it)",
-		bashGate({ input: { command: "awk '{print $1}' inside/file.txt" } }).action,
+		(await bashGate({ input: { command: "awk '{print $1}' inside/file.txt" } })).action,
 		"pass",
 	);
 	check(
 		"single-quoted literal dollar passes",
-		bashGate({ input: { command: "grep '\\$' inside/file.txt" } }).action,
+		(await bashGate({ input: { command: "grep '\\$' inside/file.txt" } })).action,
 		"pass",
 	);
 	check(
 		"single-quoted backticks pass (inert in bash)",
-		bashGate({ input: { command: "echo '`ls inside`'" } }).action,
+		(await bashGate({ input: { command: "echo '`ls inside`'" } })).action,
 		"pass",
 	);
 	check(
 		"ANSI-C quoting still asks (the $ sits outside the stripped span)",
-		bashGate({ input: { command: "grep $'\\t' inside/file.txt" } }).action,
+		(await bashGate({ input: { command: "grep $'\\t' inside/file.txt" } })).action,
 		"ask",
 	);
 	check(
 		"executor payload dollars still ask (a child shell re-evaluates them)",
-		bashGate({ input: { command: "bash -c 'echo $HOME/notes'" } }).action,
+		(await bashGate({ input: { command: "bash -c 'echo $HOME/notes'" } })).action,
 		"ask",
 	);
 	check(
 		"executor payload bare cd asks",
-		bashGate({ input: { command: "bash -c 'cd'" } }).action,
+		(await bashGate({ input: { command: "bash -c 'cd'" } })).action,
 		"ask",
 	);
 
@@ -1605,46 +1624,62 @@ try {
 	// still gates; an escaped dollar is literal and passes
 	check(
 		"escaped-quote substitution bypass asks",
-		bashGate({ input: { command: "echo \\' && cat \"$HOME/secrets\"" } }).action,
+		(await bashGate({ input: { command: "echo \\' && cat \"$HOME/secrets\"" } })).action,
 		"ask",
 	);
 	check(
 		"a lone escaped quote passes (literal apostrophe, nothing live)",
-		bashGate({ input: { command: "echo \\'" } }).action,
+		(await bashGate({ input: { command: "echo \\'" } })).action,
 		"pass",
 	);
 	check(
 		"escaped dollar is a literal (walker escape handling)",
-		bashGate({ input: { command: "cat \\$HOME/notes" } }).action,
+		(await bashGate({ input: { command: "cat \\$HOME/notes" } })).action,
 		"pass",
 	);
 
 	// unmodeled syntax biases toward ask
-	check("grouping parens ask", bashGate({ input: { command: "(cd /etc && cat passwd)" } }).action, "ask");
-	check("brace expansion asks", bashGate({ input: { command: "cat /etc/{passwd,group}" } }).action, "ask");
+	// SEMANTIC FLIP (PISCOPE-2-2, sanctioned Blocks Q3): grouping parens
+	// used to bail as unmodeled syntax; under the AST the subshell parses
+	// and the inner commands' operands gate. The ask verdict is preserved
+	// here through operand extraction (cd /etc), not through the bail
+	// class.
+	check("grouping parens ask", (await bashGate({ input: { command: "(cd /etc && cat passwd)" } })).action, "ask");
+	// SEMANTIC FLIP (PISCOPE-2-2, sanctioned Blocks Q3): brace expansion
+	// text used to bail as unmodeled syntax; the grammar parses it as a
+	// concatenation whose text still gates through the operand core.
+	check("brace expansion asks", (await bashGate({ input: { command: "cat /etc/{passwd,group}" } })).action, "ask");
+	// SEMANTIC FLIP (PISCOPE-2-2, sanctioned Blocks Q3): a trailing
+	// comment used to bail the scan; bash never executes a comment, so
+	// the AST walk reads none of it and the command's own operands gate.
 	check(
-		"trailing comments ask",
-		bashGate({ input: { command: "cat inside/file.txt # trailing note" } }).action,
-		"ask",
+		"trailing comments pass (a comment is inert to bash)",
+		(await bashGate({ input: { command: "cat inside/file.txt # trailing note" } })).action,
+		"pass",
 	);
-	check("heredocs ask", bashGate({ input: { command: "cat << EOF\nbody\nEOF" } }).action, "ask");
-	check("unterminated quotes ask", bashGate({ input: { command: "cat 'inside/file.txt" } }).action, "ask");
-	check("trailing escape asks", bashGate({ input: { command: "cat inside/\\" } }).action, "ask");
+	// SEMANTIC FLIP (PISCOPE-2-2, sanctioned Blocks Q3): heredocs used to
+	// bail the scan; the grammar parses the redirect and the body, the
+	// tag is not an operand, and a plain body names nothing, so an
+	// in-scope heredoc runs unprompted. Interpolating bodies still ask
+	// (their expansions run) and ERROR-bearing parses still bail.
+	check("heredocs parse and run unprompted", (await bashGate({ input: { command: "cat << EOF\nbody\nEOF" } })).action, "pass");
+	check("unterminated quotes ask", (await bashGate({ input: { command: "cat 'inside/file.txt" } })).action, "ask");
+	check("trailing escape asks", (await bashGate({ input: { command: "cat inside/\\" } })).action, "ask");
 	// F3: backslash-newline continuations remove the way bash removes
 	// them, so the continuation line cannot hide behind the join
 	check(
 		"glued continuation cannot hide an absolute operand",
-		bashGate({ input: { command: "cat \\\n/etc/passwd" } }).action,
+		(await bashGate({ input: { command: "cat \\\n/etc/passwd" } })).action,
 		"ask",
 	);
 	check(
 		"indented continuation cannot hide an absolute operand",
-		bashGate({ input: { command: "cat \\\n   /etc/passwd" } }).action,
+		(await bashGate({ input: { command: "cat \\\n   /etc/passwd" } })).action,
 		"ask",
 	);
 	check(
 		"in-scope continuation passes",
-		bashGate({ input: { command: "cat \\\ninside/file.txt" } }).action,
+		(await bashGate({ input: { command: "cat \\\ninside/file.txt" } })).action,
 		"pass",
 	);
 
@@ -1654,62 +1689,66 @@ try {
 	// is the access, not a mention
 	check(
 		"quoted path mentions ask",
-		bashGate({ input: { command: 'echo "see /etc/passwd for details"' } }).action,
+		(await bashGate({ input: { command: 'echo "see /etc/passwd for details"' } })).action,
 		"ask",
 	);
+	// SEMANTIC FLIP (PISCOPE-2-2, sanctioned Blocks Q3): parentheses
+	// inside double quotes used to bail as unmodeled syntax; in bash they
+	// are literal string data, and the grammar proves it (a string node,
+	// no ERROR), so the mention passes while its own words stay inert.
 	check(
-		"quoted parens in a mention ask (unmodeled syntax gates in double quotes)",
-		bashGate({ input: { command: 'grep "(foo" inside/file.txt' } }).action,
-		"ask",
+		"quoted parens in a mention pass (literal data inside quotes under the grammar)",
+		(await bashGate({ input: { command: 'grep "(foo" inside/file.txt' } })).action,
+		"pass",
 	);
 	check(
 		"quoted out-of-scope operand asks",
-		bashGate({ input: { command: 'cat "/etc/passwd"' } }).action,
+		(await bashGate({ input: { command: 'cat "/etc/passwd"' } })).action,
 		"ask",
 	);
 	check(
 		"quoted redirect target asks",
-		bashGate({ input: { command: 'echo x > "/etc/capture.txt"' } }).action,
+		(await bashGate({ input: { command: 'echo x > "/etc/capture.txt"' } })).action,
 		"ask",
 	);
 	check(
 		"quoted operand as a copy source asks",
-		bashGate({ input: { command: 'cp "/etc/passwd" .' } }).action,
+		(await bashGate({ input: { command: 'cp "/etc/passwd" .' } })).action,
 		"ask",
 	);
 	check(
 		"quoted assignment-prefix RHS asks",
-		bashGate({ input: { command: 'X="/etc/capture.txt" run' } }).action,
+		(await bashGate({ input: { command: 'X="/etc/capture.txt" run' } })).action,
 		"ask",
 	);
 
 	// executor shapes gate payload operands inside quotes
-	check("bash -c payload outside asks", bashGate({ input: { command: "bash -c 'cat /etc/passwd'" } }).action, "ask");
-	check("sh -c payload outside asks", bashGate({ input: { command: "sh -c 'ls /etc'" } }).action, "ask");
-	check("eval payload outside asks", bashGate({ input: { command: "eval 'cat /etc/group'" } }).action, "ask");
-	check("su -c payload outside asks", bashGate({ input: { command: "su -c 'cat /etc/shadow'" } }).action, "ask");
-	check("ssh payload outside asks", bashGate({ input: { command: "ssh host 'cat /etc/hosts'" } }).action, "ask");
+	check("bash -c payload outside asks", (await bashGate({ input: { command: "bash -c 'cat /etc/passwd'" } })).action, "ask");
+	check("sh -c payload outside asks", (await bashGate({ input: { command: "sh -c 'ls /etc'" } })).action, "ask");
+	check("eval payload outside asks", (await bashGate({ input: { command: "eval 'cat /etc/group'" } })).action, "ask");
+	check("su -c payload outside asks", (await bashGate({ input: { command: "su -c 'cat /etc/shadow'" } })).action, "ask");
+	check("ssh payload outside asks", (await bashGate({ input: { command: "ssh host 'cat /etc/hosts'" } })).action, "ask");
 	// an escaped quote before an executor shape must not hide it: the
 	// walker reads \' as a literal apostrophe, so the executor tokens
 	// stay visible as tokens
 	check(
 		"an escaped quote cannot hide a bash -c executor payload (the hidden executor asks)",
-		bashGate({ input: { command: "echo \\' ; bash -c 'cat \"$HOME/secrets\"'" } }).action,
+		(await bashGate({ input: { command: "echo \\' ; bash -c 'cat \"$HOME/secrets\"'" } })).action,
 		"ask",
 	);
 	check(
 		"an escaped quote cannot hide an eval executor payload",
-		bashGate({ input: { command: "echo \\' ; eval 'cat $HOME/x'" } }).action,
+		(await bashGate({ input: { command: "echo \\' ; eval 'cat $HOME/x'" } })).action,
 		"ask",
 	);
 	check(
 		"an escaped quote cannot hide an executor write payload",
-		bashGate({ input: { command: "echo \\' ; bash -c 'echo x > \"$HOME/.ssh/authorized_keys\"'" } }).action,
+		(await bashGate({ input: { command: "echo \\' ; bash -c 'echo x > \"$HOME/.ssh/authorized_keys\"'" } })).action,
 		"ask",
 	);
 	check(
 		"executor word inside a quoted mention does not trigger the raw scan",
-		bashGate({ input: { command: 'echo "never write bash -c in reports"' } }).action,
+		(await bashGate({ input: { command: 'echo "never write bash -c in reports"' } })).action,
 		"pass",
 	);
 
@@ -1719,37 +1758,37 @@ try {
 	// gates; the ask posture keys on the invocation shape)
 	check(
 		"path-qualified bash executor asks",
-		bashGate({ input: { command: "/bin/bash -c 'cat \"$HOME/s\"'" } }).action,
+		(await bashGate({ input: { command: "/bin/bash -c 'cat \"$HOME/s\"'" } })).action,
 		"ask",
 	);
 	check(
 		"relative-path bash executor asks",
-		bashGate({ input: { command: "./bash -c 'cat $HOME/x'" } }).action,
+		(await bashGate({ input: { command: "./bash -c 'cat $HOME/x'" } })).action,
 		"ask",
 	);
 	check(
 		"relative-path sh executor asks",
-		bashGate({ input: { command: "./sh -c 'cat $HOME/x'" } }).action,
+		(await bashGate({ input: { command: "./sh -c 'cat $HOME/x'" } })).action,
 		"ask",
 	);
 	check(
 		"home-anchored bash executor asks",
-		bashGate({ input: { command: "~/bin/bash -c 'cat $HOME/x'" } }).action,
+		(await bashGate({ input: { command: "~/bin/bash -c 'cat $HOME/x'" } })).action,
 		"ask",
 	);
 	check(
 		"path-qualified su executor asks",
-		bashGate({ input: { command: "/bin/su -c 'cat $HOME/x'" } }).action,
+		(await bashGate({ input: { command: "/bin/su -c 'cat $HOME/x'" } })).action,
 		"ask",
 	);
 	check(
 		"path-qualified ssh executor asks",
-		bashGate({ input: { command: "/usr/bin/ssh host 'cat $HOME/x'" } }).action,
+		(await bashGate({ input: { command: "/usr/bin/ssh host 'cat $HOME/x'" } })).action,
 		"ask",
 	);
 	check(
 		"a missing path-qualified executor still gates (the ask posture keys on the shape)",
-		bashGate({ input: { command: "/no/such/dir/bash -c 'cat $HOME/x'" } }).action,
+		(await bashGate({ input: { command: "/no/such/dir/bash -c 'cat $HOME/x'" } })).action,
 		"ask",
 	);
 
@@ -1758,22 +1797,22 @@ try {
 	// and -cpayload are the executor shape however the value glues
 	check(
 		"single-quote-glued -c payload asks",
-		bashGate({ input: { command: "bash -c'cat $HOME/x'" } }).action,
+		(await bashGate({ input: { command: "bash -c'cat $HOME/x'" } })).action,
 		"ask",
 	);
 	check(
 		"double-quote-glued -c payload asks",
-		bashGate({ input: { command: 'bash -c"cat $HOME/x"' } }).action,
+		(await bashGate({ input: { command: 'bash -c"cat $HOME/x"' } })).action,
 		"ask",
 	);
 	check(
 		"bare glued -c cluster with a quoted payload tail asks",
-		bashGate({ input: { command: "bash -ccat' $HOME/x'" } }).action,
+		(await bashGate({ input: { command: "bash -ccat' $HOME/x'" } })).action,
 		"ask",
 	);
 	check(
 		"a bare glued -c payload inside the scope passes (detection alone is not the ask)",
-		bashGate({ input: { command: "bash -cecho hi" } }).action,
+		(await bashGate({ input: { command: "bash -cecho hi" } })).action,
 		"pass",
 	);
 
@@ -1783,219 +1822,226 @@ try {
 	// arguments and the scanner cannot model what it will run
 	check(
 		"command-prefixed executor asks",
-		bashGate({ input: { command: "command bash -c 'cat $X'" } }).action,
+		(await bashGate({ input: { command: "command bash -c 'cat $X'" } })).action,
 		"ask",
 	);
 	check(
 		"env-prefixed executor with a redirect payload asks",
-		bashGate({ input: { command: "env bash -c 'x > $Y'" } }).action,
+		(await bashGate({ input: { command: "env bash -c 'x > $Y'" } })).action,
 		"ask",
 	);
 	check(
 		"env-prefixed executor asks even on an inert payload (the wrapper is the point)",
-		bashGate({ input: { command: "env bash -c 'echo inside'" } }).action,
+		(await bashGate({ input: { command: "env bash -c 'echo inside'" } })).action,
 		"ask",
 	);
 	check(
 		"nohup-prefixed executor asks",
-		bashGate({ input: { command: "nohup bash -c 'echo inside'" } }).action,
+		(await bashGate({ input: { command: "nohup bash -c 'echo inside'" } })).action,
 		"ask",
 	);
 	check(
 		"nice with its flags before an executor asks",
-		bashGate({ input: { command: "nice -n 5 bash -c 'echo inside'" } }).action,
+		(await bashGate({ input: { command: "nice -n 5 bash -c 'echo inside'" } })).action,
 		"ask",
 	);
 	check(
 		"timeout with a duration before a path-qualified executor asks",
-		bashGate({ input: { command: "timeout 30 /bin/bash -c 'echo inside'" } }).action,
+		(await bashGate({ input: { command: "timeout 30 /bin/bash -c 'echo inside'" } })).action,
 		"ask",
 	);
 	check(
 		"path-qualified env before an executor asks",
-		bashGate({ input: { command: "/usr/bin/env bash -c 'echo inside'" } }).action,
+		(await bashGate({ input: { command: "/usr/bin/env bash -c 'echo inside'" } })).action,
 		"ask",
 	);
 	check(
 		"command before an eval shape asks",
-		bashGate({ input: { command: "command eval 'echo inside'" } }).action,
+		(await bashGate({ input: { command: "command eval 'echo inside'" } })).action,
 		"ask",
 	);
 
 	// bash-only operand overrides ahead of the shared core
 	check(
 		"~user operand asks (bash expands it, the core keeps it literal)",
-		bashGate({ input: { command: "cat ~root/.bashrc" } }).action,
+		(await bashGate({ input: { command: "cat ~root/.bashrc" } })).action,
 		"ask",
 	);
-	check("glob-plus-dotdot operand asks", bashGate({ input: { command: "cat */../secret" } }).action, "ask");
+	check("glob-plus-dotdot operand asks", (await bashGate({ input: { command: "cat */../secret" } })).action, "ask");
 
 	// unusable inputs fail closed
-	check("non-string bash command asks", bashGate({ input: { command: 42 } }).action, "ask");
-	check("missing bash command asks", bashGate({ input: {} }).action, "ask");
-	check("empty bash command asks", bashGate({ input: { command: "" } }).action, "ask");
+	check("non-string bash command asks", (await bashGate({ input: { command: 42 } })).action, "ask");
+	check("missing bash command asks", (await bashGate({ input: {} })).action, "ask");
+	check("empty bash command asks", (await bashGate({ input: { command: "" } })).action, "ask");
 	check(
 		"unusable session cwd asks",
-		bashGate({ sessionCwd: "", input: { command: "echo hello" } }).action,
+		(await bashGate({ sessionCwd: "", input: { command: "echo hello" } })).action,
 		"ask",
 	);
 
 	// degraded seal asks every bash call
-	const bashDegraded = bashGate({ seal: gateDegradedSeal });
+	const bashDegraded = (await bashGate({ seal: gateDegradedSeal }));
 	check("degraded seal asks even an operand-free command", bashDegraded.action, "ask");
 	checkContains("degraded bash ask names the seal reason", bashDegraded.title, "digest was pinned");
-	check("degraded seal blocks headless bash", bashGate({ hasUI: false, seal: gateDegradedSeal }).action, "block");
+	check("degraded seal blocks headless bash", (await bashGate({ hasUI: false, seal: gateDegradedSeal })).action, "block");
 
 	// post-prompt and headless branches
 	check(
 		"approved out-of-scope bash passes",
-		bashGate({ input: { command: "cat /etc/passwd" }, approved: true }).action,
+		(await bashGate({ input: { command: "cat /etc/passwd" }, approved: true })).action,
 		"pass",
 	);
-	const bashRefused = bashGate({ input: { command: "cat /etc/passwd" }, approved: false });
+	const bashRefused = (await bashGate({ input: { command: "cat /etc/passwd" }, approved: false }));
 	check("refused out-of-scope bash blocks", bashRefused.action, "block");
 	checkContains("bash refusal reason names the tool", bashRefused.reason, "bash");
 	checkContains("bash refusal reason names the operand", bashRefused.reason, "/etc/passwd");
-	const bashHeadless = bashGate({ input: { command: "cat /etc/passwd" }, hasUI: false });
+	const bashHeadless = (await bashGate({ input: { command: "cat /etc/passwd" }, hasUI: false }));
 	check("out-of-scope bash blocks headless", bashHeadless.action, "block");
 	checkContains("headless bash reason names the operand", bashHeadless.reason, "/etc/passwd");
 	checkContains("headless bash reason names the remedy", bashHeadless.reason, "interactively");
-	check("headless in-scope bash passes", bashGate({ hasUI: false }).action, "pass");
+	check("headless in-scope bash passes", (await bashGate({ hasUI: false })).action, "pass");
 
 	// DC-R1 through the bash wiring: seal omitted -> the real memoized session seal
 	check(
 		"bash wiring with omitted seal consumes the real session seal",
-		bashGate({ seal: undefined }).action,
+		(await bashGate({ seal: undefined })).action,
 		"pass",
 	);
 
 	// scanner extraction pins
-	const scan = (command) => scanBashCommand(command);
+	const scan = async (command) => await scanBashCommand(command);
 	check(
 		"scan extracts an absolute operand",
-		JSON.stringify(scan("cat /etc/passwd").operands),
+		JSON.stringify((await scan("cat /etc/passwd")).operands),
 		JSON.stringify(["/etc/passwd"]),
 	);
 	check(
 		"scan extracts a relative operand",
-		JSON.stringify(scan("cat inside/file.txt").operands),
+		JSON.stringify((await scan("cat inside/file.txt")).operands),
 		JSON.stringify(["inside/file.txt"]),
 	);
 	check(
 		"scan keeps multiple operands in order",
-		JSON.stringify(scan("cp /etc/passwd inside/copy.txt").operands),
+		JSON.stringify((await scan("cp /etc/passwd inside/copy.txt")).operands),
 		JSON.stringify(["/etc/passwd", "inside/copy.txt"]),
 	);
-	check("scan skips bare words and the command word", scan("echo hello").operands.length, 0);
+	check("scan skips bare words and the command word", (await scan("echo hello")).operands.length, 0);
 	check(
 		"scan extracts quoted mention pieces",
-		JSON.stringify(scan('echo "see /etc/passwd"').operands),
+		JSON.stringify((await scan('echo "see /etc/passwd"')).operands),
 		JSON.stringify(["/etc/passwd"]),
 	);
 	check(
 		"scan extracts a quoted operand",
-		JSON.stringify(scan('cat "/etc/passwd"').operands),
+		JSON.stringify((await scan('cat "/etc/passwd"')).operands),
 		JSON.stringify(["/etc/passwd"]),
 	);
 	check(
 		"scan extracts a quoted redirect target",
-		JSON.stringify(scan('echo x > "/etc/capture.txt"').operands),
+		JSON.stringify((await scan('echo x > "/etc/capture.txt"')).operands),
 		JSON.stringify(["/etc/capture.txt"]),
 	);
 	check(
 		"scan extracts a quoted assignment-prefix RHS",
-		JSON.stringify(scan('X="/etc/capture.txt" run').operands),
+		JSON.stringify((await scan('X="/etc/capture.txt" run')).operands),
 		JSON.stringify(["/etc/capture.txt"]),
 	);
 	check(
 		"scan flags substitution behind an escaped quote",
-		scan("echo \\' && cat \"$HOME/secrets\"").substitution,
+		(await scan("echo \\' && cat \"$HOME/secrets\"")).substitution,
 		true,
 	);
-	check("scan treats an escaped dollar as literal", scan("cat \\$HOME/notes").substitution, false);
-	check("scan keeps double-quoted grouping syntax as bail", scan('grep "(foo" f').bail, true);
+	check("scan treats an escaped dollar as literal", (await scan("cat \\$HOME/notes")).substitution, false);
+	// SEMANTIC FLIP (PISCOPE-2-2, sanctioned Blocks Q3): a quoted
+	// parenthesis is literal string data under the grammar, so the bail
+	// pin re-derives to the ERROR-only class.
+	check("double-quoted grouping syntax parses as literal data", (await scan('grep "(foo" f')).bail, false);
 	check(
 		"scan honors escaped-space operands",
-		JSON.stringify(scan("cat inside/my\\ file.txt").operands),
+		JSON.stringify((await scan("cat inside/my\\ file.txt")).operands),
 		JSON.stringify(["inside/my file.txt"]),
 	);
 	check(
 		"scan takes the full word and the RHS of option assignments",
-		JSON.stringify(scan("tool --config=/etc/app.conf").operands),
+		JSON.stringify((await scan("tool --config=/etc/app.conf")).operands),
 		JSON.stringify(["--config=/etc/app.conf", "/etc/app.conf"]),
 	);
 	check(
 		"scan takes an assignment-prefix RHS",
-		JSON.stringify(scan("OUT=/etc/capture.txt run").operands),
+		JSON.stringify((await scan("OUT=/etc/capture.txt run")).operands),
 		JSON.stringify(["/etc/capture.txt"]),
 	);
-	check("scan keeps a lone assignment inert", scan("X=/etc/capture.txt").operands.length, 0);
+	check("scan keeps a lone assignment inert", (await scan("X=/etc/capture.txt")).operands.length, 0);
 	check(
 		"scan flags a segment-head redirect target",
-		JSON.stringify(scan("> /etc/passwd").operands),
+		JSON.stringify((await scan("> /etc/passwd")).operands),
 		JSON.stringify(["/etc/passwd"]),
 	);
 	check(
 		"scan flags a background stream redirect target",
-		JSON.stringify(scan("make &> /etc/log").operands),
+		JSON.stringify((await scan("make &> /etc/log")).operands),
 		JSON.stringify(["/etc/log"]),
 	);
 	check(
 		"scan flags a noclobber redirect target",
-		JSON.stringify(scan("cat >| /etc/log").operands),
+		JSON.stringify((await scan("cat >| /etc/log")).operands),
 		JSON.stringify(["/etc/log"]),
 	);
 	check(
 		"scan extracts a bare cd target",
-		JSON.stringify(scan("cd link-out").operands),
+		JSON.stringify((await scan("cd link-out")).operands),
 		JSON.stringify(["link-out"]),
 	);
-	check("scan asks on bare cd", scan("cd").cdAsk !== null, true);
+	check("scan asks on bare cd", (await scan("cd")).cdAsk !== null, true);
 	checkContains(
 		"scan bare-cd ask names the unresolvable target class",
-		scan("cd").cdAsk ?? "",
+		(await scan("cd")).cdAsk ?? "",
 		"cannot resolve",
 	);
-	checkContains("scan cd - ask names OLDPWD", scan("cd -").cdAsk ?? "", "OLDPWD");
-	check("scan cd with an extractable target raises no ask", scan("cd inside").cdAsk, null);
+	checkContains("scan cd - ask names OLDPWD", (await scan("cd -")).cdAsk ?? "", "OLDPWD");
+	check("scan cd with an extractable target raises no ask", (await scan("cd inside")).cdAsk, null);
 	check(
 		"scan removes a glued continuation",
-		JSON.stringify(scan("cat \\\n/etc/passwd").operands),
+		JSON.stringify((await scan("cat \\\n/etc/passwd")).operands),
 		JSON.stringify(["/etc/passwd"]),
 	);
 	check(
 		"scan joins a mid-word continuation exactly as bash does",
-		JSON.stringify(scan("cat foo\\\n/etc/passwd").operands),
+		JSON.stringify((await scan("cat foo\\\n/etc/passwd")).operands),
 		JSON.stringify(["foo/etc/passwd"]),
 	);
-	check("scan treats single-quoted dollars as inert", scan("awk '{print $1}' f").substitution, false);
-	check("scan keeps double-quoted dollars as substitution", scan('cat "$HOME/x"').substitution, true);
-	check("scan keeps ANSI-C dollars as substitution", scan("grep $'\\t' f").substitution, true);
-	check("scan flags executor payload dollars", scan("bash -c 'echo $X'").substitution, true);
-	check("scan raises the cd ask through an executor payload", scan("bash -c 'cd'").cdAsk !== null, true);
+	check("scan treats single-quoted dollars as inert", (await scan("awk '{print $1}' f")).substitution, false);
+	check("scan keeps double-quoted dollars as substitution", (await scan('cat "$HOME/x"')).substitution, true);
+	check("scan keeps ANSI-C dollars as substitution", (await scan("grep $'\\t' f")).substitution, true);
+	check("scan flags executor payload dollars", (await scan("bash -c 'echo $X'")).substitution, true);
+	check("scan raises the cd ask through an executor payload", (await scan("bash -c 'cd'")).cdAsk !== null, true);
 	check(
 		"scan splits executor payloads through quotes",
-		JSON.stringify(scan("bash -c 'cat /etc/passwd'").operands),
+		JSON.stringify((await scan("bash -c 'cat /etc/passwd'")).operands),
 		JSON.stringify(["/etc/passwd"]),
 	);
-	check("scan flags substitution", scan("echo $(x)").substitution, true);
-	check("scan flags executor shapes", scan("bash -c 'ls /'").executor, true);
-	check("scan detects the executor shape behind an escaped quote", scan("echo \\' ; bash -c 'cat /etc/passwd'").executor, true);
-	check("scan keeps a quoted prose mention of the executor shape inert", scan('echo "never write bash -c in reports"').executor, false);
-	check("scan detects executor shapes through option flags and intervening arguments", scan("bash --norc -lc 'ls inside'").executor, true);
-	check("scan detects the bare glued -c cluster", scan("bash -ccat").executor, true);
-	check("scan detects -cu as the -c cluster (the disclosed inert-junk over-ask)", scan("bash -cu x").executor, true);
+	check("scan flags substitution", (await scan("echo $(x)")).substitution, true);
+	check("scan flags executor shapes", (await scan("bash -c 'ls /'")).executor, true);
+	check("scan detects the executor shape behind an escaped quote", (await scan("echo \\' ; bash -c 'cat /etc/passwd'")).executor, true);
+	check("scan keeps a quoted prose mention of the executor shape inert", (await scan('echo "never write bash -c in reports"')).executor, false);
+	check("scan detects executor shapes through option flags and intervening arguments", (await scan("bash --norc -lc 'ls inside'")).executor, true);
+	check("scan detects the bare glued -c cluster", (await scan("bash -ccat")).executor, true);
+	check("scan detects -cu as the -c cluster (the disclosed inert-junk over-ask)", (await scan("bash -cu x")).executor, true);
 	check(
 		"scan floors an interposer-prefixed executor shape and names the wrapper",
-		scan("env bash -c 'echo inside'").interposed,
+		(await scan("env bash -c 'echo inside'")).interposed,
 		"env",
 	);
 	check(
 		"scan keeps an interposer without an executor shape inert",
-		scan("env FOO=1 ls inside").interposed,
+		(await scan("env FOO=1 ls inside")).interposed,
 		null,
 	);
-	check("scan flags unmodeled syntax", scan("ls (x)").bail, true);
+	// SEMANTIC FLIP (PISCOPE-2-2, sanctioned Blocks Q3): tree-sitter
+	// recovers a stray parenthesized group as a subshell with no ERROR
+	// node, and bash itself rejects the spelling before anything runs,
+	// so the lexical bail pin re-derives to the ERROR-only class.
+	check("a stray parenthesized group parses without an ERROR tree", (await scan("ls (x)")).bail, false);
 
 	// the factory handler maps bash events onto the shared ask/block machinery
 	check(
@@ -2028,6 +2074,1084 @@ try {
 		"handler redirect refusal names the resolved path",
 		handlerRedirectHead.reason,
 		"/etc/passwd",
+	);
+
+	// --- PISCOPE-2-2: the AST detection layer swap -----------------------
+	// Pins for the tree-sitter detection layer behind the unchanged
+	// BashScanResult contract: the EXT-34 sed closure (the pattern-first
+	// skip adapted from permission-gate's PATTERN_FIRST_COMMANDS, scoped
+	// to sed per the driver record), the heredoc tree-quirk corpus (the
+	// GPS correction class: a redirect attached to a heredoc statement
+	// hangs under heredoc_redirect and still extracts), ERROR-tree bail
+	// equivalence, the expansion-node vocabulary, and the parser-
+	// unavailable fail-safe boundary at the async decision seam.
+
+	// EXT-34 closure: a sed range is an argument, structurally. The
+	// script positional is skipped and the file operands still gate, so
+	// the false-positive class closes without opening a silent direction.
+	check(
+		"the EXT-34 incident command passes (a sed range is an argument, not a path)",
+		(await bashGate({ input: { command: "sed -n '/^next_report_seq()/,/^}/p' file" } })).action,
+		"pass",
+	);
+	check(
+		"the EXT-34 sed script is not extracted as an operand (the lexical scan surfaced it as a garbage absolute path)",
+		JSON.stringify((await scan("sed -n '/^next_report_seq()/,/^}/p' file")).operands),
+		JSON.stringify([]),
+	);
+	check(
+		"the EXT-34 command parses clean through the grammar",
+		(await scan("sed -n '/^next_report_seq()/,/^}/p' file")).bail,
+		false,
+	);
+	check(
+		"a sed script positional still gates a real out-of-scope file operand",
+		(await bashGate({ input: { command: "sed 's/a/b/' /etc/passwd" } })).action,
+		"ask",
+	);
+	check(
+		"a sed -e script is consumed and not extracted",
+		JSON.stringify((await scan("sed -e '/a/,/b/p' file")).operands),
+		JSON.stringify([]),
+	);
+	check(
+		"an unquoted sed -e script is consumed too",
+		JSON.stringify((await scan("sed -e s/a/b/ file")).operands),
+		JSON.stringify([]),
+	);
+	check(
+		"a sed -f script file stays an operand while the data file extracts",
+		JSON.stringify((await scan("sed -f /scripts/fix.sed /etc/data")).operands),
+		JSON.stringify(["/scripts/fix.sed", "/etc/data"]),
+	);
+	check(
+		"a sed inline --expression value is not extracted",
+		JSON.stringify((await scan("sed --expression=/a/,/b/p file")).operands),
+		JSON.stringify([]),
+	);
+	check(
+		"sed -i consumes nothing and only the script positional is skipped",
+		JSON.stringify((await scan("sed -i 's/a/b/' file")).operands),
+		JSON.stringify([]),
+	);
+
+	// heredoc tree-quirk corpus (the GPS correction class)
+	check(
+		"an interpolating heredoc body still asks (its expansion runs)",
+		(await bashGate({ input: { command: "cat << EOF\n${HOME}\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a redirect attached to a heredoc statement still extracts its target (the tree hangs it under heredoc_redirect)",
+		(await bashGate({ input: { command: `cat << EOF > ${outFile}\nbody\nEOF` } })).action,
+		"ask",
+	);
+	check(
+		"a post-heredoc redirect statement still extracts its target",
+		(await bashGate({ input: { command: `wc -l << EOF\nbody\nEOF\n> ${outFile}` } })).action,
+		"ask",
+	);
+
+	// ERROR-tree bail equivalence: the bail class is now the parse-health
+	// class (rootNode.hasError), the GPS parse-health precedent.
+	check("an unterminated quote parses to the bail class", (await scan("cat 'inside/file.txt")).bail, true);
+	check("a trailing escape parses to the bail class", (await scan("cat inside/\\")).bail, true);
+	check("a malformed read-write redirect parses to the bail class", (await scan("<> /etc/out")).bail, true);
+
+	// the expansion-node vocabulary: every form bash would expand asks,
+	// matching the lexical scanner's dollar-sighting posture
+	check("brace parameter expansion asks", (await bashGate({ input: { command: "echo ${HOME}/secret" } })).action, "ask");
+	check("arithmetic expansion asks", (await bashGate({ input: { command: "echo $((1+2))" } })).action, "ask");
+	check("a top-level assignment carrying an expansion asks", (await bashGate({ input: { command: "X=$HOME/notes" } })).action, "ask");
+
+	// --- PISCOPE-2-2 fix round (review 08 findings) ----------------------
+	// The swap's walk missed two tree positions the lexical scanner saw
+	// and its continuation join was not bash-exact. The pins below hold
+	// the closed gaps at both the gate and the scan seam.
+
+	// Assignment values are expansion positions: a value that is itself
+	// a bare expansion node (the grammar allows one directly) asks, as
+	// does an expansion nested in a literal value, at every assignment
+	// posture the grammar spells (top-level, command prefix, backtick,
+	// declaration command).
+	check(
+		"command substitution as an assignment value asks",
+		(await bashGate({ input: { command: "x=$(cat /etc/passwd)" } })).action,
+		"ask",
+	);
+	check(
+		"backtick substitution as an assignment value asks",
+		(await bashGate({ input: { command: "v=`cat /etc/passwd`" } })).action,
+		"ask",
+	);
+	check(
+		"command substitution in a prefix assignment value asks",
+		(await bashGate({ input: { command: "FOO=$(cat /etc/passwd) cmd" } })).action,
+		"ask",
+	);
+	check(
+		"command substitution in a declaration assignment value asks",
+		(await bashGate({ input: { command: "export v=$(cat /etc/passwd)" } })).action,
+		"ask",
+	);
+	check("scan flags a bare parameter-expansion assignment value", (await scan("x=$HOME")).substitution, true);
+	check("scan flags a bare arithmetic-expansion assignment value", (await scan("x=$((1+1))")).substitution, true);
+	check("scan flags substitution in a prefix assignment value", (await scan("FOO=$(cat /etc/x) cmd")).substitution, true);
+	check("scan flags substitution in a declaration assignment value", (await scan("export v=`cat /etc/x`")).substitution, true);
+	check(
+		"a stray expansion argument to a declaration command asks",
+		(await bashGate({ input: { command: "export $HOME" } })).action,
+		"ask",
+	);
+	check(
+		"scan flags a stray expansion child of a declaration command",
+		(await scan("export `cat /etc/x`")).substitution,
+		true,
+	);
+
+	// Declaration-command assignment values extract as operands exactly
+	// like the command-prefix form: the exported value is the same
+	// environment access point, and the lexical scanner gated it.
+	check(
+		"an exported value gates like the prefix form",
+		(await bashGate({ input: { command: "export X=/etc/passwd" } })).action,
+		"ask",
+	);
+	check(
+		"scan extracts a declaration-command value",
+		JSON.stringify((await scan("export X=/etc/capture.txt")).operands),
+		JSON.stringify(["/etc/capture.txt"]),
+	);
+	check(
+		"scan extracts a declare value",
+		JSON.stringify((await scan("declare x=/etc/passwd")).operands),
+		JSON.stringify(["/etc/passwd"]),
+	);
+	check(
+		"scan extracts a readonly value",
+		JSON.stringify((await scan("readonly r=/etc/passwd")).operands),
+		JSON.stringify(["/etc/passwd"]),
+	);
+
+	// Redirect destinations are expansion positions too: a destination
+	// that is itself an expansion (process or command substitution, a
+	// parameter) asks, covering both the runtime-named write target and
+	// the process substitution's inner command.
+	check(
+		"a process-substitution redirect destination asks",
+		(await bashGate({ input: { command: "echo hi > >(cp /etc/passwd /tmp/stolen)" } })).action,
+		"ask",
+	);
+	check(
+		"an input process-substitution redirect destination asks",
+		(await bashGate({ input: { command: "echo x > <(cat /etc/passwd)" } })).action,
+		"ask",
+	);
+	check(
+		"a parameter-expansion redirect destination asks",
+		(await bashGate({ input: { command: "out=/etc/passwd; echo x > $out" } })).action,
+		"ask",
+	);
+	check(
+		"a command-substitution redirect destination asks",
+		(await bashGate({ input: { command: "echo x > $(cat namefile)" } })).action,
+		"ask",
+	);
+	check("scan flags substitution in an expansion redirect destination", (await scan("cat > $out")).substitution, true);
+	check(
+		"scan flags substitution in a process-substitution destination",
+		(await scan("echo x > >(tee /etc/passwd)")).substitution,
+		true,
+	);
+
+	// A literal redirect destination is one shell word and extracts
+	// whole (the lexical posture), not split into prose pieces; a bare
+	// number destination is an fd target and extracts nothing.
+	check(
+		"a multi-word quoted redirect destination stays one in-scope word",
+		(await bashGate({ input: { command: 'echo x > "note /etc/passwd"' } })).action,
+		"pass",
+	);
+	check(
+		"scan extracts a redirect destination whole",
+		JSON.stringify((await scan('echo x > "note /etc/passwd"')).operands),
+		JSON.stringify(["note /etc/passwd"]),
+	);
+	check("scan extracts nothing from a numeric redirect destination", JSON.stringify((await scan("echo x > 2")).operands), JSON.stringify([]));
+
+	// --- PISCOPE-2-2 fix round 2 (review 10 findings) --------------------
+	// Substitution was position-enumerated and the fourth unvisited
+	// position (command_name) re-opened the same silent-allow class: a
+	// variable-assembled invocation passed where the lexical scanner's
+	// raw-dollar sighting asked. The remedy is class-level: ONE
+	// position-blind traversal flags substitution for every expansion
+	// node wherever the grammar allows one, so no position can hide an
+	// expansion (command names under command, negation, pipeline, and
+	// subshell parents included); operand extraction stays position-aware
+	// with command_name read for identity (a literal name is identity,
+	// not an operand, the pinned historical posture). The LOW residuals
+	// ride the same round: array declaration values extract their
+	// element pieces exactly as the scalar value does, and the fd-close
+	// operator spellings join the operator table (inert shapes, not
+	// asks).
+	check(
+		"the variable-assembled invocation chain asks",
+		(await bashGate({ input: { command: "c='cat /etc/passwd'\n$c" } })).action,
+		"ask",
+	);
+	check("a bare variable command name asks", (await bashGate({ input: { command: "$c" } })).action, "ask");
+	check(
+		"a command substitution as the command name asks",
+		(await bashGate({ input: { command: "$(cat /etc/passwd)" } })).action,
+		"ask",
+	);
+	check("a backtick command name asks", (await bashGate({ input: { command: "`cat /etc/passwd`" } })).action, "ask");
+	check(
+		"a substitution concatenated into the command name asks",
+		(await bashGate({ input: { command: "$(cat /etc/passwd)x /tmp/out" } })).action,
+		"ask",
+	);
+	check(
+		"a parameter expansion in the command name asks",
+		(await bashGate({ input: { command: "${HOME}bin/tool" } })).action,
+		"ask",
+	);
+	check(
+		"an ANSI-C string command name asks",
+		(await bashGate({ input: { command: "$'cat' /etc/passwd" } })).action,
+		"ask",
+	);
+	check("scan flags a variable command name after a lone assignment", (await scan("c='cat /etc/x'\n$c")).substitution, true);
+	check("scan flags a command-name substitution under negation", (await scan("! $c")).substitution, true);
+	check("scan flags a command-name substitution in a pipeline", (await scan("$c | cat")).substitution, true);
+	check("scan flags a command-name substitution in a subshell", (await scan("($c)")).substitution, true);
+	check(
+		"scan flags a substitution concatenated into the command name",
+		(await scan("$(cat /etc/x)t")).substitution,
+		true,
+	);
+
+	// Array declaration values extract their element pieces exactly as
+	// the scalar value does (the same environment access point), while
+	// the lone array assignment stays inert like the scalar one; an
+	// expansion inside an array value asks.
+	check(
+		"an exported array of absolute paths asks",
+		(await bashGate({ input: { command: "export arr=(/etc/passwd /etc/shadow)" } })).action,
+		"ask",
+	);
+	check(
+		"an exported array with quoted elements asks",
+		(await bashGate({ input: { command: "export arr=(\"/etc/a\" '/etc/b')" } })).action,
+		"ask",
+	);
+	check(
+		"a subscript array element asks",
+		(await bashGate({ input: { command: "export arr=([0]=/etc/capture.txt)" } })).action,
+		"ask",
+	);
+	check(
+		"scan extracts array element pieces like the scalar value",
+		JSON.stringify((await scan("export arr=(/etc/capture.txt)")).operands),
+		JSON.stringify(["/etc/capture.txt"]),
+	);
+	check(
+		"scan extracts quoted array elements in order",
+		JSON.stringify((await scan("export arr=(\"/etc/a\" '/etc/b')")).operands),
+		JSON.stringify(["/etc/a", "/etc/b"]),
+	);
+	check(
+		"scan extracts a subscript array element value",
+		JSON.stringify((await scan("export arr=([0]=/etc/capture.txt)")).operands),
+		JSON.stringify(["/etc/capture.txt"]),
+	);
+	check("scan flags an expansion inside an array value", (await scan("arr=($(cat /etc/x))")).substitution, true);
+	check(
+		"a lone array assignment passes like the scalar one",
+		(await bashGate({ input: { command: "arr=(/etc/passwd)" } })).action,
+		"pass",
+	);
+
+	// The fd-close operator spellings are inert (a closed descriptor
+	// names no path) and sit in the operator table, so they neither ask
+	// nor read as unmodeled destination shapes.
+	check("an input fd close passes", (await bashGate({ input: { command: "cat <&-" } })).action, "pass");
+	check("an output fd close passes", (await bashGate({ input: { command: "echo ok 2>&-" } })).action, "pass");
+	check("an fd-prefixed close passes", (await bashGate({ input: { command: "echo x 3>&-" } })).action, "pass");
+
+	// The continuation join is bash-exact: bash removes the
+	// backslash-newline pair and splits the remainder on whitespace, so
+	// only the bare pair glues the words; an indented continuation or a
+	// space before the backslash leaves two words, each gated on its own
+	// text. A \r spelling is not the pair (bash escapes the carriage
+	// return and the newline still separates).
+	check(
+		"an indented continuation cannot hide an absolute operand",
+		(await bashGate({ input: { command: "cat foo\\\n   /etc/passwd" } })).action,
+		"ask",
+	);
+	check(
+		"a spaced continuation cannot hide an absolute operand",
+		(await bashGate({ input: { command: "cat foo \\\n/etc/passwd" } })).action,
+		"ask",
+	);
+	check(
+		"a glued in-scope continuation passes",
+		(await bashGate({ input: { command: "cat foo\\\ninside/file.txt" } })).action,
+		"pass",
+	);
+	check(
+		"scan reads an indented continuation as two words",
+		JSON.stringify((await scan("cat foo\\\n   /etc/passwd")).operands),
+		JSON.stringify(["/etc/passwd"]),
+	);
+	check(
+		"scan keeps a CRLF continuation split",
+		JSON.stringify((await scan("cat foo\\\r\nbar")).operands),
+		JSON.stringify([]),
+	);
+	// --- PISCOPE-2-2 fix round 3 (advisor memo 15) -----------------------
+	// The verdict assembly, not the traversal, was the open seam: the
+	// executor corner erased a true substitution flag for dollar-free
+	// expansion spellings. An executor command carrying a process
+	// substitution passed with zero operands while the substitution's
+	// inner command ran ungated, because the substitution branch carried
+	// an executor carve-out and the final return hardcoded the flag
+	// false. The traversal always flagged these trees correctly; the
+	// pins hold all ten memo spellings asking at the gate plus the
+	// scan-level flag surviving the executor corner, while the interposed
+	// wrapper branch that always preserved the flag stays pinned. DC-1
+	// rides the same round: PROMPT_COMMAND and BASH_ENV are env-var-
+	// carried execution vectors (the prompt hook and the non-interactive
+	// startup file), so an assignment in any posture or an env spelling
+	// carrying those names floors to ask regardless of value shape,
+	// while a plain argument merely mentioning a name stays inert.
+	check(
+		"an executor command with an input process substitution asks",
+		(await bashGate({ input: { command: "bash -c 'true' <(cat /etc/passwd)" } })).action,
+		"ask",
+	);
+	check(
+		"an executor command with a login-flag payload and an input process substitution asks",
+		(await bashGate({ input: { command: "bash -lc 'true' <(cat /etc/passwd)" } })).action,
+		"ask",
+	);
+	check(
+		"an executor command with an output process substitution asks",
+		(await bashGate({ input: { command: "bash -c 'true' >(cat /etc/passwd)" } })).action,
+		"ask",
+	);
+	check(
+		"an executor command with a redirect-destination process substitution asks",
+		(await bashGate({ input: { command: "bash -c 'true' > <(cat /etc/passwd)" } })).action,
+		"ask",
+	);
+	check(
+		"an executor command with a nested process substitution asks",
+		(await bashGate({ input: { command: "bash -c 'true' <(cat <(cat /etc/passwd))" } })).action,
+		"ask",
+	);
+	check(
+		"a su executor command with a process substitution asks",
+		(await bashGate({ input: { command: "su -c 'true' <(cat /etc/passwd)" } })).action,
+		"ask",
+	);
+	check(
+		"an ssh executor command with a process substitution asks",
+		(await bashGate({ input: { command: "ssh host 'true' <(cat /etc/passwd)" } })).action,
+		"ask",
+	);
+	check(
+		"an eval executor command with a process substitution asks",
+		(await bashGate({ input: { command: "eval <(cat /etc/passwd)" } })).action,
+		"ask",
+	);
+	check(
+		"an executor command with a writing process substitution asks",
+		(await bashGate({ input: { command: "bash -c 'true' <(cp /etc/passwd /tmp/stolen)" } })).action,
+		"ask",
+	);
+	check(
+		"an executor command with an output-bearing process substitution asks",
+		(await bashGate({ input: { command: "bash -c 'echo hi' <(cp /etc/a /etc/b)" } })).action,
+		"ask",
+	);
+	check("the substitution flag survives the executor corner", (await scan("bash -c 'true' <(cat /etc/passwd)")).substitution, true);
+	check(
+		"an interposed executor with a process substitution still asks through the wrapper",
+		(await bashGate({ input: { command: "env bash -c 'true' <(cat /etc/passwd)" } })).action,
+		"ask",
+	);
+
+	// DC-1: the env-var-carried execution vectors floor to ask. The
+	// value's shape proves nothing about when bash will run it, so the
+	// floor keys on the name in assignment posture (lone, command
+	// prefix, declaration, append, and subscript forms ride the same
+	// variable_name read) or in env spelling, never on the value.
+	check(
+		"a lone prompt-hook assignment asks regardless of its payload",
+		(await bashGate({ input: { command: "PROMPT_COMMAND='cat /etc/passwd'" } })).action,
+		"ask",
+	);
+	checkContains(
+		"the prompt-hook ask names the vector",
+		String((await bashGate({ input: { command: "PROMPT_COMMAND='cat /etc/passwd'" } })).title ?? ""),
+		"PROMPT_COMMAND",
+	);
+	check(
+		"a lone startup-file assignment asks",
+		(await bashGate({ input: { command: "BASH_ENV=/etc/evil.sh" } })).action,
+		"ask",
+	);
+	check(
+		"a prompt-hook assignment with a benign value still asks",
+		(await bashGate({ input: { command: "PROMPT_COMMAND=echo hi" } })).action,
+		"ask",
+	);
+	check(
+		"an exported prompt-hook assignment asks",
+		(await bashGate({ input: { command: "export PROMPT_COMMAND='x'" } })).action,
+		"ask",
+	);
+	check(
+		"an env spelling carrying a vector name asks",
+		(await bashGate({ input: { command: "env PROMPT_COMMAND=x cat file" } })).action,
+		"ask",
+	);
+	check(
+		"a prefix vector assignment on an executor command asks",
+		(await bashGate({ input: { command: "FOO=1 BASH_ENV=x bash -c 'true'" } })).action,
+		"ask",
+	);
+	check("scan names the vector for a prefix assignment", (await scan("PROMPT_COMMAND=x cat file")).envVector, "PROMPT_COMMAND");
+	check("scan names the vector for a lone startup-file assignment", (await scan("BASH_ENV=/etc/evil.sh")).envVector, "BASH_ENV");
+	check(
+		"a plain argument mentioning a vector name passes",
+		(await bashGate({ input: { command: "cat PROMPT_COMMAND" } })).action,
+		"pass",
+	);
+	check(
+		"a prose mention of a vector assignment passes",
+		(await bashGate({ input: { command: "echo PROMPT_COMMAND=x" } })).action,
+		"pass",
+	);
+
+	// --- PISCOPE-2-2 fix round 4 (advisor confirmation memo 19) ----------
+	// Three surviving HIGH swap regressions. One: the executor payload
+	// pieces ride their inner quote and backslash characters, so
+	// `bash -c 'cat "/etc/passwd"'` extracted a quote-leading piece the
+	// verdict core resolved as a cwd-relative in-scope name while the
+	// child shell stripped the quoting and opened the real absolute
+	// path; extraction now reproduces the child's word split at executor
+	// shapes (quote characters are word boundaries and are dropped,
+	// outside-quote escapes consume the escaped character), the
+	// splitQuotes posture the swap retired. Two: the deferred-execution
+	// floor widens from its two names to the full hijackable family
+	// (ZDOTDIR and ENV source shell startup files, LD_PRELOAD loads into
+	// the next exec, PS4 executes under xtrace, PATH redirects
+	// executable lookup). Three: the stdin-script seam is in-tree, so a
+	// shell/su/ssh/eval head whose statement carries a heredoc_redirect
+	// or herestring_redirect extracts the body's words exactly as it
+	// extracts payload words, while a non-shell consumer's heredoc stays
+	// data.
+	check(
+		"an executor payload with a double-quoted path asks",
+		(await bashGate({ input: { command: `bash -c 'cat "/etc/passwd"'` } })).action,
+		"ask",
+	);
+	check(
+		"an executor payload with a single-quoted path asks",
+		(await bashGate({ input: { command: `bash -c "cat '/etc/passwd'"` } })).action,
+		"ask",
+	);
+	check(
+		"an executor payload with backslash-escaped slashes asks",
+		(await bashGate({ input: { command: `bash -c 'cat \\\/etc\\/passwd'` } })).action,
+		"ask",
+	);
+	check(
+		"a single-quote-glued payload with an inner-quoted path asks",
+		(await bashGate({ input: { command: `bash -c'cat "/etc/passwd"'` } })).action,
+		"ask",
+	);
+	check(
+		"a double-quote-glued payload with a single-quoted path asks",
+		(await bashGate({ input: { command: `bash -c"cat '/etc/passwd'"` } })).action,
+		"ask",
+	);
+	check(
+		"an executor payload read-and-write with both paths quoted asks",
+		(await bashGate({ input: { command: `bash -c 'cat "/etc/shadow" > "/home/khave/stolen"'` } })).action,
+		"ask",
+	);
+	check(
+		"a su executor payload with an inner-quoted path asks",
+		(await bashGate({ input: { command: `su -c 'cat "/etc/passwd"' root` } })).action,
+		"ask",
+	);
+	check(
+		"an ssh executor payload with an inner-quoted path asks",
+		(await bashGate({ input: { command: `ssh host 'cat "/etc/passwd"'` } })).action,
+		"ask",
+	);
+	check(
+		"an eval executor write payload with both paths quoted asks",
+		(await bashGate({ input: { command: `eval 'cat "/etc/passwd" > "/etc/stolen-eval"'` } })).action,
+		"ask",
+	);
+	check(
+		"a path-qualified executor payload with an inner-quoted path asks",
+		(await bashGate({ input: { command: `/bin/bash -c 'cat "/etc/passwd"'` } })).action,
+		"ask",
+	);
+	check(
+		"a login-cluster executor payload with an inner-quoted path asks",
+		(await bashGate({ input: { command: `bash -lc 'cat "/etc/passwd"'` } })).action,
+		"ask",
+	);
+	check(
+		"an interactive-cluster executor payload with an inner-quoted path asks",
+		(await bashGate({ input: { command: `bash -ic 'cat "/etc/passwd"'` } })).action,
+		"ask",
+	);
+	check(
+		"a zsh executor payload with an inner-quoted path asks",
+		(await bashGate({ input: { command: `zsh -c 'cat "/etc/passwd"'` } })).action,
+		"ask",
+	);
+	check(
+		"an executor cd payload with a quoted target asks",
+		(await bashGate({ input: { command: `bash -c 'cd "/etc"'` } })).action,
+		"ask",
+	);
+	check(
+		"scan splits the quoted executor payload into the clean path",
+		JSON.stringify((await scan(`bash -c 'cat "/etc/passwd"'`)).operands),
+		JSON.stringify(["/etc/passwd"]),
+	);
+	check(
+		"scan extracts both clean paths from the quoted read-and-write payload",
+		JSON.stringify((await scan(`bash -c 'cat "/etc/shadow" > "/home/khave/stolen"'`)).operands),
+		JSON.stringify(["/etc/shadow", "/home/khave/stolen"]),
+	);
+	check(
+		"an executor payload with no path-like words passes",
+		(await bashGate({ input: { command: `bash -c 'echo hi'` } })).action,
+		"pass",
+	);
+	check(
+		"a trace-variable assignment asks",
+		(await bashGate({ input: { command: `PS4='$(cat /etc/passwd)'; set -x; ls` } })).action,
+		"ask",
+	);
+	check("scan names the trace vector", (await scan(`PS4='$(cat /etc/passwd)'; set -x; ls`)).envVector, "PS4");
+	check(
+		"a lone lookup-path assignment asks",
+		(await bashGate({ input: { command: "PATH=/etc/evil; ls" } })).action,
+		"ask",
+	);
+	check("scan names the lookup-path vector", (await scan("PATH=/etc/evil; ls")).envVector, "PATH");
+	check(
+		"a lone startup-directory assignment asks",
+		(await bashGate({ input: { command: "ZDOTDIR=/etc/evil; zsh -c true" } })).action,
+		"ask",
+	);
+	check("scan names the zsh-startup vector", (await scan("ZDOTDIR=/etc/evil; zsh -c true")).envVector, "ZDOTDIR");
+	check(
+		"a lone dash-startup assignment asks",
+		(await bashGate({ input: { command: "ENV=/etc/evil.sh; dash -i" } })).action,
+		"ask",
+	);
+	check("scan names the dash-startup vector", (await scan("ENV=/etc/evil.sh; dash -i")).envVector, "ENV");
+	check(
+		"a lone loader-preload assignment asks",
+		(await bashGate({ input: { command: "set -a; LD_PRELOAD=/tmp/evil.so; ls" } })).action,
+		"ask",
+	);
+	check("scan names the loader-preload vector", (await scan("set -a; LD_PRELOAD=/tmp/evil.so; ls")).envVector, "LD_PRELOAD");
+	check(
+		"an exported startup-directory assignment asks",
+		(await bashGate({ input: { command: "export ZDOTDIR=/etc/evil" } })).action,
+		"ask",
+	);
+	check("scan names the vector for an exported startup-directory assignment", (await scan("export ZDOTDIR=/etc/evil")).envVector, "ZDOTDIR");
+	check(
+		"a declared startup-file assignment asks",
+		(await bashGate({ input: { command: "declare -x ENV=/etc/evil.sh" } })).action,
+		"ask",
+	);
+	check("scan names the vector for a declared startup-file assignment", (await scan("declare -x ENV=/etc/evil.sh")).envVector, "ENV");
+	check(
+		"a prefix loader-preload assignment asks",
+		(await bashGate({ input: { command: "LD_PRELOAD=/tmp/evil.so ls" } })).action,
+		"ask",
+	);
+	check("scan names the vector for a prefix loader-preload assignment", (await scan("LD_PRELOAD=/tmp/evil.so ls")).envVector, "LD_PRELOAD");
+	check(
+		"an env spelling carrying a startup-directory name asks",
+		(await bashGate({ input: { command: "env ZDOTDIR=/etc/evil zsh -i" } })).action,
+		"ask",
+	);
+	check("scan names the vector in env spelling", (await scan("env ZDOTDIR=/etc/evil zsh -i")).envVector, "ZDOTDIR");
+	check(
+		"a prefix lookup-path assignment asks",
+		(await bashGate({ input: { command: "PATH=/etc/evil ls" } })).action,
+		"ask",
+	);
+	check("scan names the vector for a prefix lookup-path assignment", (await scan("PATH=/etc/evil ls")).envVector, "PATH");
+	check(
+		"a prose mention of a lookup-path assignment passes",
+		(await bashGate({ input: { command: "echo PATH=x" } })).action,
+		"pass",
+	);
+	check(
+		"a plain argument mentioning a loader name passes",
+		(await bashGate({ input: { command: "cat LD_PRELOAD" } })).action,
+		"pass",
+	);
+	check(
+		"a shell heredoc body carrying an out-of-scope read asks",
+		(await bashGate({ input: { command: "bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"scan extracts the shell heredoc body's words",
+		JSON.stringify((await scan("bash << EOF\ncat /etc/passwd\nEOF")).operands),
+		JSON.stringify(["/etc/passwd"]),
+	);
+	check(
+		"a quoted-delimiter shell heredoc body carrying an out-of-scope read asks",
+		(await bashGate({ input: { command: "bash << 'EOF'\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a shell stdin-script heredoc through -s asks",
+		(await bashGate({ input: { command: "bash -s << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"an executor compound shell heredoc asks",
+		(await bashGate({ input: { command: "bash -c 'sh' << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a shell heredoc body carrying an out-of-scope write asks",
+		(await bashGate({ input: { command: "bash << EOF\necho x > /etc/evil\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"scan extracts the heredoc body's write target",
+		JSON.stringify((await scan("bash << EOF\necho x > /etc/evil\nEOF")).operands),
+		JSON.stringify(["/etc/evil"]),
+	);
+	check(
+		"a zsh heredoc body carrying an out-of-scope read asks",
+		(await bashGate({ input: { command: "zsh << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a su stdin-script heredoc asks",
+		(await bashGate({ input: { command: "su user << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"an ssh stdin-script heredoc asks",
+		(await bashGate({ input: { command: "ssh host << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"an eval stdin-script heredoc asks",
+		(await bashGate({ input: { command: "eval 'cat' << EOF\n/etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a compound-headed shell heredoc asks",
+		(await bashGate({ input: { command: "{ bash; } << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a subshell-wrapped shell heredoc asks",
+		(await bashGate({ input: { command: "( bash << EOF\ncat /etc/passwd\nEOF )" } })).action,
+		"ask",
+	);
+	check(
+		"a here-string carrying an inner-quoted path asks",
+		(await bashGate({ input: { command: `bash <<< 'cat "/etc/passwd"'` } })).action,
+		"ask",
+	);
+	check(
+		"a here-string carrying a clean path still asks",
+		(await bashGate({ input: { command: `bash <<< 'cat /etc/passwd'` } })).action,
+		"ask",
+	);
+	check(
+		"a here-string carrying an out-of-scope write still asks",
+		(await bashGate({ input: { command: `bash <<< 'echo x > /etc/evil'` } })).action,
+		"ask",
+	);
+	check(
+		"a non-shell consumer's heredoc body stays data",
+		(await bashGate({ input: { command: "cat << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"pass",
+	);
+	check(
+		"a non-shell consumer's here-string still extracts its value",
+		(await bashGate({ input: { command: `echo hi <<< 'cat /etc/passwd'` } })).action,
+		"ask",
+	);
+
+	// loop-hardening pins (review pass, iteration 1): the seam's head
+	// read missed two stdin-consumer shapes. A wrapper hides the shell
+	// (`command bash << EOF` runs bash on the body) and the executor
+	// detection posture already looks past interposer words, so the
+	// head read strips them; a pipeline child reads its LAST stage
+	// because the statement's stdin feeds the pipeline's end.
+	check(
+		"a wrapper-hidden shell heredoc body asks",
+		(await bashGate({ input: { command: "command bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a nohup-hidden shell heredoc body asks",
+		(await bashGate({ input: { command: "nohup bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a pipeline whose last stage is a shell reads the heredoc body as its script",
+		(await bashGate({ input: { command: "cat x | bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a pipeline whose last stage is not a shell keeps the heredoc body as data",
+		(await bashGate({ input: { command: "bash | cat << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"pass",
+	);
+	check(
+		"a wrapper over a non-shell head keeps the heredoc body as data",
+		(await bashGate({ input: { command: "command cat << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"pass",
+	);
+	check(
+		"a wrapper-hidden shell here-string with an inner-quoted path asks",
+		(await bashGate({ input: { command: `command bash <<< 'cat "/etc/passwd"'` } })).action,
+		"ask",
+	);
+
+	// --- PISCOPE-2-2 fix round 5 (review 22 seam gaps + advisor memo 23) --
+	// Four gap classes, all live-confirmed passing before this round. One:
+	// the seam's wrapper strip stopped at the first non-interposer
+	// argument, so any flag, assignment, or duration between the wrapper
+	// and the shell (env -i, env NAME=x, env -u, env long flags, timeout
+	// 5s, timeout --foreground, nice -n 5, chained spellings, the
+	// pipeline-end crossover) left the heredoc and here-string seams
+	// inactive and the body ran ungated. The head read now scans every
+	// argument token for the stdin-script identity, the same full-stream
+	// look executor detection uses. Two: the seam lacked the executor
+	// corner's raw-dollar backstop, so a dollar the grammar cannot see
+	// (quoted-delimiter bodies, quoted here-string values, escaped
+	// dollars) assembled the real path inside the child shell; a
+	// seam-active body or value whose raw text carries $ or a backtick
+	// now biases to substitution. Three: exec replaces the process with
+	// its argument, so it joins the interposer strip (the head read sees
+	// through it, and an executor shape behind it floors to ask), and
+	// LD_AUDIT and LD_LIBRARY_PATH join the deferred-execution floor as
+	// the loader family of LD_PRELOAD. Four (advisor memo 23 Q1): the
+	// executor detection keyed on the command's own name, so a
+	// non-vocabulary prefix (sudo, strace, xargs, setsid, watch) hid a
+	// prefixed executor payload from the re-split while the lexical
+	// baseline asked; detection is now position-independent over the
+	// command's token stream, so a prefixed payload gates identically to
+	// the bare spelling.
+	check(
+		"an env -i wrapper heredoc body carrying an out-of-scope read asks",
+		(await bashGate({ input: { command: "env -i bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"an env -i wrapper heredoc body carrying a quoted read-and-write asks",
+		(await bashGate({ input: { command: `env -i bash << EOF\ncat \"/etc/shadow\" > \"/home/khave/stolen\"\nEOF` } })).action,
+		"ask",
+	);
+	check(
+		"scan reads the stdin-script head through env -i",
+		JSON.stringify((await scan("env -i bash << EOF\ncat /etc/passwd\nEOF")).operands),
+		JSON.stringify(["/etc/passwd"]),
+	);
+	check(
+		"an env assignment wrapper heredoc body asks",
+		(await bashGate({ input: { command: "env FOO=bar bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"an env -u wrapper heredoc body asks",
+		(await bashGate({ input: { command: "env -u X bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"an env long-flag wrapper heredoc body asks",
+		(await bashGate({ input: { command: "env --ignore-environment bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a word-duration timeout wrapper heredoc body asks",
+		(await bashGate({ input: { command: "timeout 5s bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a long-flag timeout wrapper heredoc body asks",
+		(await bashGate({ input: { command: "timeout --foreground 5 bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a nice -n wrapper heredoc body asks",
+		(await bashGate({ input: { command: "nice -n 5 bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a chained wrapper-argument heredoc body asks",
+		(await bashGate({ input: { command: "nohup nice -n 5 bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a pipeline-end wrapper-argument heredoc body asks",
+		(await bashGate({ input: { command: "cat x | env -i bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a wrapper-argument here-string with an inner-quoted path asks",
+		(await bashGate({ input: { command: `env -i bash <<< 'cat \"/etc/passwd\"'` } })).action,
+		"ask",
+	);
+	check(
+		"scan splits the wrapper-argument here-string into the clean path",
+		JSON.stringify((await scan(`env -i bash <<< 'cat \"/etc/passwd\"'`)).operands),
+		JSON.stringify(["/etc/passwd"]),
+	);
+	check(
+		"a quoted-delimiter heredoc body with a dollar-assembled path asks",
+		(await bashGate({ input: { command: "bash << 'EOF'\ncat $HOME/secret\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a here-string with a dollar-assembled path asks",
+		(await bashGate({ input: { command: `bash <<< 'cat $HOME/secret'` } })).action,
+		"ask",
+	);
+	check(
+		"the seam dollar backstop biases a quoted-literal body to substitution",
+		(await scan("bash << 'EOF'\ncat $HOME/secret\nEOF")).substitution,
+		true,
+	);
+	check(
+		"the seam dollar backstop biases a quoted here-string value to substitution",
+		(await scan(`bash <<< 'cat $HOME/secret'`)).substitution,
+		true,
+	);
+	check(
+		"a dollar-indirection heredoc body asks",
+		(await bashGate({ input: { command: "f=/etc/passwd; bash <<'EOF'\ncat $f\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a dollar-indirection here-string asks",
+		(await bashGate({ input: { command: `f=/etc/passwd; bash <<< 'cat $f'` } })).action,
+		"ask",
+	);
+	check(
+		"an escaped-dollar heredoc body asks",
+		(await bashGate({ input: { command: "bash << EOF\ncat \\$HOME/secret\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a su heredoc body with a dollar-assembled path asks",
+		(await bashGate({ input: { command: "su user << 'EOF'\ncat $HOME/secret\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"an exec-headed heredoc body carrying a quoted read-and-write asks",
+		(await bashGate({ input: { command: `exec bash << EOF\ncat \"/etc/shadow\" > \"/home/khave/stolen\"\nEOF` } })).action,
+		"ask",
+	);
+	check(
+		"an exec-headed here-string with an inner-quoted path asks",
+		(await bashGate({ input: { command: `exec bash <<< 'cat \"/etc/passwd\"'` } })).action,
+		"ask",
+	);
+	check(
+		"an exec-headed executor payload with an inner-quoted path asks",
+		(await bashGate({ input: { command: `exec sh -c 'cat \"/etc/passwd\"'` } })).action,
+		"ask",
+	);
+	check(
+		"an exec-prefixed clean executor payload asks (the disclosed interposer over-ask)",
+		(await bashGate({ input: { command: `exec bash -c 'echo hi'` } })).action,
+		"ask",
+	);
+	check(
+		"a lone loader-audit assignment asks",
+		(await bashGate({ input: { command: "LD_AUDIT=/tmp/evil.so; ls" } })).action,
+		"ask",
+	);
+	check(
+		"a lone library-path assignment asks",
+		(await bashGate({ input: { command: "LD_LIBRARY_PATH=/tmp/evil; ls" } })).action,
+		"ask",
+	);
+	check("scan names the loader-audit vector", (await scan("LD_AUDIT=/tmp/evil.so; ls")).envVector, "LD_AUDIT");
+	check(
+		"scan names the library-path vector",
+		(await scan("LD_LIBRARY_PATH=/tmp/evil; ls")).envVector,
+		"LD_LIBRARY_PATH",
+	);
+	check(
+		"a sudo-prefixed executor payload with an inner-quoted path asks",
+		(await bashGate({ input: { command: `sudo bash -c 'cat \"/etc/passwd\"'` } })).action,
+		"ask",
+	);
+	check(
+		"a sudo-prefixed executor payload read-and-write with both paths quoted asks",
+		(await bashGate({ input: { command: `sudo bash -c 'cat \"/etc/shadow\" > \"/home/khave/stolen\"'` } })).action,
+		"ask",
+	);
+	check(
+		"scan splits the sudo-prefixed quoted payload into the clean path identically",
+		JSON.stringify((await scan(`sudo bash -c 'cat \"/etc/passwd\"'`)).operands),
+		JSON.stringify(["/etc/passwd"]),
+	);
+	check(
+		"scan extracts both clean paths from the sudo-prefixed read-and-write payload",
+		JSON.stringify((await scan(`sudo bash -c 'cat \"/etc/shadow\" > \"/home/khave/stolen\"'`)).operands),
+		JSON.stringify(["/etc/shadow", "/home/khave/stolen"]),
+	);
+	check(
+		"a strace-prefixed executor payload with an inner-quoted path asks",
+		(await bashGate({ input: { command: `strace bash -c 'cat \"/etc/passwd\"'` } })).action,
+		"ask",
+	);
+	check(
+		"an xargs-prefixed executor payload with an inner-quoted path asks",
+		(await bashGate({ input: { command: `xargs bash -c 'cat \"/etc/passwd\"'` } })).action,
+		"ask",
+	);
+	check(
+		"a setsid-prefixed executor payload with an inner-quoted path asks",
+		(await bashGate({ input: { command: `setsid bash -c 'cat \"/etc/passwd\"'` } })).action,
+		"ask",
+	);
+	check(
+		"a watch-prefixed executor payload with an inner-quoted path asks",
+		(await bashGate({ input: { command: `watch bash -c 'cat \"/etc/passwd\"'` } })).action,
+		"ask",
+	);
+	check(
+		"a sudo-prefixed su executor payload with an inner-quoted path asks",
+		(await bashGate({ input: { command: `sudo su -c 'cat \"/etc/passwd\"'` } })).action,
+		"ask",
+	);
+	check(
+		"an exec-headed plain command keeps its operands as the only gate",
+		(await bashGate({ input: { command: "exec ls" } })).action,
+		"pass",
+	);
+	check(
+		"an exec-headed command with an in-scope operand passes",
+		(await bashGate({ input: { command: "exec cat inside/file.txt" } })).action,
+		"pass",
+	);
+	check(
+		"a quoted-delimiter data heredoc body carrying dollars stays data",
+		(await bashGate({ input: { command: "cat << 'EOF'\ncat $HOME/secret\nEOF" } })).action,
+		"pass",
+	);
+	check(
+		"a non-shell here-string value with a dollar-assembled path keeps the generic posture",
+		(await bashGate({ input: { command: `echo hi <<< 'cat $HOME/secret'` } })).action,
+		"pass",
+	);
+	check(
+		"a number-duration timeout wrapper heredoc body still asks",
+		(await bashGate({ input: { command: "timeout 5 bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a prefix loader-audit assignment still gates on its value",
+		(await bashGate({ input: { command: "LD_AUDIT=/tmp/evil.so ls" } })).action,
+		"ask",
+	);
+	check(
+		"a backtick quoted-delimiter heredoc body still asks",
+		(await bashGate({ input: { command: "bash << 'EOF'\necho `cat /etc/passwd`\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"an ssh heredoc body with a dollar-assembled path still asks",
+		(await bashGate({ input: { command: "ssh host << 'EOF'\ncat $HOME/secret\nEOF" } })).action,
+		"ask",
+	);
+
+	// loop-hardening pins (review pass, iteration 1): redirect-only exec
+	// (no argument) applies its redirections to the current shell, so a
+	// later command in the same string reads the attached body as its
+	// stdin script; exec joins the stdin-script identity family, which
+	// only bites in the no-argument fallback (the strip's argument
+	// short-circuit still names the real program whenever exec carries
+	// one).
+	check(
+		"a redirect-only exec heredoc body followed by a shell asks",
+		(await bashGate({ input: { command: "exec << EOF\ncat /etc/passwd\nEOF\nbash" } })).action,
+		"ask",
+	);
+	check(
+		"a redirect-only exec heredoc body asks on its own",
+		(await bashGate({ input: { command: "exec << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a quoted redirect-only exec heredoc body with a dollar path asks",
+		(await bashGate({ input: { command: "exec << 'EOF'\ncat $HOME/secret\nEOF\nbash" } })).action,
+		"ask",
+	);
+	check(
+		"an exec-headed non-shell command keeps the heredoc body as data",
+		(await bashGate({ input: { command: "exec ls << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"pass",
+	);
+
+	// the async decision seam: parser unavailability degrades to ask
+	// (UI) or an actionable block (headless), never a silent allow, and
+	// the scan surface is injectable the way the seal is.
+	const rejectingScan = async () => {
+		throw new Error("wasm load failed");
+	};
+	check(
+		"parser unavailability asks every bash call",
+		(await bashGate({ input: { command: "echo hello" }, scan: rejectingScan })).action,
+		"ask",
+	);
+	checkContains(
+		"the parser-unavailable ask names the failure",
+		(await bashGate({ input: { command: "echo hello" }, scan: rejectingScan })).title,
+		"parser is unavailable",
+	);
+	check(
+		"parser unavailability blocks headless",
+		(await bashGate({ input: { command: "echo hello" }, scan: rejectingScan, hasUI: false })).action,
+		"block",
+	);
+	check(
+		"parser unavailability carries no grant candidate",
+		(await bashGate({ input: { command: "cat /etc/passwd" }, scan: rejectingScan })).grantCandidate,
+		undefined,
+	);
+	check(
+		"the injected scanner surface drives the decision verbatim",
+		(
+			await bashGate({
+				input: { command: "anything" },
+				scan: async () => ({ substitution: false, executor: false, interposed: null, bail: false, cdAsk: null, operands: ["/etc/passwd"] }),
+			})
+		).action,
+		"ask",
 	);
 
 	// --- parent-own grant recorder: unit 1-2 wiring ----------------------
@@ -2185,7 +3309,7 @@ try {
 		seal: cleanSeal,
 	});
 	check("the path ask decision carries the grant candidate", candidateDecision.grantCandidate, outFile);
-	const bashCandidateDecision = decideBashToolCall({
+	const bashCandidateDecision = await decideBashToolCall({
 		toolName: "bash",
 		input: { command: `cat ${outFile}` },
 		sessionCwd: cwdDir,
@@ -2194,7 +3318,7 @@ try {
 		seal: cleanSeal,
 	});
 	check("the bash operand ask decision carries the grant candidate", bashCandidateDecision.grantCandidate, outFile);
-	const bashSubstitutionDecision = decideBashToolCall({
+	const bashSubstitutionDecision = await decideBashToolCall({
 		toolName: "bash",
 		input: { command: "echo $HOME/secret" },
 		sessionCwd: cwdDir,
@@ -2207,7 +3331,7 @@ try {
 		bashSubstitutionDecision.grantCandidate,
 		undefined,
 	);
-	const bashCdDecision = decideBashToolCall({
+	const bashCdDecision = await decideBashToolCall({
 		toolName: "bash",
 		input: { command: "cd" },
 		sessionCwd: cwdDir,
@@ -2322,7 +3446,7 @@ try {
 		true,
 	);
 	checkContains("the ask evidence explains the policy breach", fwdPathHeadless.askEvidence ?? "", "allowed");
-	const fwdBashHeadless = decideBashToolCall({
+	const fwdBashHeadless = await decideBashToolCall({
 		toolName: "bash",
 		input: { command: "cat /etc/hostname" },
 		sessionCwd: fwdCwd,
@@ -2346,7 +3470,7 @@ try {
 	});
 	check("a degraded headless block carries no grant candidate", fwdDegradedPath.grantCandidate, undefined);
 	checkContains("a degraded headless block still explains itself", fwdDegradedPath.askEvidence ?? "", "degraded");
-	const fwdDegradedBash = decideBashToolCall({
+	const fwdDegradedBash = await decideBashToolCall({
 		toolName: "bash",
 		input: { command: "cat /etc/hostname" },
 		sessionCwd: fwdCwd,
@@ -2355,7 +3479,7 @@ try {
 		seal: fwdDegradedSeal,
 	});
 	check("a degraded headless bash block carries no grant candidate", fwdDegradedBash.grantCandidate, undefined);
-	const fwdSubstitution = decideBashToolCall({
+	const fwdSubstitution = await decideBashToolCall({
 		toolName: "bash",
 		input: { command: "echo $HOME/secret" },
 		sessionCwd: fwdCwd,
@@ -2676,6 +3800,141 @@ check("repeat loads resolve to the same memoized parser instance", (await loadBa
 	check("a rejected load is dropped and the next call retries the factory", factoryRuns === 2, true);
 	check("the retried load resolves the fresh factory result", retried?.marker, 2);
 	check("a resolved load stays memoized without re-running the factory", factoryRuns === 2 && (await retrying()) === retried, true);
+}
+
+// --- PISCOPE-2-2: the fence-ast hardening surfaces ------------------
+// The advisory obligations folded into the detection-layer swap: the
+// tree-lifetime helper (DC-2), the bounded init budget (DC-1), and the
+// digest-before-import ordering (advisor R2, the engine entry is
+// executable code and the grammar wasm load path can evaluate embedded
+// JS, so no vendored byte may load before its pin verifies). The
+// module-type pin (DC-3) walks the in-repo manifest chain above the
+// vendored entry; the deployed agent-root walk is discharged by unit
+// PISCOPE-2-3's landing evidence.
+
+check(
+	"the parser init budget is a positive bounded constant",
+	typeof BASH_PARSER_INIT_TIMEOUT_MS === "number" && BASH_PARSER_INIT_TIMEOUT_MS > 0,
+	true,
+);
+{
+	let hungRejected = false;
+	try {
+		await withInitBudget(new Promise(() => {}), 40);
+	} catch {
+		hungRejected = true;
+	}
+	check("a hung init rejects within the budget instead of stalling", hungRejected, true);
+	check("a settling init passes the budget unchanged", await withInitBudget(Promise.resolve("ok"), 40), "ok");
+	let factoryRuns = 0;
+	const healing = memoizeAsyncWithRetry(() => {
+		factoryRuns += 1;
+		if (factoryRuns === 1) return withInitBudget(new Promise(() => {}), 30);
+		return Promise.resolve("healed");
+	});
+	let budgetRejected = false;
+	try {
+		await healing();
+	} catch {
+		budgetRejected = true;
+	}
+	check("a hung first init rejects through the budget, not the hang", budgetRejected, true);
+	check("a budget-rejected init does not poison the memo and heals on retry", await healing(), "healed");
+}
+{
+	const rootType = await withBashParse("cat /etc/secrets", (rootNode) => rootNode.type);
+	check("withBashParse runs the body over the parsed root and returns its result", rootType, "program");
+	let bodyThrew = false;
+	try {
+		await withBashParse("cat /etc/secrets", () => {
+			throw new Error("body failure");
+		});
+	} catch {
+		bodyThrew = true;
+	}
+	check("a body throw propagates out of withBashParse", bodyThrew, true);
+	check(
+		"the parser stays usable after a body throw (the tree was still released)",
+		await withBashParse("cat /etc/secrets", (rootNode) => rootNode.type),
+		"program",
+	);
+	let allParsed = true;
+	for (const command of ["echo hi", "cat << EOF\nbody\nEOF", "(echo hi)", "echo 'unterminated", "echo \\'; cat \"$HOME/x\""]) {
+		const type = await withBashParse(command, (rootNode) => rootNode.type);
+		if (type !== "program") allParsed = false;
+	}
+	check("withBashParse serves every verdict-branch shape without losing the parser", allParsed, true);
+}
+{
+	let verified = "threw";
+	try {
+		verifyGrammarArtifacts();
+		verified = "clean";
+	} catch {
+		verified = "threw";
+	}
+	check("the vendored artifacts verify against the recorded pins as shipped", verified, "clean");
+	const digestFixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "fence-ast-digest-"));
+	try {
+		for (const artifact of GRAMMAR_ARTIFACT_FILES) {
+			fs.copyFileSync(path.join(fenceAstVendorDir, artifact), path.join(digestFixtureDir, artifact));
+		}
+		const mutatedName = "tree-sitter-bash.wasm";
+		const mutatedPath = path.join(digestFixtureDir, mutatedName);
+		const bytes = fs.readFileSync(mutatedPath);
+		bytes[Math.floor(bytes.length / 2)] ^= 0xff;
+		fs.writeFileSync(mutatedPath, bytes);
+		let namesArtifact = false;
+		try {
+			verifyGrammarArtifacts(digestFixtureDir);
+		} catch (error) {
+			namesArtifact = String(error && error.message).includes(mutatedName);
+		}
+		check("a mutated artifact aborts verification naming it", namesArtifact, true);
+	} finally {
+		fs.rmSync(digestFixtureDir, { recursive: true, force: true });
+	}
+	const loaderSource = fs.readFileSync(path.join(fenceAstDir, "bash-parser.ts"), "utf8");
+	const verifyCall = loaderSource.indexOf("verifyGrammarArtifacts()");
+	const vendoredImport = loaderSource.indexOf('import("./vendor/web-tree-sitter.js")');
+	check(
+		"digest verification precedes the vendored import in the loader (verify-before-import)",
+		verifyCall >= 0 && vendoredImport >= 0 && verifyCall < vendoredImport,
+		true,
+	);
+}
+{
+	let governing = "none";
+	let dir = fenceAstVendorDir;
+	const repoRoot = path.join(fenceAstDir, "..", "..");
+	while (dir !== path.dirname(dir)) {
+		const manifestPath = path.join(dir, "package.json");
+		if (fs.existsSync(manifestPath)) {
+			const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+			if (manifest.type === "commonjs") {
+				governing = "commonjs";
+				break;
+			}
+		}
+		if (dir === repoRoot) break;
+		dir = path.dirname(dir);
+	}
+	check("no commonjs manifest governs the vendored ESM entry in-repo (the module-type pin)", governing, "none");
+}
+{
+	const attribution = fs.readFileSync(path.join(fenceAstVendorDir, "ATTRIBUTION.md"), "utf8");
+	check(
+		"the registry integrity anchors are recorded",
+		attribution.includes("YJwSHANl6XFgeEjB8nitgj0qZYt5gkIesJ4w2srS2wcLB4GUa4xcOkM0YaMsU6WNR53YVIkDSY7Ej4pf3IXtCA==") &&
+			attribution.includes("7hMytuYIMoXOq24yRulgIxthE9YmggZIOHCyPTTuJcu6EU54tYD+4G39cUb28kxC6jMf/AbPfWGLQtgPTdh3xw=="),
+		true,
+	);
+	check(
+		"the tarball provenance hashes are recorded",
+		attribution.includes("aacd8ab6058fc132e531526d7253476abc56b0c64637e2037b0209205c14691b") &&
+			attribution.includes("d4b2819508ea97cb8953fff7e304a610d443007bd395c8f03a15de9a8ae4a6f9"),
+		true,
+	);
 }
 
 const passed = total - failed;
