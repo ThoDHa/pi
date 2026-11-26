@@ -20,7 +20,13 @@
 #
 # Known postures: the moved shell suites degrade per their own contracts
 # (ISOLATION_ALLOW_DEGRADED=1 gates tool-dependent sections), so run-all
-# works on the host fully and in bare environments on what ran.
+# works on the host fully and in bare environments on what ran. The
+# subagent-thinking-level suite carries two gated checks that print a
+# named skip instead of failing when their subject is absent: the
+# external pin against pi's installed ThinkingLevel vocabulary (needs a
+# locatable pi installation) and the deployed-fleet chart pin (needs
+# ~/.pi/agent/agents, gitignored machine config the repo does not
+# carry); every other check in every suite runs everywhere.
 
 set -u
 cd "$(dirname "$0")/.." || exit 1

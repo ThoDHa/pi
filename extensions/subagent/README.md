@@ -165,13 +165,14 @@ name: my-agent
 description: What this agent does
 tools: read, grep, find, ls
 model: claude-haiku-4-5
+thinkingLevel: high
 detach: false
 ---
 
 System prompt for the agent goes here.
 ```
 
-When `model` is omitted, the subagent inherits the dispatching session's active model and thinking level. The optional `detach: false` key bars the agent from detached (background) dispatch; see [Detached Dispatch](#detached-dispatch-and-the-jobs-tool).
+The optional `thinkingLevel` key pins the agent's thinking level for every dispatch of this agent: valid values are pi's ThinkingLevel vocabulary (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`), the frontmatter value always wins over the dispatching session's thinking level whether or not the agent also pins a model, and an unrecognized value is ignored at discovery rather than failing the agent's load. When `thinkingLevel` is omitted, an agent that pins no model inherits the dispatching session's active model and thinking level, and an agent that pins a model passes no `--thinking` flag and runs at pi's model default. The optional `detach: false` key bars the agent from detached (background) dispatch; see [Detached Dispatch](#detached-dispatch-and-the-jobs-tool).
 
 **Locations:**
 - `~/.pi/agent/agents/*.md` - User-level (always loaded)

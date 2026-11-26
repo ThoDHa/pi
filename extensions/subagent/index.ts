@@ -361,6 +361,27 @@ interface DispatchDefaults {
 	thinkingLevel?: ThinkingLevel;
 }
 
+/**
+ * Resolve the `--thinking` level a dispatch passes to an agent.
+ *
+ * Precedence: an agent frontmatter `thinkingLevel` always wins, model
+ * pinned or not; otherwise the current behavior holds unchanged, the
+ * session default is inherited only when the agent does not pin a model
+ * (a pinned model means the agent owns its runtime config), and no flag is
+ * passed at all when neither source has a value. There is no third source:
+ * the subagent tool's parameter schema carries no dispatch-level
+ * thinkingLevel, so frontmatter is the strongest override that exists; a
+ * dispatch-level parameter, if ever added, must be re-decided against this
+ * precedence (tests/subagent-thinking-level.test.mjs pins that condition).
+ */
+export function resolveDispatchThinkingLevel(
+	agent: AgentConfig,
+	dispatchDefaults: DispatchDefaults,
+): ThinkingLevel | undefined {
+	if (agent.thinkingLevel) return agent.thinkingLevel;
+	return agent.model ? undefined : dispatchDefaults.thinkingLevel;
+}
+
 async function runSingleAgent(
 	defaultCwd: string,
 	dispatchDefaults: DispatchDefaults,
@@ -391,12 +412,10 @@ async function runSingleAgent(
 	}
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-	const inheritsDispatchConfig = !agent.model;
 	const model = agent.model ?? dispatchDefaults.model;
 	if (model) args.push("--model", model);
-	if (inheritsDispatchConfig && dispatchDefaults.thinkingLevel) {
-		args.push("--thinking", dispatchDefaults.thinkingLevel);
-	}
+	const thinkingLevel = resolveDispatchThinkingLevel(agent, dispatchDefaults);
+	if (thinkingLevel) args.push("--thinking", thinkingLevel);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
 	let tmpPromptDir: string | null = null;

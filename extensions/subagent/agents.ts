@@ -4,6 +4,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 
 export type AgentScope = "user" | "project" | "both";
@@ -13,6 +14,8 @@ export interface AgentConfig {
 	description: string;
 	tools?: string[];
 	model?: string;
+	/** Frontmatter `thinkingLevel` (a pi ThinkingLevel value) the dispatch passes as the agent's default `--thinking`. */
+	thinkingLevel?: ThinkingLevel;
 	/** Frontmatter `detach: false` bars this agent from detached (background) dispatch. */
 	detach?: boolean;
 	systemPrompt: string;
@@ -38,8 +41,25 @@ type AgentFrontmatter = {
 	description?: unknown;
 	tools?: unknown;
 	model?: unknown;
+	thinkingLevel?: unknown;
 	detach?: unknown;
 };
+
+const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/**
+ * Normalize a frontmatter `thinkingLevel` value to a pi ThinkingLevel.
+ *
+ * Only the exact vocabulary pi's `--thinking` flag accepts passes through;
+ * anything else yields undefined rather than throwing: this runs inside
+ * agent discovery, where a single bad file must not take down every other
+ * agent in the same directory.
+ */
+export function parseThinkingLevel(value: unknown): ThinkingLevel | undefined {
+	return typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value)
+		? (value as ThinkingLevel)
+		: undefined;
+}
 
 /**
  * Normalize a frontmatter `tools` value to a list of tool names.
@@ -99,6 +119,7 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			description: frontmatter.description,
 			tools: parseToolList(frontmatter.tools),
 			model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
+			thinkingLevel: parseThinkingLevel(frontmatter.thinkingLevel),
 			detach: typeof frontmatter.detach === "boolean" ? frontmatter.detach : undefined,
 			systemPrompt: body,
 			source,
