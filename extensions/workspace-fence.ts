@@ -19,7 +19,12 @@
  * prompt nothing. An out-of-scope verdict in a UI session (ctx.hasUI)
  * asks via ctx.ui.select Yes/No, the permission-gate precedent; any
  * answer other than Yes blocks with a reason naming the tool, the
- * resolved path, and the policy. A headless session (hasUI false)
+ * resolved path, and the policy, and every ask reason names its
+ * trigger class (EXT-37): the bash pass renders each operand's
+ * extraction position, the substitution bias's expansion kinds, and
+ * the env-vector floor's posture into the detail the prompt, the
+ * refusal, and the forwarded ask evidence carry. A headless session
+ * (hasUI false)
  * blocks fail-closed with the same actionable reason plus the remedy
  * to run pi interactively, with one exception: a dispatched child
  * carrying ask-channel provisioning forwards the ask to its parent
@@ -897,7 +902,11 @@ function chaseDanglingFinalSymlink(linkPath: string): string | null {
  * replicated transforms. The seal argument is suite injection: pass a
  * SealState to decide against it verbatim, or omit it to consume the
  * memoized real session seal (sessionSealState, evaluated once per
- * process).
+ * process). The optional extractionOrigin carries the bash scope
+ * pass's operand provenance (EXT-37): when present it joins the
+ * out-of-scope ask detail so the reason names the trigger position
+ * the operand was extracted from; the path tools omit it and keep
+ * their generic shape.
  */
 export function resolveScopeTarget(
 	sessionCwd: string,
@@ -905,6 +914,7 @@ export function resolveScopeTarget(
 	raw: unknown,
 	home: string = os.homedir(),
 	seal?: SealState,
+	extractionOrigin?: string,
 ): ScopeVerdict {
 	const effectiveSeal = seal ?? sessionSealState();
 	if (effectiveSeal.degraded) {
@@ -923,6 +933,7 @@ export function resolveScopeTarget(
 		};
 	}
 	const candidates: string[] = [lexical];
+	const originClause = extractionOrigin !== undefined ? `; the scope pass extracted it from ${extractionOrigin}` : "";
 	const kernel = kernelStyleResolve(sessionCwd, raw, home);
 	if (kernel !== null) candidates.push(kernel);
 	try {
@@ -950,7 +961,7 @@ export function resolveScopeTarget(
 			return {
 				path: lexical,
 				scope: "ask",
-				detail: `${candidate} resolves outside the session cwd, the temp directory, and every extra allowed root; approve interactively or widen the extra roots (${FENCE_CONFIG_FILE} or ${EXTRA_ROOTS_ENV})`,
+				detail: `${candidate} resolves outside the session cwd, the temp directory, and every extra allowed root${originClause}; approve interactively or widen the extra roots (${FENCE_CONFIG_FILE} or ${EXTRA_ROOTS_ENV})`,
 				escapingCandidate: candidate,
 			};
 		}
@@ -1147,7 +1158,13 @@ export type { BashScanResult };
  * command_name identity plus the -c flag shape, interposition reads
  * wrapper identities, envVector names an env-var-carried execution
  * vector assigned in any posture or carried by an env spelling, and
- * the bail flag is the parse's own health (ERROR trees). The walk runs
+ * the bail flag is the parse's own health (ERROR trees). EXT-37 adds
+ * the provenance record: operandPositions keys each operand to the
+ * extraction position the walk read it from (interpreter payloads
+ * recognized by the node -e / python -c / perl -e script-flag shape
+ * included), substitutionKinds lists the expansion kinds behind the
+ * flag, and envVectorPosture names the vector's posture, so every ask
+ * reason names its trigger class. The walk runs
  * on every call through the memoized parser (withBashParse releases
  * the tree on every path); a parser-unavailable load REJECTS rather
  * than returning a guess, so the consumer boundary decides the
@@ -1155,7 +1172,7 @@ export type { BashScanResult };
  */
 export async function scanBashCommand(command: string): Promise<BashScanResult> {
 	if (typeof command !== "string") {
-		return { substitution: false, executor: false, bail: true, envVector: null, cdAsk: null, operands: [], interposed: null };
+		return { substitution: false, executor: false, bail: true, envVector: null, envVectorPosture: undefined, cdAsk: null, operands: [], operandPositions: {}, substitutionKinds: [], interposed: null };
 	}
 	return runBashScan(command);
 }
@@ -1188,15 +1205,18 @@ const bashDeviceFdOperand = /^\/dev\/fd\/[0-9]+$/;
 
 /**
  * One bash operand's verdict: the device exemption first, bash-
- * specific overrides next, then the shared verdict core. Data-null and
- * process-internal devices allow without resolution, a bash-only
- * carve-out the path tools do not share. A ~user operand asks even
- * though the core keeps it literal: bash expands it to another user's
- * home, which the core (mirroring pi's tools, which do not expand
- * ~user) would misplace inside the cwd. An operand combining glob
- * metacharacters with a .. component asks: expansion could enumerate
- * names that turn the traversal into an escape the literal resolution
- * hides.
+ * specific overrides next, then the shared verdict core carrying the
+ * operand's extraction-position provenance (EXT-37) into the ask
+ * reason. Data-null and process-internal devices allow without
+ * resolution, a bash-only carve-out the path tools do not share. A
+ * ~user operand asks even though the core keeps it literal: bash
+ * expands it to another user's home, which the core (mirroring pi's
+ * tools, which do not expand ~user) would misplace inside the cwd. An
+ * operand combining glob metacharacters with a .. component asks:
+ * expansion could enumerate names that turn the traversal into an
+ * escape the literal resolution hides. The override asks name their
+ * own trigger class already, so only the core ask carries the
+ * extraction origin.
  */
 function bashOperandVerdict(
 	operand: string,
@@ -1204,6 +1224,7 @@ function bashOperandVerdict(
 	allowedRoots: string[],
 	home: string,
 	seal: SealState,
+	extractionOrigin: string,
 ): ScopeVerdict {
 	if (BASH_DEVICE_OPERANDS.has(operand) || bashDeviceFdOperand.test(operand)) {
 		return {
@@ -1226,7 +1247,7 @@ function bashOperandVerdict(
 			detail: "operand combines glob expansion with .. traversal, so the paths it reaches cannot be proven; approve interactively or narrow it",
 		};
 	}
-	return resolveScopeTarget(sessionCwd, allowedRoots, operand, home, seal);
+	return resolveScopeTarget(sessionCwd, allowedRoots, operand, home, seal, extractionOrigin);
 }
 
 /** Everything decideBashToolCall needs from one tool_call event. */
@@ -1271,8 +1292,12 @@ export interface BashGateCall {
  * riding behind a command/env/nohup/nice/timeout/exec wrapper asks
  * without scanning through (the wrapper re-executes its arguments);
  * otherwise every extracted operand resolves through the verdict core
- * and the first ask wins. A command with no asking operand passes
- * untouched.
+ * carrying its extraction-position provenance and the first ask wins,
+ * so the reason names the trigger class (EXT-37): the operand's
+ * extraction position, the substitution ask's expansion kinds, and
+ * the vector floor's posture all join the detail the prompt, the
+ * refusal, and the forwarded ask evidence render. A command with no
+ * asking operand passes untouched.
  */
 export async function decideBashToolCall(call: BashGateCall): Promise<PathGateDecision> {
 	if (!GATED_BASH_TOOLS.has(call.toolName)) return { action: "pass" };
@@ -1302,19 +1327,38 @@ export async function decideBashToolCall(call: BashGateCall): Promise<PathGateDe
 		return askBash(`the command routes an executor invocation through ${scan.interposed}, which re-executes its arguments in ways the scan cannot see through; approve interactively or drop the wrapper`);
 	}
 	if (scan.substitution) {
-		return askBash("command carries an expansion whose result the scanner cannot see; the scope pass biases toward asking");
+		const kinds = scan.substitutionKinds ?? [];
+		return askBash(
+			kinds.length > 0
+				? `command carries expansion the scanner cannot see through (${kinds.join(", ")}); the scope pass biases toward asking`
+				: "command carries an expansion whose result the scanner cannot see; the scope pass biases toward asking",
+		);
 	}
 	if (scan.bail) {
 		return askBash("the command did not parse cleanly (a syntax error or broken quoting); the scope pass biases toward asking");
 	}
 	if (scan.envVector) {
-		return askBash(`command assigns ${scan.envVector}, a variable the shell or its loader consumes for deferred or indirect execution (prompt hook, startup file, startup directory, preloaded library, audit module, library search path, trace output, executable lookup), which the scanner cannot evaluate; approve interactively or drop the assignment`);
+		const vectorText =
+			"a variable the shell or its loader consumes for deferred or indirect execution (prompt hook, startup file, startup directory, preloaded library, audit module, library search path, trace output, executable lookup), which the scanner cannot evaluate";
+		return askBash(
+			scan.envVectorPosture === "env spelling"
+				? `command carries ${scan.envVector} in an env spelling, ${vectorText}; approve interactively or drop the spelling`
+				: `command assigns ${scan.envVector}, ${vectorText}; approve interactively or drop the assignment`,
+		);
 	}
 	if (scan.cdAsk) {
 		return askBash(scan.cdAsk);
 	}
+	const operandPositions = scan.operandPositions ?? {};
 	for (const operand of scan.operands) {
-		const verdict = bashOperandVerdict(operand, call.sessionCwd, call.allowedRoots, home, effectiveSeal);
+		const verdict = bashOperandVerdict(
+			operand,
+			call.sessionCwd,
+			call.allowedRoots,
+			home,
+			effectiveSeal,
+			operandPositions[operand] ?? "a command argument",
+		);
 		if (verdict.scope === "ask") {
 			return assembleGateDecision(call.toolName, verdict, call.hasUI, call.approved);
 		}

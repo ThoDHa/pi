@@ -84,7 +84,54 @@ export interface BashScanResult {
 	cdAsk: string | null;
 	/** Path-like operands in walk order, deduped; empty under substitution or bail. */
 	operands: string[];
+	/**
+	 * Extraction-position provenance per operand text, keyed by operand, the
+	 * first extraction winning on dedup (EXT-37): the ask reason names it so
+	 * the prompt says exactly which role the path played in the command.
+	 * Optional so suite scan injections stay valid; an absent entry reads as
+	 * the plain argument posture at the consumer.
+	 */
+	operandPositions?: Record<string, string>;
+	/**
+	 * The expansion kinds behind the substitution flag, in first-seen order,
+	 * so the bias ask names what it saw. Optional like operandPositions for
+	 * the same injection tolerance; an absent or empty list reads as the
+	 * generic expansion ask.
+	 */
+	substitutionKinds?: string[];
+	/**
+	 * Which posture fired the env-vector floor: a variable assignment or an
+	 * env spelling. Optional like the other provenance fields; an absent
+	 * value reads as the assignment posture.
+	 */
+	envVectorPosture?: "assignment" | "env spelling";
 }
+
+/**
+ * The reason-facing kind name per expansion node type (EXT-37): the
+ * substitution bias ask names the expansion kinds it saw instead of a
+ * generic expansion. Backtick substitution parses as command_substitution,
+ * the grammar's single node for both spellings.
+ */
+const EXPANSION_KIND_NAMES: Readonly<Record<string, string>> = {
+	simple_expansion: "a parameter expansion ($var)",
+	expansion: "a brace parameter expansion (${var})",
+	command_substitution: "a command substitution",
+	process_substitution: "a process substitution",
+	arithmetic_expansion: "an arithmetic expansion",
+	ansi_c_string: "an ANSI-C quoted string",
+};
+
+/** The kind the substitution bias reports for an unmodeled redirect destination shape. */
+const UNMODELED_REDIRECT_KIND = "an unmodeled redirect destination shape";
+
+/** The kind for a raw $ or backtick the grammar cannot see in an executor payload. */
+const EXECUTOR_PAYLOAD_DOLLAR_KIND =
+	"a raw $ or backtick in an executor payload (the child shell re-evaluates it)";
+
+/** The kind for a raw $ or backtick the grammar cannot see in a stdin-script body. */
+const STDIN_SCRIPT_DOLLAR_KIND =
+	"a raw $ or backtick in a stdin-script body (the consumer shell re-evaluates it)";
 
 /** Node types whose presence is substitution: any form bash would expand. */
 const EXPANSION_NODE_TYPES: ReadonlySet<string> = new Set([
@@ -221,14 +268,31 @@ const cdUnresolvableAskDetail =
 
 const bashWhitespaceSplit = /\s+/;
 
+/**
+ * Interpreter identities whose script-flag payload text the interpreter
+ * itself re-evaluates (EXT-37 provenance): the payload's path-like words
+ * label as interpreter payload so the ask reason says the path came from
+ * node -e / python -c / perl -e script text. Label-only recognition: the
+ * payload pieces extract through the generic argument-piece posture
+ * unchanged, so the recognized shape changes no verdict, only the
+ * reason's wording.
+ */
+const INTERPRETER_PAYLOAD_HEADS: ReadonlySet<string> = new Set(["node", "python", "python3", "perl"]);
+
+/** Sed's script-carrying flags provenance phrase (the -f/--file value is a real file reference). */
+const SED_SCRIPT_FILE_POSITION = "a sed script-file flag value";
+
 interface ScanAccumulator {
 	substitution: boolean;
 	executor: boolean;
 	interposed: string | null;
 	bail: boolean;
 	envVector: string | null;
+	envVectorPosture: "assignment" | "env spelling" | null;
 	cdAsk: string | null;
 	operands: string[];
+	operandPositions: Record<string, string>;
+	substitutionKinds: string[];
 	seen: Set<string>;
 }
 
@@ -238,11 +302,17 @@ interface ArgumentToken {
 	pieces: string[];
 }
 
-function pushOperand(acc: ScanAccumulator, operand: string): void {
+function pushOperand(acc: ScanAccumulator, operand: string, position: string): void {
 	if (!acc.seen.has(operand)) {
 		acc.seen.add(operand);
 		acc.operands.push(operand);
+		acc.operandPositions[operand] = position;
 	}
+}
+
+/** Record one substitution kind for the bias ask, deduped in first-seen order. */
+function recordSubstitutionKind(acc: ScanAccumulator, kind: string): void {
+	if (!acc.substitutionKinds.includes(kind)) acc.substitutionKinds.push(kind);
 }
 
 /**
@@ -320,6 +390,90 @@ function piecesOfNode(node: BashSyntaxNode): string[] {
 	}
 }
 
+/**
+ * Match one token text as an interpreter's script-carrying flag: -e for
+ * node and perl, -c for python and python3, --eval for node. Returns the
+ * flag spelling for the provenance phrase plus the glued payload
+ * remainder when the script rides the flag token itself (bash's
+ * short-option cluster rule: letters after the value-taking letter are
+ * its value, and --eval= glues the same way); null when the flag is
+ * separated from its payload, and null overall when the text is not that
+ * identity's flag at all.
+ */
+function interpreterScriptFlag(identity: string, text: string): { spelling: string; gluedRemainder: string | null } | null {
+	if (text.startsWith("--")) {
+		if (identity !== "node") return null;
+		const match = /^--eval(?:=(.*))?$/.exec(text);
+		return match === null ? null : { spelling: "--eval", gluedRemainder: match[1] ?? null };
+	}
+	const flagLetter =
+		identity === "python" || identity === "python3"
+			? "c"
+			: identity === "node" || identity === "perl"
+				? "e"
+				: null;
+	if (flagLetter === null) return null;
+	const match = /^-([a-z]*?)([ec])([\s\S]*)$/.exec(text);
+	if (match === null || match[2] !== flagLetter) return null;
+	return {
+		spelling: `-${match[2]}`,
+		gluedRemainder: match[3].length > 0 ? match[3] : null,
+	};
+}
+
+/**
+ * The interpreter-payload provenance per argument-token index: for each
+ * interpreter identity in the token stream, the first script flag after
+ * it locates the payload argument (the flag's own token when glued, the
+ * next token when separated), and that argument's pieces label as the
+ * interpreter payload. Position-independent over the stream, the same
+ * posture executor detection uses, so a prefixed spelling labels exactly
+ * as the bare one does. Only consulted outside the executor posture,
+ * which relabels the whole command's arguments as its own payload.
+ */
+function interpreterPayloadLabels(tokenTexts: string[]): Map<number, string> {
+	const labels = new Map<number, string>();
+	for (let i = 0; i < tokenTexts.length; i++) {
+		const identity = bashExecutorTokenIdentity(tokenTexts[i]);
+		if (!INTERPRETER_PAYLOAD_HEADS.has(identity)) continue;
+		for (let j = i + 1; j < tokenTexts.length; j++) {
+			const match = interpreterScriptFlag(identity, tokenTexts[j]);
+			if (match === null) continue;
+			// tokenTexts[0] is the command name, so argument-token index is
+			// token index minus one: a glued payload labels the flag's own
+			// argument token, a separated payload labels the next one. A
+			// separated flag with no following token labels nothing.
+			const payloadArgIndex = match.gluedRemainder !== null ? j - 1 : j;
+			if (payloadArgIndex >= 0 && payloadArgIndex < tokenTexts.length - 1) {
+				labels.set(payloadArgIndex, `the ${identity} ${match.spelling} script payload`);
+			}
+			return labels;
+		}
+	}
+	return labels;
+}
+
+/**
+ * The executor-payload provenance phrase: the first executor shape in
+ * the token stream, spelled as the invocation it is (a shell or su with
+ * its -c flag, bare ssh, or eval), mirroring
+ * tokensCarryExecutorShape's scan order. The trailing fallback is
+ * unreachable at a true executor posture; it keeps the phrase total.
+ */
+function executorPayloadLabel(tokenTexts: string[]): string {
+	for (let index = 0; index < tokenTexts.length; index++) {
+		const identity = bashExecutorTokenIdentity(tokenTexts[index]);
+		if (identity === "eval") return "the eval payload";
+		if (identity === "ssh") return "the ssh payload";
+		if (BASH_EXECUTOR_SHELLS.has(identity) || identity === "su") {
+			for (let next = index + 1; next < tokenTexts.length; next++) {
+				if (bashExecutorFlag.test(tokenTexts[next])) return `the ${identity} -c payload`;
+			}
+		}
+	}
+	return "the executor payload";
+}
+
 function makeArgumentToken(node: BashSyntaxNode): ArgumentToken {
 	return { node, text: processedTextOf(node), pieces: piecesOfNode(node) };
 }
@@ -375,13 +529,21 @@ function isStdinScriptIdentity(identity: string): boolean {
 }
 
 /**
+ * The default provenance phrase: an operand whose extraction position no
+ * caller named (the generic argument-shape fallback and scan injections
+ * without provenance) reads as the plain argument posture.
+ */
+const ARGUMENT_POSITION = "a command argument";
+
+/**
  * Push the path-like words of one stdin-script text (a heredoc body
  * or a here-string value handed to such a consumer) as operands,
- * deduped in walk order.
+ * deduped in walk order, naming the statement head that reads them
+ * (EXT-37: the seam source is the trigger provenance).
  */
-function pushStdinScriptPieces(text: string, acc: ScanAccumulator): void {
+function pushStdinScriptPieces(text: string, acc: ScanAccumulator, position: string): void {
 	for (const piece of executorPayloadPieces(text)) {
-		if (isPathLikeBashWord(piece)) pushOperand(acc, piece);
+		if (isPathLikeBashWord(piece)) pushOperand(acc, piece, position);
 	}
 }
 
@@ -400,7 +562,8 @@ function pushStdinScriptPieces(text: string, acc: ScanAccumulator): void {
 function flagEveryExpansion(node: BashSyntaxNode, acc: ScanAccumulator): void {
 	if (EXPANSION_NODE_TYPES.has(node.type)) {
 		acc.substitution = true;
-		return;
+		const kind = EXPANSION_KIND_NAMES[node.type];
+		if (kind !== undefined) recordSubstitutionKind(acc, kind);
 	}
 	for (let i = 0; i < node.childCount; i++) {
 		const child = node.child(i);
@@ -462,7 +625,10 @@ function assignmentName(node: BashSyntaxNode): string | null {
 function flagDeferredExecutionVector(node: BashSyntaxNode, acc: ScanAccumulator): void {
 	if (acc.envVector !== null) return;
 	const name = assignmentName(node);
-	if (name !== null && BASH_DEFERRED_EXECUTION_VARS.has(name)) acc.envVector = name;
+	if (name !== null && BASH_DEFERRED_EXECUTION_VARS.has(name)) {
+		acc.envVector = name;
+		acc.envVectorPosture = "assignment";
+	}
 }
 
 /**
@@ -486,11 +652,11 @@ function scanAssignment(node: BashSyntaxNode, acc: ScanAccumulator, extractOpera
 	if (!extractOperands || acc.substitution) return;
 	for (const piece of assignmentValuePieces(node)) {
 		const value = piece.startsWith("=") ? piece.slice(1) : piece;
-		if (isPathLikeBashWord(value)) pushOperand(acc, value);
+		if (isPathLikeBashWord(value)) pushOperand(acc, value, "a variable-assignment value");
 		const eq = value.indexOf("=");
 		if (eq > 0) {
 			const tail = value.slice(eq + 1);
-			if (isPathLikeBashWord(tail)) pushOperand(acc, tail);
+			if (isPathLikeBashWord(tail)) pushOperand(acc, tail, "a variable-assignment value");
 		}
 	}
 }
@@ -533,8 +699,8 @@ function tokensCarryExecutorShape(tokens: string[]): boolean {
  * direction (GPS leans on an existence probe this fence does not
  * have), so -i consumes nothing here.
  */
-function sedArgRoles(argTokens: ArgumentToken[]): { extract: boolean; extraPieces: string[] }[] {
-	const roles = argTokens.map(() => ({ extract: true, extraPieces: [] as string[] }));
+function sedArgRoles(argTokens: ArgumentToken[]): { extract: boolean; extraPieces: string[]; position: string | null }[] {
+	const roles = argTokens.map(() => ({ extract: true, extraPieces: [] as string[], position: null as string | null }));
 	let explicitScript = false;
 	let scriptPositionalSkipped = false;
 	let endOfFlags = false;
@@ -543,6 +709,7 @@ function sedArgRoles(argTokens: ArgumentToken[]): { extract: boolean; extraPiece
 		const text = argTokens[i].text;
 		if (pending !== null) {
 			roles[i].extract = pending === "script-file";
+			if (pending === "script-file") roles[i].position = SED_SCRIPT_FILE_POSITION;
 			pending = null;
 			continue;
 		}
@@ -620,7 +787,7 @@ function detectCdTarget(pieces: string[], acc: ScanAccumulator): void {
 				break;
 			}
 			if (target.startsWith("-")) continue;
-			pushOperand(acc, target);
+			pushOperand(acc, target, "the cd/pushd target");
 			resolved = true;
 			break;
 		}
@@ -680,7 +847,10 @@ function handleCommand(node: BashSyntaxNode, acc: ScanAccumulator, source: strin
 			const eq = token.text.indexOf("=");
 			const name = eq > 0 ? token.text.slice(0, eq) : null;
 			if (name !== null && BASH_DEFERRED_EXECUTION_VARS.has(name)) {
-				if (acc.envVector === null) acc.envVector = name;
+				if (acc.envVector === null) {
+					acc.envVector = name;
+					acc.envVectorPosture = "env spelling";
+				}
 				break;
 			}
 		}
@@ -707,37 +877,46 @@ function handleCommand(node: BashSyntaxNode, acc: ScanAccumulator, source: strin
 	if (acc.executor) {
 		for (const token of argTokens) token.pieces = executorPayloadPieces(token.node.text);
 	}
+	const executorLabel = acc.executor ? executorPayloadLabel(tokenTexts) : null;
+	const interpreterLabels = executorLabel === null ? interpreterPayloadLabels(tokenTexts) : null;
 	for (const herestring of herestrings) {
 		for (let i = 0; i < herestring.childCount; i++) {
 			const value = herestring.child(i);
 			if (value && ARG_NODE_TYPES.has(value.type)) {
 				if (bashSubstitutionChars.test(value.text)) {
 					acc.substitution = true;
+					recordSubstitutionKind(acc, STDIN_SCRIPT_DOLLAR_KIND);
 				} else {
-					pushStdinScriptPieces(value.text, acc);
+					pushStdinScriptPieces(value.text, acc, `a here-string fed to ${seamIdentity} as its stdin script`);
 				}
 			}
 		}
 	}
 
+	const cdPieces = [nameText, ...argTokens.flatMap((token) => token.pieces)];
+	detectCdTarget(cdPieces, acc);
+
 	const roles = identity === "sed" ? sedArgRoles(argTokens) : null;
 	for (let i = 0; i < argTokens.length; i++) {
 		if (roles && !roles[i].extract) {
-			for (const piece of roles[i].extraPieces) pushOperand(acc, piece);
+			for (const piece of roles[i].extraPieces) pushOperand(acc, piece, SED_SCRIPT_FILE_POSITION);
 			continue;
 		}
+		const position =
+			(roles !== null && roles[i].position !== null ? roles[i].position : null)
+			?? executorLabel
+			?? (interpreterLabels !== null && interpreterLabels.has(i) ? interpreterLabels.get(i) : null)
+			?? ARGUMENT_POSITION;
 		for (const piece of argTokens[i].pieces) {
-			if (isPathLikeBashWord(piece)) pushOperand(acc, piece);
+			if (isPathLikeBashWord(piece)) pushOperand(acc, piece, position);
 			const eq = piece.indexOf("=");
 			if (eq > 0) {
 				const value = piece.slice(eq + 1);
-				if (isPathLikeBashWord(value)) pushOperand(acc, value);
+				if (isPathLikeBashWord(value)) pushOperand(acc, value, position);
 			}
 		}
 	}
 	for (const assignment of assignments) scanAssignment(assignment, acc, true);
-	const cdPieces = [nameText, ...argTokens.flatMap((token) => token.pieces)];
-	detectCdTarget(cdPieces, acc);
 }
 
 /**
@@ -764,9 +943,10 @@ function handleFileRedirect(node: BashSyntaxNode, acc: ScanAccumulator): void {
 		if (child.type === "number") continue;
 		if (!ARG_NODE_TYPES.has(child.type)) {
 			acc.substitution = true;
+			recordSubstitutionKind(acc, UNMODELED_REDIRECT_KIND);
 			continue;
 		}
-		pushOperand(acc, processedTextOf(child));
+		pushOperand(acc, processedTextOf(child), "a redirect destination");
 	}
 }
 
@@ -870,8 +1050,12 @@ function handleRedirectedStatement(node: BashSyntaxNode, acc: ScanAccumulator, s
 			if (!child) continue;
 			if (child.type === "heredoc_body") {
 				if (!acc.substitution) {
-					if (bashSubstitutionChars.test(child.text)) acc.substitution = true;
-					else pushStdinScriptPieces(child.text, acc);
+					if (bashSubstitutionChars.test(child.text)) {
+						acc.substitution = true;
+						recordSubstitutionKind(acc, STDIN_SCRIPT_DOLLAR_KIND);
+					} else {
+						pushStdinScriptPieces(child.text, acc, `a heredoc body fed to ${headIdentity} as its stdin script`);
+					}
 				}
 			} else {
 				walkNode(child, acc, source);
@@ -911,7 +1095,7 @@ function walkNode(node: BashSyntaxNode, acc: ScanAccumulator, source: string): v
 	}
 	if (ARG_NODE_TYPES.has(node.type)) {
 		for (const piece of piecesOfNode(node)) {
-			if (isPathLikeBashWord(piece)) pushOperand(acc, piece);
+			if (isPathLikeBashWord(piece)) pushOperand(acc, piece, ARGUMENT_POSITION);
 		}
 		return;
 	}
@@ -946,9 +1130,10 @@ function joinWordsAcrossContinuation(
 
 /**
  * Extract one command's scan from its parsed tree: the walk collects
- * substitution, executor, interposition, the execution-vector name,
- * operands, and cdAsk, then the assembly mirrors the lexical scanner's
- * decision order: interposition first; then the substitution flag,
+ * substitution (with the expansion kinds behind the flag), executor,
+ * interposition, the execution-vector name and posture, operands with
+ * their extraction-position provenance, and cdAsk, then the assembly
+ * mirrors the lexical scanner's decision order: interposition first; then the substitution flag,
  * authoritative in every corner (the position-blind traversal flagged
  * the tree, and no assembly branch may erase what it saw - the
  * executor carve-out this ordering once carried silently allowed an
@@ -971,21 +1156,38 @@ export async function runBashScan(command: string): Promise<BashScanResult> {
 			interposed: null,
 			bail: rootNode.hasError,
 			envVector: null,
+			envVectorPosture: null,
 			cdAsk: null,
 			operands: [],
+			operandPositions: {},
+			substitutionKinds: [],
 			seen: new Set<string>(),
 		};
 		flagEveryExpansion(rootNode, acc);
 		walkNode(rootNode, acc, command);
 		if (acc.interposed !== null) {
-			return { substitution: acc.substitution, executor: acc.executor, bail: acc.bail, envVector: acc.envVector, cdAsk: null, operands: [], interposed: acc.interposed };
+			return withProvenance(acc, { substitution: acc.substitution, executor: acc.executor, bail: acc.bail, envVector: acc.envVector, envVectorPosture: acc.envVectorPosture, cdAsk: null, operands: [], interposed: acc.interposed });
 		}
 		if (acc.substitution) {
-			return { substitution: true, executor: false, bail: true, envVector: acc.envVector, cdAsk: null, operands: [], interposed: null };
+			return withProvenance(acc, { substitution: true, executor: false, bail: true, envVector: acc.envVector, envVectorPosture: acc.envVectorPosture, cdAsk: null, operands: [], interposed: null });
 		}
 		if (acc.executor && bashSubstitutionChars.test(command)) {
-			return { substitution: true, executor: false, bail: true, envVector: acc.envVector, cdAsk: null, operands: [], interposed: null };
+			recordSubstitutionKind(acc, EXECUTOR_PAYLOAD_DOLLAR_KIND);
+			return withProvenance(acc, { substitution: true, executor: false, bail: true, envVector: acc.envVector, envVectorPosture: acc.envVectorPosture, cdAsk: null, operands: [], interposed: null });
 		}
-		return { substitution: false, executor: acc.executor, bail: acc.bail, envVector: acc.envVector, cdAsk: acc.cdAsk, operands: acc.operands, interposed: null };
+		return withProvenance(acc, { substitution: false, executor: acc.executor, bail: acc.bail, envVector: acc.envVector, envVectorPosture: acc.envVectorPosture, cdAsk: acc.cdAsk, operands: acc.operands, interposed: null });
 	});
+}
+
+/**
+ * Merge the provenance record into one return shape: every BashScanResult
+ * the walk produces carries the operand provenance, the substitution
+ * kinds, and the vector posture the accumulation saw, so the consumer's
+ * reasons name the trigger class on every branch.
+ */
+function withProvenance(
+	acc: ScanAccumulator,
+	shape: Omit<BashScanResult, "operandPositions" | "substitutionKinds">,
+): BashScanResult {
+	return { ...shape, operandPositions: acc.operandPositions, substitutionKinds: acc.substitutionKinds };
 }

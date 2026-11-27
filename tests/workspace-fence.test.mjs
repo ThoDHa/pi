@@ -3154,6 +3154,318 @@ try {
 		"ask",
 	);
 
+	// --- EXT-37: ask reasons carry trigger provenance ------------------
+	// Every fence ask/block reason names its trigger class wherever the
+	// machinery already knows it: each extracted operand carries the
+	// extraction position the walk read it from (plain argument, redirect
+	// destination, cd/pushd target, assignment value, stdin-script
+	// heredoc/here-string body word naming the statement head, executor
+	// payload naming the executor identity, interpreter payload naming
+	// the interpreter and its script flag), the substitution bias names
+	// the expansion kinds it saw, the env-vector floor names its
+	// posture, and the user seeing a prompt for a probe command can tell
+	// exactly which role the path played in the command. The provenance
+	// rides the scan result as data (operandPositions,
+	// substitutionKinds, envVectorPosture) so the decision layer renders
+	// it into the ask title, the refusal reason, and the forwarded ask
+	// evidence; suite scan injections without provenance read as the
+	// plain argument posture.
+	const operandPosition = async (command, operand) =>
+		((await scan(command)).operandPositions ?? {})[operand];
+	check(
+		"provenance: a plain argument operand names the argument posture",
+		await operandPosition("cat /etc/passwd", "/etc/passwd"),
+		"a command argument",
+	);
+	check(
+		"provenance: a redirect destination names the redirect posture",
+		await operandPosition("echo x > /etc/passwd", "/etc/passwd"),
+		"a redirect destination",
+	);
+	check(
+		"provenance: a segment-head redirect target names the redirect posture",
+		await operandPosition("> /etc/passwd", "/etc/passwd"),
+		"a redirect destination",
+	);
+	check(
+		"provenance: a resolvable cd target names the cd/pushd posture",
+		await operandPosition("cd /etc", "/etc"),
+		"the cd/pushd target",
+	);
+	check(
+		"provenance: a prefix assignment value names the assignment posture",
+		await operandPosition("FOO=/etc/passwd cmd", "/etc/passwd"),
+		"a variable-assignment value",
+	);
+	check(
+		"provenance: a declaration value names the assignment posture",
+		await operandPosition("export X=/etc/passwd", "/etc/passwd"),
+		"a variable-assignment value",
+	);
+	check(
+		"provenance: an executor payload names the shell and its -c flag",
+		await operandPosition("bash -c 'cat /etc/passwd'", "/etc/passwd"),
+		"the bash -c payload",
+	);
+	check(
+		"provenance: an eval payload names eval",
+		await operandPosition("eval 'cat /etc/group'", "/etc/group"),
+		"the eval payload",
+	);
+	check(
+		"provenance: an ssh payload names ssh",
+		await operandPosition("ssh host 'cat /etc/hosts'", "/etc/hosts"),
+		"the ssh payload",
+	);
+	check(
+		"provenance: a su payload names su and its -c flag",
+		await operandPosition("su -c 'cat /etc/shadow' root", "/etc/shadow"),
+		"the su -c payload",
+	);
+	check(
+		"provenance: a heredoc body word names the statement head",
+		await operandPosition("bash << EOF\ncat /etc/passwd\nEOF", "/etc/passwd"),
+		"a heredoc body fed to bash as its stdin script",
+	);
+	check(
+		"provenance: a wrapper-hidden heredoc body names the stripped shell",
+		await operandPosition("command bash << EOF\ncat /etc/passwd\nEOF", "/etc/passwd"),
+		"a heredoc body fed to bash as its stdin script",
+	);
+	check(
+		"provenance: a redirect-only exec heredoc body names exec",
+		await operandPosition("exec << EOF\ncat /etc/passwd\nEOF\nbash", "/etc/passwd"),
+		"a heredoc body fed to exec as its stdin script",
+	);
+	check(
+		"provenance: a here-string word names the statement head",
+		await operandPosition("bash <<< 'cat /etc/passwd'", "/etc/passwd"),
+		"a here-string fed to bash as its stdin script",
+	);
+	check(
+		"provenance: a node -e script word names the interpreter payload",
+		await operandPosition("node -e 'cat /etc/passwd'", "/etc/passwd"),
+		"the node -e script payload",
+	);
+	check(
+		"provenance: a node --eval script word names the long flag",
+		await operandPosition("node --eval 'cat /etc/passwd'", "/etc/passwd"),
+		"the node --eval script payload",
+	);
+	check(
+		"provenance: a glued node -e cluster names the interpreter payload",
+		await operandPosition("node -e'cat /etc/passwd'", "/etc/passwd"),
+		"the node -e script payload",
+	);
+	check(
+		"provenance: a python -c script word names the interpreter payload",
+		await operandPosition("python -c 'cat /etc/passwd'", "/etc/passwd"),
+		"the python -c script payload",
+	);
+	check(
+		"provenance: a python3 -c script word names the interpreter payload",
+		await operandPosition("python3 -c 'cat /etc/passwd'", "/etc/passwd"),
+		"the python3 -c script payload",
+	);
+	check(
+		"provenance: a perl -e script word names the interpreter payload",
+		await operandPosition("perl -e 'cat /etc/passwd'", "/etc/passwd"),
+		"the perl -e script payload",
+	);
+	check(
+		"provenance: a prefixed interpreter payload still names the interpreter",
+		await operandPosition("sudo node -e 'cat /etc/passwd'", "/etc/passwd"),
+		"the node -e script payload",
+	);
+	check(
+		"provenance: an executor-carried interpreter payload reads as the executor payload",
+		await operandPosition("bash -c 'node -e \"cat /etc/passwd\"'", "/etc/passwd"),
+		"the bash -c payload",
+	);
+	check(
+		"provenance: a sed script-file flag value names its role",
+		((await scan("sed -f /scripts/fix.sed /etc/data")).operandPositions ?? {})["/scripts/fix.sed"],
+		"a sed script-file flag value",
+	);
+	check(
+		"provenance: a sed data-file operand keeps the argument posture",
+		((await scan("sed -f /scripts/fix.sed /etc/data")).operandPositions ?? {})["/etc/data"],
+		"a command argument",
+	);
+
+	const substitutionKinds = async (command) => (await scan(command)).substitutionKinds;
+	check(
+		"provenance: a command substitution names its kind",
+		JSON.stringify(await substitutionKinds("echo $(cat inside/file.txt)")),
+		JSON.stringify(["a command substitution"]),
+	);
+	check(
+		"provenance: a backtick substitution names the command-substitution kind",
+		JSON.stringify(await substitutionKinds("cat `ls inside`")),
+		JSON.stringify(["a command substitution"]),
+	);
+	check(
+		"provenance: a bare parameter expansion names its kind",
+		JSON.stringify(await substitutionKinds("cat $HOME/notes")),
+		JSON.stringify(["a parameter expansion ($var)"]),
+	);
+	check(
+		"provenance: a brace parameter expansion names its kind",
+		JSON.stringify(await substitutionKinds("echo ${HOME}/secret")),
+		JSON.stringify(["a brace parameter expansion (${var})"]),
+	);
+	check(
+		"provenance: a process substitution names its kind",
+		JSON.stringify(await substitutionKinds("cat <(cat inside/file.txt)")),
+		JSON.stringify(["a process substitution"]),
+	);
+	check(
+		"provenance: an arithmetic expansion names its kind",
+		JSON.stringify(await substitutionKinds("echo $((1+2))")),
+		JSON.stringify(["an arithmetic expansion"]),
+	);
+	check(
+		"provenance: an ANSI-C string names its kind",
+		JSON.stringify(await substitutionKinds("grep $'\\t' f")),
+		JSON.stringify(["an ANSI-C quoted string"]),
+	);
+	check(
+		"provenance: executor payload dollars name the payload-raw kind",
+		JSON.stringify(await substitutionKinds("bash -c 'echo $HOME/notes'")),
+		JSON.stringify(["a raw $ or backtick in an executor payload (the child shell re-evaluates it)"]),
+	);
+	check(
+		"provenance: a seam body dollar names the stdin-script kind",
+		JSON.stringify(await substitutionKinds("bash << 'EOF'\ncat $HOME/secret\nEOF")),
+		JSON.stringify(["a raw $ or backtick in a stdin-script body (the consumer shell re-evaluates it)"]),
+	);
+	check(
+		"provenance: mixed expansion kinds list in first-seen order",
+		JSON.stringify(await substitutionKinds("echo $(x) ${y}")),
+		JSON.stringify(["a command substitution", "a brace parameter expansion (${var})"]),
+	);
+	check(
+		"provenance: a heredoc body word keeps its seam posture under the dollar backstop kinds",
+		(await scan("bash << 'EOF'\ncat $HOME/secret\nEOF")).substitution,
+		true,
+	);
+	check(
+		"provenance: an assignment vector names the assignment posture",
+		(await scan("PROMPT_COMMAND='cat /etc/passwd'")).envVectorPosture,
+		"assignment",
+	);
+	check(
+		"provenance: an env-spelling vector names the env posture",
+		(await scan("env PROMPT_COMMAND=x cat file")).envVectorPosture,
+		"env spelling",
+	);
+
+	// the gate renders the provenance into the live prompt: the ask
+	// title, the refusal reason, and the headless ask evidence all name
+	// the extraction position, so the user sees exactly why the fence
+	// fired (the EXT-37 ruling's motivating probe: a node -e payload
+	// path prompting as a bare out-of-scope path).
+	const probeAsk = async (command) => bashGate({ input: { command } });
+	checkContains(
+		"the plain-argument ask names the argument posture",
+		(await probeAsk("cat /etc/passwd")).title,
+		"the scope pass extracted it from a command argument",
+	);
+	checkContains(
+		"the redirect ask names the redirect posture",
+		(await probeAsk("echo x > /etc/passwd")).title,
+		"the scope pass extracted it from a redirect destination",
+	);
+	checkContains(
+		"the cd ask names the cd/pushd posture",
+		(await probeAsk("cd /etc")).title,
+		"the scope pass extracted it from the cd/pushd target",
+	);
+	checkContains(
+		"the assignment-value ask names the assignment posture",
+		(await probeAsk("FOO=/etc/passwd run")).title,
+		"the scope pass extracted it from a variable-assignment value",
+	);
+	checkContains(
+		"the executor ask names the payload posture",
+		(await probeAsk("bash -c 'cat /etc/passwd'")).title,
+		"the scope pass extracted it from the bash -c payload",
+	);
+	checkContains(
+		"the heredoc ask names the seam and the head",
+		(await probeAsk("bash << EOF\ncat /etc/passwd\nEOF")).title,
+		"the scope pass extracted it from a heredoc body fed to bash as its stdin script",
+	);
+	checkContains(
+		"the here-string ask names the seam and the head",
+		(await probeAsk("bash <<< 'cat /etc/passwd'")).title,
+		"the scope pass extracted it from a here-string fed to bash as its stdin script",
+	);
+	const interpreterProbe = await probeAsk("node -e 'cat /etc/passwd'");
+	check("the interpreter-payload probe asks", interpreterProbe.action, "ask");
+	checkContains(
+		"the interpreter-payload ask names the resolved path",
+		interpreterProbe.title,
+		"/etc/passwd resolves outside",
+	);
+	checkContains(
+		"the interpreter-payload ask names the interpreter and its flag",
+		interpreterProbe.title,
+		"the scope pass extracted it from the node -e script payload",
+	);
+	checkContains(
+		"the python -c ask names the interpreter",
+		(await probeAsk("python -c 'cat /etc/passwd'")).title,
+		"the scope pass extracted it from the python -c script payload",
+	);
+	checkContains(
+		"the perl -e ask names the interpreter",
+		(await probeAsk("perl -e 'cat /etc/passwd'")).title,
+		"the scope pass extracted it from the perl -e script payload",
+	);
+	checkContains(
+		"the substitution ask names the expansion kind",
+		(await probeAsk("echo $(cat inside/file.txt)")).title,
+		"(a command substitution)",
+	);
+	checkContains(
+		"the executor-dollar substitution ask names the payload-raw kind",
+		(await probeAsk("bash -c 'echo $HOME/notes'")).title,
+		"a raw $ or backtick in an executor payload",
+	);
+	checkContains(
+		"the env-spelling vector ask names the posture",
+		(await probeAsk("env PROMPT_COMMAND=x cat file")).title,
+		"command carries PROMPT_COMMAND in an env spelling",
+	);
+	checkContains(
+		"the assignment vector ask keeps the assignment posture",
+		(await probeAsk("PROMPT_COMMAND='cat /etc/passwd'")).title,
+		"command assigns PROMPT_COMMAND",
+	);
+	const interpreterHeadless = bashGate({ input: { command: "node -e 'cat /etc/passwd'" }, hasUI: false });
+	check("the interpreter-payload probe blocks headless", (await interpreterHeadless).action, "block");
+	checkContains(
+		"the headless forwarded evidence carries the provenance",
+		(await interpreterHeadless).askEvidence ?? "",
+		"the node -e script payload",
+	);
+	check(
+		"a scan injection without provenance reads as the argument posture",
+		(
+			await bashGate({
+				input: { command: "anything" },
+				scan: async () => ({ substitution: false, executor: false, interposed: null, bail: false, cdAsk: null, operands: ["/etc/passwd"] }),
+			})
+		).title.includes("the scope pass extracted it from a command argument"),
+		true,
+	);
+	check(
+		"the path-tool ask keeps its generic shape (no bash extraction provenance)",
+		gate({ input: { path: outFile } }).title.includes("the scope pass extracted it"),
+		false,
+	);
+
 	// --- parent-own grant recorder: unit 1-2 wiring ----------------------
 	// The interactive Yes on the parent's own ask path is property 1's
 	// producer: the approved ask's escaping candidate is classified
