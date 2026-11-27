@@ -30,9 +30,17 @@
  * 1-3 surface (the headless forward branch, the child-scoped roots
  * build), and the fence-ask entry loads standalone and its factory
  * registers the session lifecycle pair, the live-load discipline the
- * incident rule demands of every loadable entry.
+ * incident rule demands of every loadable entry. The EXT-33 layer
+ * drives the two-hop grandchild inheritance through the spawn site's
+ * exported composition (buildChildInheritedRootsEnvValue): the top
+ * session's env-carried root must survive into the grandchild's
+ * composed env value, and the spawn site must keep calling that
+ * exported composition.
  */
 
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { register } from "node:module";
 
 let failed = 0;
@@ -45,6 +53,10 @@ function check(label, actual, expected) {
 		console.log(`      expected: ${expected}`);
 		console.log(`      actual  : ${actual}`);
 	}
+}
+
+function checkContains(label, haystack, needle) {
+	check(label, haystack.includes(needle) ? "yes" : "no", "yes");
 }
 
 const stubSources = {
@@ -141,8 +153,17 @@ check("grant-ledger carries the parent-own recorder feed", typeof grantLedger.re
 const fence = await import("../extensions/workspace-fence.ts");
 check("workspace-fence loads standalone", typeof fence.recordParentOwnGrant, "function");
 check("workspace-fence keeps the spawn composition input", typeof fence.fenceExtraRoots, "function");
+check("workspace-fence carries the per-source spawn composition feed", typeof fence.fenceExtraRootSources, "function");
 check("workspace-fence carries the headless forward branch", typeof fence.forwardHeadlessAsk, "function");
 check("workspace-fence carries the child-scoped roots build", typeof fence.childScopedAllowedRoots, "function");
+check("the subagent module carries the parent spawn root sources feed", typeof subagent.parentSpawnRootSources, "function");
+check("the subagent module carries the exported spawn composition", typeof subagent.buildChildInheritedRootsEnvValue, "function");
+const spawnSiteSource = fs.readFileSync(path.join(import.meta.dirname, "..", "extensions", "subagent", "index.ts"), "utf-8");
+checkContains(
+	"the spawn site's inherited-roots value is the exported composition call",
+	spawnSiteSource,
+	"const inheritedRootsValue = buildChildInheritedRootsEnvValue({",
+);
 
 const fenceAskEntry = await import("../extensions/fence-ask/index.ts");
 check("the fence-ask entry loads standalone", typeof fenceAskEntry.default, "function");
@@ -163,6 +184,63 @@ check(
 	entryRegistrations.join(","),
 	"session_start:function,session_shutdown:function",
 );
+
+// --- EXT-33: the two-hop grandchild inheritance through the real
+// spawn composition. Both hops call the exported function the spawn
+// site itself calls (buildChildInheritedRootsEnvValue), so a
+// regression that hardcodes empty overlay or env sources inside the
+// composition loses the top root at hop one and fails the hop pins;
+// a spawn site that stops calling the exported composition fails the
+// call-site pin above.
+
+let hopThrew = null;
+const hopFixture = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-load-hop-"));
+const topRoot = path.join(hopFixture, "top-root");
+const topCwd = path.join(hopFixture, "session-top");
+const middleCwd = path.join(hopFixture, "session-middle");
+const grandCwd = path.join(hopFixture, "session-grand");
+for (const dir of [topRoot, topCwd, middleCwd, grandCwd]) fs.mkdirSync(dir, { recursive: true });
+const topRootReal = fs.realpathSync(topRoot);
+const savedHopEnv = process.env[fence.EXTRA_ROOTS_ENV];
+try {
+	try {
+		process.env[fence.EXTRA_ROOTS_ENV] = topRootReal;
+		fence.resetFenceExtraRoots();
+		const middleEnvValue = subagent.buildChildInheritedRootsEnvValue({
+			parentSessionCwd: topCwd,
+			dispatchCwd: middleCwd,
+		});
+		checkContains(
+			"hop one composes the top session's env root into the middle child's env value",
+			middleEnvValue,
+			topRootReal,
+		);
+		process.env[fence.EXTRA_ROOTS_ENV] = middleEnvValue;
+		fence.resetFenceExtraRoots();
+		const grandEnvValue = subagent.buildChildInheritedRootsEnvValue({
+			parentSessionCwd: middleCwd,
+			dispatchCwd: grandCwd,
+		});
+		checkContains(
+			"hop two keeps the top session's env root in the grandchild's composed env value",
+			grandEnvValue,
+			topRootReal,
+		);
+		check(
+			"the grandchild-side parse resolves the surviving top root",
+			fence.parseExtraRoots(grandEnvValue).includes(topRootReal),
+			true,
+		);
+	} finally {
+		if (savedHopEnv === undefined) delete process.env[fence.EXTRA_ROOTS_ENV];
+		else process.env[fence.EXTRA_ROOTS_ENV] = savedHopEnv;
+		fence.resetFenceExtraRoots();
+		fs.rmSync(hopFixture, { recursive: true, force: true });
+	}
+} catch (error) {
+	hopThrew = error;
+}
+check("the two-hop inheritance chain composes through the real spawn feed", hopThrew, null);
 
 const passed = total - failed;
 console.log(`\n${passed}/${total} passed, ${failed} failed`);

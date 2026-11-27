@@ -57,7 +57,7 @@ import {
 	registerLiveChild,
 	releaseChild,
 } from "../fence-ask/grant-ledger.ts";
-import { EXTRA_ROOTS_ENV, fenceExtraRoots } from "../workspace-fence.ts";
+import { EXTRA_ROOTS_ENV, fenceExtraRootSources, type FenceExtraRootSources } from "../workspace-fence.ts";
 import {
 	extractActivityLog,
 	extractLastActivity,
@@ -356,6 +356,44 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
+/**
+ * The parent-side sources the spawn composition feeds: the fence's
+ * tracked-config, overlay, and env root arrays, in InheritedRootsInput's
+ * field shapes. The spawn composition must keep consuming this feed —
+ * passing hardcoded empty overlay or env arrays there drops the
+ * parent's carried roots at every hop — and the exported form lets
+ * suites drive the two-hop inheritance chain against the same feed
+ * buildChildInheritedRootsEnvValue spreads.
+ */
+export function parentSpawnRootSources(): FenceExtraRootSources {
+	return fenceExtraRootSources();
+}
+
+/**
+ * The spawn site's inherited-roots composition, exported so a suite
+ * pin drives the exact invocation the child spawn runs: the parent
+ * feed (parentSpawnRootSources) and the parent's own grant ledger
+ * compose with the session/dispatch cwd pair into the child's
+ * PISCOPE_EXTRA_ROOTS value. The spawn site calls this as a thin
+ * call; hardcoding empty overlay or env arrays on either side of it
+ * drops the parent's carried roots at every hop and flips the
+ * two-hop inheritance pin red.
+ */
+export function buildChildInheritedRootsEnvValue(parentContext: {
+	parentSessionCwd: string;
+	dispatchCwd: string;
+}): string {
+	const parentRootSources = parentSpawnRootSources();
+	return inheritedExtraRootsEnvValue({
+		configRoots: parentRootSources.configRoots,
+		overlayRoots: parentRootSources.overlayRoots,
+		envRoots: parentRootSources.envRoots,
+		parentGrantRoots: parentGrantedDirectories(),
+		parentSessionCwd: parentContext.parentSessionCwd,
+		dispatchCwd: parentContext.dispatchCwd,
+	});
+}
+
 interface DispatchDefaults {
 	model?: string;
 	thinkingLevel?: ThinkingLevel;
@@ -470,11 +508,7 @@ async function runSingleAgent(
 		const dispatchCwd = cwd ?? defaultCwd;
 		const forwardingRoot = ensureForwardingRoot(parentSessionId ?? `pid-${process.pid}`, randomUUID());
 		ensureForwardingServer();
-		const inheritedRootsValue = inheritedExtraRootsEnvValue({
-			configRoots: fenceExtraRoots(),
-			overlayRoots: [],
-			envRoots: [],
-			parentGrantRoots: parentGrantedDirectories(),
+		const inheritedRootsValue = buildChildInheritedRootsEnvValue({
 			parentSessionCwd: defaultCwd,
 			dispatchCwd,
 		});

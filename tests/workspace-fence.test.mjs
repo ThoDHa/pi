@@ -131,6 +131,7 @@ import cwdScopeGate, {
 	expandTilde,
 	evaluateSealState,
 	fenceExtraRoots,
+	fenceExtraRootSources,
 	isInsideRoots,
 	kernelStyleResolve,
 	lexicalResolvePath,
@@ -161,6 +162,19 @@ import {
 } from "../extensions/fence-ast/bash-parser.ts";
 import { GRAMMAR_ARTIFACT_FILES, GRAMMAR_DIGEST_PINS } from "../extensions/fence-ast/grammar-pins.ts";
 
+// Hermeticity over ambient ask-channel provisioning: the factory handler
+// reads PISCOPE_ASK_FORWARDING_ROOT / PISCOPE_ASK_CHILD_TOKEN from the live
+// environment on every headless block, so a suite run inside a provisioned
+// dispatched child would silently route the handler sections below onto the
+// real forward path instead of the unprovisioned fail-closed branch they
+// pin. The pair is cleared for the whole suite; the forward section sets
+// its own fixture provisioning, and the ambient values are restored at the
+// bottom so the process env is left as found.
+const ambientAskRoot = process.env[CHILD_ASK_ROOT_ENV];
+const ambientAskToken = process.env[CHILD_ASK_TOKEN_ENV];
+delete process.env[CHILD_ASK_ROOT_ENV];
+delete process.env[CHILD_ASK_TOKEN_ENV];
+
 let failed = 0;
 let total = 0;
 function check(label, actual, expected) {
@@ -187,6 +201,8 @@ const fakeHome = path.join(fixtureRoot, "home");
 for (const dir of [insideDir, outsideSubDir, customTmpDir, fakeHome]) {
 	fs.mkdirSync(dir, { recursive: true });
 }
+const colonDir = path.join(fixtureRoot, "colon-typo:");
+fs.mkdirSync(colonDir, { recursive: true });
 const inFile = path.join(insideDir, "file.txt");
 const outFile = path.join(outsideSubDir, "target.txt");
 fs.writeFileSync(inFile, "fixture");
@@ -851,6 +867,34 @@ try {
 	);
 	resetFenceExtraRoots();
 
+	// the per-source breakdown behind the union: the spawn composition
+	// consumes the same three sources the gate enforces, split by origin
+	resetFenceExtraRoots();
+	const previousSourcesEnv = process.env[EXTRA_ROOTS_ENV];
+	process.env[EXTRA_ROOTS_ENV] = outsideDir;
+	try {
+		const sources = fenceExtraRootSources();
+		check("the source breakdown memoizes across calls", fenceExtraRootSources() === sources, true);
+		check(
+			"the source breakdown keeps the tracked config source",
+			sources.configRoots.includes(path.join(os.homedir(), ".agents", "skills")),
+			true,
+		);
+		check("the source breakdown parses the env source", sources.envRoots.includes(outsideDir), true);
+		check("the source breakdown leaves the overlay source empty without a local file", sources.overlayRoots.length, 0);
+		const union = fenceExtraRoots();
+		check("the union memoizes across the sources call", fenceExtraRoots() === union, true);
+		check(
+			"the union stays the merged view of the three sources",
+			JSON.stringify(union),
+			JSON.stringify([...new Set([...sources.configRoots, ...sources.overlayRoots, ...sources.envRoots])]),
+		);
+	} finally {
+		if (previousSourcesEnv === undefined) delete process.env[EXTRA_ROOTS_ENV];
+		else process.env[EXTRA_ROOTS_ENV] = previousSourcesEnv;
+	}
+	resetFenceExtraRoots();
+
 	// --- env-integrated roots: PISCOPE_EXTRA_ROOTS set around the case --
 	const envKey = EXTRA_ROOTS_ENV;
 	const previous = process.env[envKey];
@@ -1288,6 +1332,13 @@ try {
 	checkContains("ask denial reason names the policy", outScope.denyReason, EXTRA_ROOTS_ENV);
 	checkContains("ask denial names the tracked config widening path", outScope.denyReason, FENCE_CONFIG_FILE);
 
+	// the ask title quotes the operand, so a typo'd trailing colon (the
+	// live incident form) is visible at a glance instead of reading as
+	// sentence punctuation
+	const colonAsk = gate({ input: { path: colonDir } });
+	check("an out-of-scope colon-suffixed operand asks under UI", colonAsk.action, "ask");
+	checkContains("the ask title quotes the colon-suffixed operand", colonAsk.title, `"${colonDir}"`);
+
 	const grepOutside = gate({ toolName: "grep", input: { pattern: "x", path: outsideDir, glob: "*.txt" } });
 	check("grep with an out-of-scope path asks regardless of glob metadata", grepOutside.action, "ask");
 
@@ -1440,6 +1491,14 @@ try {
 	checkContains("bash ask title names the tool", bashOut.title, "bash");
 	checkContains("bash ask title names the resolved path", bashOut.title, "/etc/passwd");
 	checkContains("bash ask title ends in the prompt", bashOut.title, "Allow?");
+	const bashColon = (await bashGate({ input: { command: `cd ${colonDir}` } }));
+	check("an out-of-scope cd to a colon-suffixed target asks", bashColon.action, "ask");
+	checkContains("the bash ask title quotes the colon-suffixed operand", bashColon.title, `"${colonDir}"`);
+	checkContains(
+		"the bash colon ask title carries the cd/pushd provenance",
+		bashColon.title,
+		"the scope pass extracted it from the cd/pushd target",
+	);
 	checkContains("bash denial reason names the policy", bashOut.denyReason, EXTRA_ROOTS_ENV);
 	check("cd outside the cwd subtree asks", (await bashGate({ input: { command: "cd /etc" } })).action, "ask");
 	check("cd to tilde home asks", (await bashGate({ input: { command: "cd ~" } })).action, "ask");
@@ -4005,6 +4064,10 @@ try {
 	fs.rmSync(fwdFixtureRoot, { recursive: true, force: true });
 	fs.rmSync(fwdCwd, { recursive: true, force: true });
 }
+if (typeof ambientAskRoot === "string") process.env[CHILD_ASK_ROOT_ENV] = ambientAskRoot;
+else delete process.env[CHILD_ASK_ROOT_ENV];
+if (typeof ambientAskToken === "string") process.env[CHILD_ASK_TOKEN_ENV] = ambientAskToken;
+else delete process.env[CHILD_ASK_TOKEN_ENV];
 
 // --- PISCOPE-2-1: the fence-ast parser infrastructure --------------
 // The bash pass's parser infrastructure is a sibling package under

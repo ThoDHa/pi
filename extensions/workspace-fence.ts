@@ -799,28 +799,69 @@ export function resetSessionSeal(): void {
 }
 
 /**
- * Memoized union of every extra-root source behind the factory's
- * allowed-root build: the tracked config and the optional local overlay
- * read from the directory this module sits in (the cooldown.json
- * precedent), plus PISCOPE_EXTRA_ROOTS. The first call evaluates once
- * per process and every later call reuses the union, so a config edit
- * or env change mid-session needs a restart to apply; suites call
- * resetFenceExtraRoots to re-evaluate under changed conditions.
+ * The per-source breakdown of every extra-root source behind the
+ * factory's allowed-root build: the tracked config and the optional
+ * local overlay read from the directory this module sits in (the
+ * cooldown.json precedent), plus PISCOPE_EXTRA_ROOTS. The sources stay
+ * split so the spawn composition can feed each origin into its own
+ * InheritedRootsInput field and a dispatched child inherits exactly
+ * the scope the parent's gate enforces; fenceExtraRoots stays the one
+ * merged view of the same arrays.
  */
-let cachedFenceExtraRoots: string[] | undefined;
+export interface FenceExtraRootSources {
+	/** The tracked config's roots (readFenceRootsFile output). */
+	configRoots: string[];
+	/** The local overlay's roots; empty when no local file exists. */
+	overlayRoots: string[];
+	/** parseExtraRoots over the current PISCOPE_EXTRA_ROOTS. */
+	envRoots: string[];
+}
 
+/**
+ * Memoized sources-and-union evaluation behind both fenceExtraRoot
+ * surfaces. The first call evaluates once per process and every later
+ * call reuses the results, so a config edit or env change mid-session
+ * needs a restart to apply; suites call resetFenceExtraRoots to
+ * re-evaluate under changed conditions.
+ */
+interface FenceExtraRootCache {
+	sources: FenceExtraRootSources;
+	union: string[];
+}
+
+let cachedFenceExtraRoots: FenceExtraRootCache | undefined;
+
+function evaluateFenceExtraRoots(): FenceExtraRootCache {
+	const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+	const sources: FenceExtraRootSources = {
+		configRoots: readFenceRootsFile(path.join(moduleDir, FENCE_CONFIG_FILE), FENCE_CONFIG_FILE, false, os.homedir()),
+		overlayRoots: readFenceRootsFile(path.join(moduleDir, FENCE_LOCAL_CONFIG_FILE), FENCE_LOCAL_CONFIG_FILE, true, os.homedir()),
+		envRoots: parseExtraRoots(process.env[EXTRA_ROOTS_ENV]),
+	};
+	const union = mergeRoots(mergeRoots([...sources.configRoots], sources.overlayRoots), sources.envRoots);
+	return { sources, union };
+}
+
+/**
+ * The memoized per-source breakdown (see FenceExtraRootSources): the
+ * same evaluation fenceExtraRoots reads, exposed so the spawn
+ * composition feeds each origin into its own InheritedRootsInput
+ * field instead of one pre-merged array.
+ */
+export function fenceExtraRootSources(): FenceExtraRootSources {
+	cachedFenceExtraRoots ??= evaluateFenceExtraRoots();
+	return cachedFenceExtraRoots.sources;
+}
+
+/**
+ * The memoized union of the three sources (see
+ * FenceExtraRootSources): the merged view the factory's allowed-root
+ * build consumes, returned by reference so later calls reuse the one
+ * evaluation.
+ */
 export function fenceExtraRoots(): string[] {
-	if (cachedFenceExtraRoots === undefined) {
-		const moduleDir = path.dirname(fileURLToPath(import.meta.url));
-		cachedFenceExtraRoots = mergeRoots(
-			loadFenceConfigRoots(
-				path.join(moduleDir, FENCE_CONFIG_FILE),
-				path.join(moduleDir, FENCE_LOCAL_CONFIG_FILE),
-			),
-			parseExtraRoots(process.env[EXTRA_ROOTS_ENV]),
-		);
-	}
-	return cachedFenceExtraRoots;
+	cachedFenceExtraRoots ??= evaluateFenceExtraRoots();
+	return cachedFenceExtraRoots.union;
 }
 
 export function resetFenceExtraRoots(): void {
@@ -1060,9 +1101,13 @@ function scopeDenyReason(toolName: string, verdict: ScopeVerdict): string {
 const HEADLESS_REMEDY =
 	"; this session has no interactive UI, so the call fails closed; run pi interactively to approve it";
 
-/** The ctx.ui.select title for an out-of-scope call (permission-gate shape). */
+/**
+ * The ctx.ui.select title for an out-of-scope call (permission-gate
+ * shape). The operand is quoted so typo artifacts like a trailing
+ * colon read as part of the path, never as sentence punctuation.
+ */
 function scopeAskTitle(toolName: string, verdict: ScopeVerdict): string {
-	return `⚠️ ${toolName} outside the allowed scope:\n\n  ${verdict.path}\n\n${verdict.detail}\n\nAllow?`;
+	return `⚠️ ${toolName} outside the allowed scope:\n\n  "${verdict.path}"\n\n${verdict.detail}\n\nAllow?`;
 }
 
 /**
