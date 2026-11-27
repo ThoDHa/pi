@@ -119,6 +119,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import cwdScopeGate, {
 	EXTRA_ROOTS_ENV,
 	FENCE_CONFIG_FILE,
+	FENCE_DISABLE_ENV,
 	FENCE_LOCAL_CONFIG_FILE,
 	GATED_BASH_TOOLS,
 	GATED_PATH_TOOLS,
@@ -234,6 +235,17 @@ const realScopeRoots = buildAllowedRoots(cwdDir);
 // custom-root mode: the fixture cwd plus an empty tmp stand-in, so the
 // sibling outside fixture is genuinely out of scope.
 const customRoots = buildAllowedRoots(cwdDir, [], customTmpDir);
+
+// Hermeticity against a provisioned invocation shell: the factory pins
+// in the try below run the handler unprovisioned (plain headless
+// blocks, no channel flow), but a shell invoking this suite from
+// inside a dispatched child carries the forwarding env, which would
+// route the out-of-scope handler pins through the live forward branch
+// instead. The snapshot is restored in the try's finally; the
+// forward-branch section below sets its own provisioning and
+// saves/restores the environment independently.
+const handlerSavedAskRoot = process.env[CHILD_ASK_ROOT_ENV];
+const handlerSavedAskToken = process.env[CHILD_ASK_TOKEN_ENV];
 
 try {
 	// --- tilde expansion pins (pi's tools expand ~ like this:
@@ -1200,6 +1212,10 @@ try {
 	// 1-1 integration incident). A recording stub pins the registration
 	// shape the permission-gate precedent uses.
 	check("extension default export is a factory function", typeof cwdScopeGate, "function");
+	// strip the ambient forwarding env so the factory pins below run the
+	// handler unprovisioned; the try's finally restores the snapshot
+	delete process.env[CHILD_ASK_ROOT_ENV];
+	delete process.env[CHILD_ASK_TOKEN_ENV];
 	const registered = [];
 	const stubPi = {
 		on(name, handler) {
@@ -2135,6 +2151,68 @@ try {
 		"/etc/passwd",
 	);
 
+	// --- EXT-38: the FENCE_DISABLE registration switch -------------------
+	// The sanctioned off-switch (the dispatch-interval precedent): with
+	// FENCE_DISABLE set to any non-empty value the factory registers an
+	// inert no-op handler. The import graph stays intact (the subagent
+	// extension imports this module directly, so a source-level disable
+	// fails extension load and kills every dispatched child), the gate
+	// never consults the seal, the roots, or the filesystem, and nothing
+	// prompts or forwards. Unset or empty arms the gate exactly as the
+	// pins above hold it.
+	check("FENCE_DISABLE_ENV export is the switch name", FENCE_DISABLE_ENV, "FENCE_DISABLE");
+	const registeredToolCallHandler = () => {
+		const captured = [];
+		cwdScopeGate({
+			on(name, handler) {
+				captured.push({ name, handler });
+			},
+		});
+		return captured.length === 1 && captured[0].name === "tool_call" ? captured[0].handler : null;
+	};
+	process.env[FENCE_DISABLE_ENV] = "1";
+	const disabledHandler = registeredToolCallHandler();
+	delete process.env[FENCE_DISABLE_ENV];
+	check(
+		"the disabled factory still registers exactly one tool_call handler",
+		disabledHandler !== null,
+		true,
+	);
+	const inertCtx = {
+		cwd: cwdDir,
+		hasUI: false,
+		ui: {
+			select: async () => {
+				throw new Error("the inert handler must not prompt");
+			},
+		},
+	};
+	check(
+		"the disabled handler passes an out-of-scope read without prompting or blocking",
+		await disabledHandler({ toolName: "read", input: { path: "/etc/passwd" } }, inertCtx),
+		undefined,
+	);
+	check(
+		"the disabled handler passes an out-of-scope bash call without prompting or blocking",
+		await disabledHandler({ toolName: "bash", input: { command: "cat /etc/passwd" } }, inertCtx),
+		undefined,
+	);
+	process.env[FENCE_DISABLE_ENV] = "";
+	const emptyValueHandler = registeredToolCallHandler();
+	delete process.env[FENCE_DISABLE_ENV];
+	const emptyValueBlock = await emptyValueHandler(
+		{ toolName: "read", input: { path: "/etc/passwd" } },
+		{ cwd: cwdDir, hasUI: false, ui: { select: async () => "Yes" } },
+	);
+	check("an empty FENCE_DISABLE value arms the gate (headless block, no channel flow)", emptyValueBlock && emptyValueBlock.block, true);
+	checkContains("the armed empty-value block names the fence", emptyValueBlock.reason, "blocked by the workspace-fence");
+	const unsetHandler = registeredToolCallHandler();
+	const unsetBlock = await unsetHandler(
+		{ toolName: "read", input: { path: "/etc/passwd" } },
+		{ cwd: cwdDir, hasUI: false, ui: { select: async () => "Yes" } },
+	);
+	check("an unset FENCE_DISABLE arms the gate (headless block, no channel flow)", unsetBlock && unsetBlock.block, true);
+
 	// --- PISCOPE-2-2: the AST detection layer swap -----------------------
 	// Pins for the tree-sitter detection layer behind the unchanged
 	// BashScanResult contract: the EXT-34 sed closure (the pattern-first
@@ -2208,6 +2286,97 @@ try {
 	check(
 		"a post-heredoc redirect statement still extracts its target",
 		(await bashGate({ input: { command: `wc -l << EOF\nbody\nEOF\n> ${outFile}` } })).action,
+		"ask",
+	);
+
+	// --- EXT-38: the benign-heredoc defect corpus ------------------------
+	// The dispatch-file idiom (cat writing a report body through a
+	// quoted-delimiter heredoc to an in-scope target) blocked headless on
+	// the deployed legacy lexical fence: that scanner bailed on every
+	// heredoc leader with the unmodeled-syntax reason, so every manager
+	// dispatch entry and instruction file heredoc asked. The AST walk
+	// parses each shape below to a verdict; these pins hold the passes so
+	// the merge carrying the AST stack cannot regress them, and the
+	// closing gate pin proves the corpus carries no silent direction.
+	const ext38Body = "---\nFindings:\n- prose naming /etc/passwd stays body data\n---";
+	check(
+		"the dispatch report idiom passes (quoted delimiter, redirect-first, benign body)",
+		(await bashGate({ input: { command: `cat > ${insideDir}/ext38-report.md << 'EOF'\n${ext38Body}\nEOF` } })).action,
+		"pass",
+	);
+	check(
+		"the dispatch report idiom parses clean through the grammar (the legacy bail trigger is gone)",
+		(await scan(`cat > ${insideDir}/ext38-report.md << 'EOF'\n${ext38Body}\nEOF`)).bail,
+		false,
+	);
+	check(
+		"the dispatch report idiom extracts only its target (the body stays data)",
+		JSON.stringify((await scan(`cat > ${insideDir}/ext38-report.md << 'EOF'\n${ext38Body}\nEOF`)).operands),
+		JSON.stringify([`${insideDir}/ext38-report.md`]),
+	);
+	check(
+		"the unquoted-delimiter idiom passes (redirect-first, benign body)",
+		(await bashGate({ input: { command: `cat > ${insideDir}/ext38-report.md << EOF\nplain body line\nEOF` } })).action,
+		"pass",
+	);
+	check(
+		"the heredoc-first placement passes (quoted delimiter after the redirect target)",
+		(await bashGate({ input: { command: `cat << 'EOF' > ${insideDir}/ext38-report.md\nplain body line\nEOF` } })).action,
+		"pass",
+	);
+	check(
+		"the dash-dash delimiter form passes (indented benign body)",
+		(await bashGate({ input: { command: `cat >> ${insideDir}/ext38-report.md <<- 'EOF'\n\t\tindented body line\n\tEOF` } })).action,
+		"pass",
+	);
+	check(
+		"a non-shell consumer keeps a body of path prose as data (tee)",
+		(await bashGate({ input: { command: `tee ${insideDir}/ext38-report.md << 'EOF'\nsee docs/workspace-fence.md and/or /etc/passwd prose\nEOF` } })).action,
+		"pass",
+	);
+	check(
+		"the defect idiom with an out-of-scope target still gates",
+		(await bashGate({ input: { command: `cat > /etc/ext38-probe.md << 'EOF'\n${ext38Body}\nEOF` } })).action,
+		"ask",
+	);
+
+	// --- EXT-38: the clean-idiom shapes -----------------------------------
+	// The probe round's passing shapes pinned so the idioms the fleet's
+	// instruction files rely on stay fence-clean across the merge: board
+	// ops run from the project cwd with no cd prefix (a bare-word task
+	// filename extracts no path operand), the cross-board --dir flag
+	// form carries the board root as an ordinary in-scope operand, a
+	// report body rides a redirect whose source resolves in the temp
+	// subtree, and the cd-to-unseeded-root form still asks (the
+	// cross-board block; --dir is its remedy).
+	check(
+		"the no-cd board op passes (tasks show with a bare-word task filename from the project cwd)",
+		(await bashGate({ input: { command: "tasks show EXT-38-20261126-1529-make-tasks-cli-usage-fence-clean.md" } })).action,
+		"pass",
+	);
+	check(
+		"the no-cd board op extracts no operand (the bare-word filename is not path-shaped)",
+		JSON.stringify((await scan("tasks show EXT-38-20261126-1529-make-tasks-cli-usage-fence-clean.md")).operands),
+		JSON.stringify([]),
+	);
+	check(
+		"the --dir cross-board form passes (the board root rides as an in-scope operand)",
+		(await bashGate({ input: { command: `tasks show EXT-38-20261126-1529-make-tasks-cli-usage-fence-clean.md --dir ${insideDir}` } })).action,
+		"pass",
+	);
+	check(
+		"the report redirect-from-file shape passes (the body file resolves in the temp subtree)",
+		(await bashGate({ input: { command: `tasks report EXT-38-20261126-1529-make-tasks-cli-usage-fence-clean.md --slug 1-heredoc-defect --from worker < ${customTmpDir}/ext38-report-body.md` } })).action,
+		"pass",
+	);
+	check(
+		"the report redirect-from-file shape extracts its source file as the one operand",
+		JSON.stringify((await scan(`tasks report EXT-38-20261126-1529-make-tasks-cli-usage-fence-clean.md --slug 1-heredoc-defect --from worker < ${customTmpDir}/ext38-report-body.md`)).operands),
+		JSON.stringify([`${customTmpDir}/ext38-report-body.md`]),
+	);
+	check(
+		"the cd-to-unseeded-board-root compound asks (the cross-board block)",
+		(await bashGate({ input: { command: `cd ${outsideDir} && tasks show EXT-38-20261126-1529-make-tasks-cli-usage-fence-clean.md` } })).action,
 		"ask",
 	);
 
@@ -3754,6 +3923,10 @@ try {
 	check("a repeat approval stays one grant row", parentGrantedDirectories().length, 1);
 	resetFenceAskState();
 } finally {
+	if (typeof handlerSavedAskRoot === "string") process.env[CHILD_ASK_ROOT_ENV] = handlerSavedAskRoot;
+	else delete process.env[CHILD_ASK_ROOT_ENV];
+	if (typeof handlerSavedAskToken === "string") process.env[CHILD_ASK_TOKEN_ENV] = handlerSavedAskToken;
+	else delete process.env[CHILD_ASK_TOKEN_ENV];
 	fs.rmSync(fixtureRoot, { recursive: true, force: true });
 }
 
@@ -4311,6 +4484,9 @@ check(
 		true,
 	);
 }
+
+check("the suite leaves the ask-root env at its start state", process.env[CHILD_ASK_ROOT_ENV], handlerSavedAskRoot);
+check("the suite leaves the ask-token env at its start state", process.env[CHILD_ASK_TOKEN_ENV], handlerSavedAskToken);
 
 const passed = total - failed;
 console.log(`\n${passed}/${total} passed, ${failed} failed`);

@@ -15,7 +15,10 @@
  *
  * Wiring: the factory registers one tool_call handler over the six
  * path-bearing tools (read, write, edit, grep, find, ls), gating the
- * `path` input field. In-scope verdicts pass through untouched and
+ * `path` input field, unless FENCE_DISABLE is set to any non-empty
+ * value, in which case the registration is an inert no-op handler and
+ * the session runs ungated (the sanctioned off-switch; the export
+ * surface and every import route stay intact). In-scope verdicts pass through untouched and
  * prompt nothing. An out-of-scope verdict in a UI session (ctx.hasUI)
  * asks via ctx.ui.select Yes/No, the permission-gate precedent; any
  * answer other than Yes blocks with a reason naming the tool, the
@@ -209,7 +212,10 @@
  * ever narrows the allowlist. The union is read lazily once per
  * process at the first gated verdict, memoized beside the seal
  * (fenceExtraRoots, reset by resetFenceExtraRoots), so a config edit or
- * env change mid-session needs a restart to apply.
+ * env change mid-session needs a restart to apply. A live session
+ * predating an overlay change never re-reads the config (the stale-
+ * memo session lag): the remedy is a session restart, which picks the
+ * new union up at the fresh session's first gated verdict.
  *
  * Unit 1-2 adds the runtime-grant producer side: an approved
  * out-of-scope ask records a parent-own grant into the fence-ask
@@ -276,6 +282,18 @@ export const FENCE_CONFIG_FILE = "workspace-fence.config.json";
  * roots; its absence is the normal case and is tolerated silently.
  */
 export const FENCE_LOCAL_CONFIG_FILE = "workspace-fence.local.json";
+
+/**
+ * Environment variable that disarms the gate at registration: set to
+ * any non-empty value, the default factory registers an inert no-op
+ * tool_call handler and nothing prompts, blocks, or forwards for the
+ * session. This is the sanctioned off-switch for intervals the user
+ * rules the fence off: the import graph stays intact (module-level
+ * consumers such as the subagent extension keep resolving their
+ * imports, unlike a source-level rename or stub which fails extension
+ * load), and unset or empty arms the gate unchanged.
+ */
+export const FENCE_DISABLE_ENV = "FENCE_DISABLE";
 
 /**
  * The unicode-space characters pi's normalizeUnicodeSpaces replaces
@@ -1534,9 +1552,16 @@ export async function forwardHeadlessAsk(call: HeadlessForwardCall): Promise<Hea
  * and the seal stays omitted so the real release seal evaluates
  * exactly once per session. Prompt answers other than Yes are
  * refusals: the user is never tricked into approval by a stale dialog.
+ * The FENCE_DISABLE environment variable (FENCE_DISABLE_ENV), when set
+ * to any non-empty value at registration, swaps the armed handler for
+ * an inert no-op: every tool_call returns undefined without consulting
+ * the seal, the allowed roots, or the filesystem, and no prompt is
+ * ever raised. Unset or empty registers the armed handler below.
  */
 export default function (pi: ExtensionAPI) {
+	const disabled = (process.env[FENCE_DISABLE_ENV] ?? "").length > 0;
 	pi.on("tool_call", async (event, ctx) => {
+		if (disabled) return undefined;
 		const shared = {
 			toolName: event.toolName,
 			input: event.input as Record<string, unknown>,

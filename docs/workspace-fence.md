@@ -41,6 +41,7 @@ process's silent scope.
   overlay for machine-dependent roots; its absence is the normal case.
 - `PISCOPE_EXTRA_ROOTS`: colon-separated absolute paths appended to the
   union.
+- `FENCE_DISABLE`: set to any non-empty value, disarms the gate at registration (the factory registers an inert no-op handler and nothing prompts, blocks, or forwards, while every import route stays intact); unset or empty arms the gate unchanged.
 
 The union evaluates once per process (memoized): a config or env edit
 mid-session needs a restart. Dispatched children receive their starting
@@ -48,6 +49,16 @@ scope composed at spawn time: config union, parent-own runtime grants,
 and the parent session cwd when the dispatch cwd differs from the
 parent session cwd. Sibling child-ask grants never compose into that
 inheritance; they dedup at ask time instead (properties 1 and 3 below).
+
+## The clean command idioms
+
+The EXT-38 probe round established which command shapes the fence passes headless, and the fleet's instruction files follow the shapes here. The heredoc file-writing idiom (cat feeding a quoted-delimiter heredoc into an in-scope target) parses on the tree-sitter stack and runs unprompted: the deployed lexical fence that predated the AST swap bailed on every heredoc leader with the unmodeled-syntax reason, and the swap is the fix, so a benign body (body text extracts no operand) passes while an interpolating body still asks (its expansion runs) and an out-of-scope redirect target still gates.
+
+Board operations run from the project working directory with no cd prefix: a bare-word task filename extracts no path operand, so `tasks show <task-file>.md` passes as an operand-free command. For a board outside the session scope, the `--dir <board-root>` flag carries the root as an ordinary operand and passes when that root is seeded (an overlay entry or the session subtree); the `cd <board-root> && tasks ...` form asks because the cd target resolves as an operand and an unseeded root is out of scope, and the `--dir` form is its remedy.
+
+Report bodies ride a file redirect: write the body to an in-scope or temp-subtree file and run `tasks report ... < <body-file>`; the redirect source extracts as the one operand and resolves in scope, so the shape passes headless.
+
+Filename discovery through an `ls | grep` pipeline trips the substitution bias the moment its result feeds an expansion, so discovery uses literal filenames; a tasks-CLI verb that lists current task filenames is the durable replacement and is flagged to the manager as out-of-territory work (the CLI lives in the dotfiles repo's shell/, outside the fence territory).
 
 ## The forwarded-ask channel
 
