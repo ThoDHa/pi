@@ -107,6 +107,34 @@ assert.equal(scoutModel.thinking?.length, 2, "the agent's thinking log streams t
 assert.deepEqual(scoutModel.thinking?.[0], { at: 1_500, text: "first thought\nsecond line" });
 assert.deepEqual(scoutModel.thinking?.[1], { at: 2_500, text: "revised thought" });
 
+// --- agent target: the thinking level field (EXT-39) ---
+
+const levelRegistry = createDispatchRegistry();
+const levelTask = levelRegistry.startTask({ mode: "single", prompt: "level detail", now: 1_000 });
+levelRegistry.startRound(levelTask.id, [{ agent: "planner", thinkingLevel: "xhigh" }], 1_000);
+levelRegistry.startRound(levelTask.id, [{ agent: "scout" }], 2_000);
+const levelNavTasks = buildNavigatorTasks(levelRegistry, [], NOW);
+const levelState = createExpansionState();
+levelState.completedExpanded = true;
+const levelRows = flattenNavigatorTree(levelNavTasks, levelState);
+levelRows.filter((row) => row.kind === "round").forEach((row) => levelState.roundOverrides.set(row.id, true));
+const leveledRows = flattenNavigatorTree(levelNavTasks, levelState);
+
+const leveledRow = leveledRows.find((row) => row.kind === "agent" && row.label === "planner");
+assert.ok(leveledRow, "the level fixture exposes the leveled agent row");
+const leveledModel = resolveDetailModel(leveledRow, levelNavTasks);
+const leveledFields = Object.fromEntries(leveledModel.fields.map((field) => [field.label, field.value]));
+assert.equal(leveledFields.thinking, "xhigh", "the detail pane carries the level as its own field in the full vocabulary form");
+
+const bareRow = leveledRows.find((row) => row.kind === "agent" && row.label === "scout");
+assert.ok(bareRow, "the level fixture exposes the level-less agent row");
+const bareModel = resolveDetailModel(bareRow, levelNavTasks);
+assert.equal(
+	Object.fromEntries(bareModel.fields.map((field) => [field.label, field.value])).thinking,
+	undefined,
+	"a node predating the level wiring renders no thinking field",
+);
+
 // --- agent target: failed agent reports the stop reason and error ---
 
 const failedRows = flattenNavigatorTree(buildNavigatorTasks(registry, [], NOW), expandedState);

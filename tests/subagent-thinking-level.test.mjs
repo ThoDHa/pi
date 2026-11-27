@@ -441,10 +441,69 @@ check("the subagent tool schema carries no thinkingLevel parameter", () => {
 	}
 });
 
-check("runSingleAgent consumes the resolveDispatchThinkingLevel decision", () => {
+check("runSingleAgent consumes the resolveDispatchRuntime resolution, which routes the --thinking decision through resolveDispatchThinkingLevel", () => {
 	const indexSource = fs.readFileSync(path.join(WORKTREE_ROOT, "extensions", "subagent", "index.ts"), "utf8");
-	if (!indexSource.includes("resolveDispatchThinkingLevel(agent, dispatchDefaults)")) {
-		throw new Error("runSingleAgent no longer routes the --thinking decision through resolveDispatchThinkingLevel");
+	if (!indexSource.includes("resolveDispatchRuntime(agent, dispatchDefaults)")) {
+		throw new Error("runSingleAgent no longer routes its spawn runtime through resolveDispatchRuntime");
+	}
+	const resolverStart = indexSource.indexOf("export function resolveDispatchRuntime(");
+	if (resolverStart === -1) throw new Error("resolveDispatchRuntime helper not found in index.ts");
+	const resolverEnd = indexSource.indexOf("\n}", resolverStart);
+	const resolverBody = indexSource.slice(resolverStart, resolverEnd);
+	if (!resolverBody.includes("resolveDispatchThinkingLevel(agent, dispatchDefaults)")) {
+		throw new Error("resolveDispatchRuntime no longer routes the --thinking decision through resolveDispatchThinkingLevel");
+	}
+});
+
+// The registry pickup sites resolve through the same helper, so a
+// registry node carries its spawn-time model and thinking level from
+// the moment it exists (the parallel pickup, the single and chain
+// round rosters, and the detached slot start) instead of waiting for
+// the first streamed update.
+check("the dispatch registry pickups record the resolved runtime via the same helper", () => {
+	const indexSource = fs.readFileSync(path.join(WORKTREE_ROOT, "extensions", "subagent", "index.ts"), "utf8");
+	for (const pickup of ["resolveAgentRuntime(t.agent)", "resolveAgentRuntime(params.agent)", "resolveAgentRuntime(step.agent)", "resolveSlotRuntime(slot)"]) {
+		if (!indexSource.includes(pickup)) {
+			throw new Error(`registry pickup wiring lost: ${pickup} no longer feeds the pickup site`);
+		}
+	}
+});
+
+// resolveDispatchRuntime: the pair a dispatch runs an agent with. The
+// model resolution mirrors runSingleAgent's legacy fallback (frontmatter
+// model, else the session model) and the thinking level routes through
+// resolveDispatchThinkingLevel; an unknown agent claims nothing, since
+// the dispatch fails before spawning and the node must not carry a
+// runtime it never ran.
+const runtimeCases = [
+	["frontmatter thinking and pinned model reach the pair untouched", { thinkingLevel: "max" }, {}, "max", "glm-5.3"],
+	[
+		"an unpinned agent inherits the session model and thinking level",
+		{ model: undefined },
+		{ model: "session/model", thinkingLevel: "high" },
+		"high",
+		"session/model",
+	],
+	[
+		"a model-pinned agent without frontmatter claims no thinking level",
+		{},
+		{ model: "session/model", thinkingLevel: "high" },
+		undefined,
+		"glm-5.3",
+	],
+	["no defaults and no frontmatter yields the empty pair", { model: undefined }, {}, undefined, undefined],
+];
+for (const [label, overrides, defaults, expectedLevel, expectedModel] of runtimeCases) {
+	check(`resolveDispatchRuntime: ${label}`, () => {
+		const resolved = subagent.resolveDispatchRuntime(makeAgent(overrides), defaults);
+		if (resolved.thinkingLevel !== expectedLevel) throw new Error(`expected thinkingLevel ${expectedLevel}, got ${resolved.thinkingLevel}`);
+		if (resolved.model !== expectedModel) throw new Error(`expected model ${expectedModel}, got ${resolved.model}`);
+	});
+}
+check("resolveDispatchRuntime: an unknown agent claims nothing", () => {
+	const resolved = subagent.resolveDispatchRuntime(undefined, { model: "session/model", thinkingLevel: "high" });
+	if (resolved.model !== undefined || resolved.thinkingLevel !== undefined) {
+		throw new Error(`expected the empty pair, got ${JSON.stringify(resolved)}`);
 	}
 });
 

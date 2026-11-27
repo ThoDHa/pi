@@ -22,6 +22,7 @@ import {
 	type DispatchRegistry,
 	type DispatchRoundNode,
 	formatDuration,
+	formatThinkingLevel,
 	isRoundLive,
 	statusGlyph,
 	type StatusGlyphName,
@@ -47,6 +48,8 @@ export interface StripAgentEntry {
 	name: string;
 	glyph: "running" | "done" | "failed";
 	durationText: string;
+	/** Pi ThinkingLevel value the agent runs at, when the node recorded one; absent renders nothing (pre-wiring records). */
+	thinkingLevel?: string;
 }
 
 export interface StripRoundEntry {
@@ -109,13 +112,14 @@ function orderSettledViews(tasks: StripTaskView[]): StripTaskView[] {
 }
 
 function agentEntryLine(entry: StripAgentEntry): StripLine {
-	return {
-		segments: [
-			{ text: statusGlyph(entry.glyph), color: GLYPH_COLORS[entry.glyph] },
-			{ text: ` ${entry.name}`, color: "toolTitle", bold: true },
-			{ text: ` · ${entry.durationText}`, color: "muted" },
-		],
-	};
+	const segments: StripSegment[] = [
+		{ text: statusGlyph(entry.glyph), color: GLYPH_COLORS[entry.glyph] },
+		{ text: ` ${entry.name}`, color: "toolTitle", bold: true },
+	];
+	const level = formatThinkingLevel(entry.thinkingLevel);
+	if (level) segments.push({ text: ` · ${level}`, color: "muted" });
+	segments.push({ text: ` · ${entry.durationText}`, color: "muted" });
+	return { segments };
 }
 
 function roundEntryLine(entry: StripRoundEntry): StripLine {
@@ -209,6 +213,7 @@ function agentEntry(agent: DispatchAgentNode, now: number): StripAgentEntry {
 		name: agent.agent,
 		glyph: agent.status,
 		durationText: formatDuration((agent.finishedAt ?? now) - agent.startedAt),
+		thinkingLevel: agent.thinkingLevel,
 	};
 }
 

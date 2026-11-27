@@ -775,6 +775,26 @@ await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (
 	assert.ok(expandedRender.includes("mapper"));
 });
 
+// --- n/p: the next/previous cursor keys alongside the arrows ---
+
+await withView({ registry: scrollFixture().registry, detachedJobs: [] }, async (view) => {
+	view.handleInput("n");
+	assert.equal(view.selectedId, "t:task-1:r1", "n moves the cursor to the next entry");
+	view.handleInput("n");
+	view.handleInput("n");
+	assert.equal(view.selectedId, "t:task-1:r1:a1", "n walks down through the tree entries");
+	view.handleInput("n");
+	assert.equal(view.selectedId, "t:task-1:r1:a1", "n at the last row clamps in place");
+	view.handleInput("p");
+	assert.equal(view.selectedId, "t:task-1:r1:a0", "p moves the cursor to the previous entry");
+	view.handleInput("p");
+	view.handleInput("p");
+	view.handleInput("p");
+	assert.equal(view.selectedId, "t:task-1", "p walks back up through the tree entries");
+	view.handleInput("p");
+	assert.equal(view.selectedId, "t:task-1", "p at the first row clamps in place");
+});
+
 // --- expand/collapse chevrons per kind and state, and the ❯ selection cursor ---
 
 // A chain fixture exposing every expandable kind at once: a live task
@@ -2084,7 +2104,7 @@ function deferredTranscriptReader() {
 // --- hints line: the longer hints line truncates inside a narrow width ---
 
 await withView({ registry: createDispatchRegistry(), detachedJobs: [] }, async (view) => {
-	const HINTS = "↑/↓ move · ←/→ collapse/expand · enter toggle · tab next task · pgup/pgdn scroll · ctrl+t tools · t thinking · esc close";
+	const HINTS = "↑/↓/n/p move · ←/→ collapse/expand · enter toggle · tab next task · pgup/pgdn scroll · ctrl+t tools · t thinking · esc close";
 	const lines = view.render(30);
 	assert.ok(visibleWidth(HINTS) > 30, "the hints line actually exceeds the narrow width");
 	assert.equal(lines[lines.length - 1], truncateToWidth(HINTS, 30), "the hints line truncates, not overflows");

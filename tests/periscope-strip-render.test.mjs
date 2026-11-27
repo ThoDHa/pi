@@ -24,7 +24,10 @@
  * fallback, "(detached)" on an empty resolution) and keying glyphs off
  * job.status, and detached per-agent nodes (the EXT-1-3 wiring)
  * streaming per-agent glyph and duration onto the strip with the
- * agentNames fallback for snapshots predating it.
+ * agentNames fallback for snapshots predating it. EXT-39: the
+ * spawn-time thinking level joins the agent chip between the name and
+ * the duration (compact token), absent on pre-wiring nodes and on the
+ * agentNames fallback so those render the baseline shape unchanged.
  */
 
 import assert from "node:assert/strict";
@@ -264,6 +267,44 @@ assert.equal(detachedFailedView.settledAt, 60_000, "a settled detached view's se
 
 const detachedBlankView = views[3];
 assert.equal(detachedBlankView.label, "(detached)", "an empty taskPreview falls back to (detached) instead of a bare header");
+
+// --- buildStripTasks: the spawn-time thinking level maps onto the agent chip ---
+
+const levelRegistry = createDispatchRegistry();
+const levelTask = levelRegistry.startTask({ mode: "single", prompt: "level chip", now: 1_000 });
+levelRegistry.startRound(levelTask.id, [{ agent: "planner", thinkingLevel: "high" }], 1_000);
+const levelView = buildStripTasks(levelRegistry, [], 4_000)[0];
+assert.equal(levelView.entries.length, 1);
+assert.equal(levelView.entries[0].thinkingLevel, "high", "the chip entry carries the node's recorded thinking level");
+
+levelRegistry.startTask({ mode: "single", prompt: "no level", now: 1_000 });
+levelRegistry.startRound("task-2", [{ agent: "scout" }], 1_000);
+const bareLevelView = buildStripTasks(levelRegistry, [], 4_000)[1];
+assert.equal(
+	bareLevelView.entries[0].thinkingLevel,
+	undefined,
+	"a node predating the level wiring carries no level (absent renders nothing)",
+);
+
+// --- renderStripLines: the level joins the agent chip between name and duration ---
+
+const leveledTask = {
+	label: "EXT-39",
+	mode: "single",
+	live: true,
+	glyph: "running",
+	settledAt: null,
+	entries: [
+		{ kind: "agent", name: "planner", glyph: "running", durationText: "45s", thinkingLevel: "high" },
+		{ kind: "agent", name: "reviewer", glyph: "running", durationText: "12s", thinkingLevel: "minimal" },
+		{ kind: "agent", name: "scout", glyph: "running", durationText: "8s" },
+	],
+};
+const leveledLines = renderStripLines([leveledTask], { hint: "hint" });
+assert.ok(lineContains(leveledLines[1], "planner · high · 45s"), "the chip renders the level between the name and the duration");
+assert.ok(lineContains(leveledLines[2], "reviewer · min · 12s"), "the dense chip uses the compact token");
+assert.equal(lineContains(leveledLines[3], "scout · 8s"), true, "a chip without a level renders the baseline name-duration shape unchanged");
+assert.equal(lineContains(leveledLines[3], "undefined"), false, "an absent level never leaks the literal into the line");
 
 // --- buildStripTasks: snapshots without node data fall back to agentNames ---
 

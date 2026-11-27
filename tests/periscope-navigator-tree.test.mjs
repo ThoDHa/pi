@@ -354,6 +354,26 @@ assert.equal(lateFirstView.durationText, "8s", "task duration ends at the latest
 	assert.equal(mixedLiveView.rounds[1].glyph, "running");
 }
 
+// --- buildNavigatorTasks / flattenNavigatorTree: the thinking level on the agent row ---
+
+const levelRegistry = createDispatchRegistry();
+const levelChain = levelRegistry.startTask({ mode: "chain", prompt: "Task: EXT-39 level rows", now: 1_000 });
+levelRegistry.startRound(levelChain.id, [{ agent: "planner", step: 1, thinkingLevel: "high" }], 1_000);
+levelRegistry.startRound(levelChain.id, [{ agent: "reviewer", step: 2, thinkingLevel: "medium" }], 2_000);
+levelRegistry.startRound(levelChain.id, [{ agent: "scout", step: 3 }], 3_000);
+const levelTasks = buildNavigatorTasks(levelRegistry, [], 5_000);
+assert.equal(levelTasks[0].rounds[0].agents[0].thinkingLevel, "high", "agent views carry the node's recorded level through");
+assert.equal(levelTasks[0].rounds[1].agents[0].thinkingLevel, "med");
+assert.equal(levelTasks[0].rounds[2].agents[0].thinkingLevel, undefined, "a pre-wiring node carries no level");
+
+const levelState = createExpansionState();
+const levelRows = flattenNavigatorTree(levelTasks, levelState);
+const levelAgentRows = levelRows.filter((row) => row.kind === "agent");
+assert.equal(levelAgentRows[0].detail, "high · 4s", "a leveled agent row leads its detail with the compact level token");
+assert.equal(levelAgentRows[1].detail, "med · 3s");
+assert.equal(levelAgentRows[2].detail, "2s", "a level-less row renders the baseline duration-only detail (pre-wiring shape)");
+assert.equal(levelAgentRows[2].detail.includes("undefined"), false, "the literal never leaks into the row detail");
+
 // --- flattenNavigatorTree: rows, depths, completed collapsed, live expanded ---
 
 const state = createExpansionState();

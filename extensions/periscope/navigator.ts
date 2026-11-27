@@ -27,6 +27,7 @@ import {
 	type StatusGlyphName,
 	extractThinkingEntries,
 	formatDuration,
+	formatThinkingLevel,
 	formatTokenCount,
 	formatUsageSummary,
 	isRoundLive,
@@ -53,6 +54,8 @@ export interface NavigatorAgentView {
 	/** Recent full-text thinking blocks for the detail pane, oldest first, capped like the activity log. */
 	thinkingLog: DispatchThinkingEntry[];
 	model?: string;
+	/** Compact display token for the level the agent runs at, recorded at spawn; absent on pre-wiring nodes, which render nothing for it. */
+	thinkingLevel?: string;
 	cwd?: string;
 	usage?: DispatchUsageSnapshot;
 	result?: DispatchResultSnapshot;
@@ -107,6 +110,7 @@ function agentView(node: DispatchAgentNode, ref: NavigatorAgentRef, fallbackEnd:
 		activityLog: node.activity ?? [],
 		thinkingLog: node.thinkingLog ?? [],
 		model: node.model,
+		thinkingLevel: formatThinkingLevel(node.thinkingLevel) || undefined,
 		cwd: node.cwd,
 		usage: node.usage,
 		result: node.result,
@@ -230,6 +234,15 @@ export interface NavigatorRow {
 }
 
 /**
+ * Agent row's detail text in the tree: the compact level token leads
+ * when the node recorded one, and a pre-wiring node renders the
+ * baseline duration-only detail unchanged.
+ */
+function agentRowDetail(agent: NavigatorAgentView): string {
+	return agent.thinkingLevel ? `${agent.thinkingLevel} · ${agent.durationText}` : agent.durationText;
+}
+
+/**
  * Flatten task views into the visible rows the view renders.
  * Tasks render as header rows and hide their whole subtree when
  * collapsed. The expansion default is partition-keyed: a live task is
@@ -298,7 +311,7 @@ export function flattenNavigatorTree(tasks: NavigatorTaskView[], state: Navigato
 						live: agent.status === "running",
 						glyph: agent.status,
 						label: agent.name,
-						detail: agent.durationText,
+						detail: agentRowDetail(agent),
 						roundIndex: round.index,
 						agentRef: agent.ref,
 					});
@@ -317,7 +330,7 @@ export function flattenNavigatorTree(tasks: NavigatorTaskView[], state: Navigato
 					live: agent.status === "running",
 					glyph: agent.status,
 					label: agent.name,
-					detail: agent.durationText,
+					detail: agentRowDetail(agent),
 					agentRef: agent.ref,
 				});
 			});
@@ -487,7 +500,7 @@ function resolveAgentView(row: NavigatorRow, task: NavigatorTaskView): Navigator
 /**
  * Resolve the selected row into the model the detail pane renders.
  * Agent targets resolve through their tree ref and carry the status
- * header fields (step, model, cwd, tokens, error, duration), the
+ * header fields (step, model, thinking, cwd, tokens, error, duration), the
  * timestamped activity log, the shared usage summary, the final
  * result text, and the run window (the agent's startedAt/finishedAt
  * when both are finite) that scopes the t keybinding's transcript
@@ -530,6 +543,7 @@ export function resolveDetailModel(row: NavigatorRow | null | undefined, tasks: 
 		const fields: NavigatorDetailField[] = [];
 		if (agent.step !== undefined) fields.push({ label: "step", value: String(agent.step) });
 		if (agent.model) fields.push({ label: "model", value: agent.model });
+		if (agent.thinkingLevel) fields.push({ label: "thinking", value: agent.thinkingLevel });
 		if (agent.cwd) fields.push({ label: "cwd", value: agent.cwd });
 		if (agent.usage?.contextTokens) fields.push({ label: "tokens", value: formatTokenCount(agent.usage.contextTokens) });
 		const errorMessage = agent.result?.errorMessage;

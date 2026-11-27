@@ -143,7 +143,7 @@ const TREE_PANE_MIN_WIDTH = 26;
 const DETAIL_PANE_MIN_WIDTH = 30;
 const PANE_GAP = 3;
 
-const HINTS_LINE = "↑/↓ move · ←/→ collapse/expand · enter toggle · tab next task · pgup/pgdn scroll · ctrl+t tools · t thinking · esc close";
+const HINTS_LINE = "↑/↓/n/p move · ←/→ collapse/expand · enter toggle · tab next task · pgup/pgdn scroll · ctrl+t tools · t thinking · esc close";
 
 /**
  * Per-event wheel ceiling in detail lines: above the stack's largest
@@ -482,17 +482,30 @@ export class NavigatorView implements Focusable {
 		return this.keybindings.matches(data, action) || matchesKey(data, fallbackKey);
 	}
 
+	/** Cursor move shared by the ↑/↓/n/p keys: selects the row delta positions away, clamped at both ends. */
+	private moveSelection(delta: number): void {
+		this.select(moveCursor(this.rows, this.selectedIndex, delta));
+	}
+
 	handleInput(data: string): void {
 		if (matchesKey(data, "escape") || matchesKey(data, this.sources.navigatorKey)) {
 			this.done(undefined);
 			return;
 		}
 		if (matchesKey(data, "up")) {
-			this.select(moveCursor(this.rows, this.selectedIndex, -1));
+			this.moveSelection(-1);
 			return;
 		}
 		if (matchesKey(data, "down")) {
-			this.select(moveCursor(this.rows, this.selectedIndex, 1));
+			this.moveSelection(1);
+			return;
+		}
+		if (matchesKey(data, "n")) {
+			this.moveSelection(1);
+			return;
+		}
+		if (matchesKey(data, "p")) {
+			this.moveSelection(-1);
 			return;
 		}
 		if (matchesKey(data, "tab")) {

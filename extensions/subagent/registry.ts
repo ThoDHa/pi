@@ -45,6 +45,26 @@ export interface DispatchResultSnapshot {
 	errorMessage?: string;
 }
 
+/**
+ * The spawn-time identity a registry agent node records at creation:
+ * the agent name and optional chain step, plus the resolved runtime
+ * the dispatch passes the child process (--model/--thinking), so the
+ * display surfaces carry model and thinking level from pickup instead
+ * of from the first streamed update. Both node-creation entrypoints
+ * take it (startRound's roster for the single/chain paths, startAgent's
+ * pickup for the lazy parallel path); fields left absent leave the
+ * node fields absent, so records predating the wiring render nothing.
+ */
+export interface DispatchAgentSeed {
+	agent: string;
+	/** 1-based step index for chain rounds. */
+	step?: number;
+	/** Resolved model id the agent runs with, when known. */
+	model?: string;
+	/** Resolved pi ThinkingLevel value the agent runs at, when known. */
+	thinkingLevel?: string;
+}
+
 export interface DispatchAgentNode {
 	agent: string;
 	/** 1-based step index for chain rounds. */
@@ -60,6 +80,8 @@ export interface DispatchAgentNode {
 	thinkingLog?: DispatchThinkingEntry[];
 	/** Model id the agent runs with, when known. */
 	model?: string;
+	/** Pi ThinkingLevel value the agent runs at, when known; resolved at spawn and recorded at node creation. */
+	thinkingLevel?: string;
 	/** Effective working directory of the agent process, when known. */
 	cwd?: string;
 	usage?: DispatchUsageSnapshot;
@@ -87,6 +109,7 @@ export interface DispatchAgentUpdate {
 	activity?: DispatchActivityEntry[];
 	thinkingLog?: DispatchThinkingEntry[];
 	model?: string;
+	thinkingLevel?: string;
 	cwd?: string;
 	usage?: DispatchUsageSnapshot;
 	result?: DispatchResultSnapshot;
@@ -140,21 +163,26 @@ export interface DispatchRegistry {
 	 * startAgent, and that roster MUST be followed by same-tick
 	 * pickups: isRoundLive counts a zero-agent round as live, so a
 	 * round left empty at rest renders live forever on both surfaces,
-	 * and no settle escape exists by design.
+	 * and no settle escape exists by design. Each seed's model and
+	 * thinkingLevel record onto its node at creation, the node-creation
+	 * point the single/chain paths use.
 	 */
-	startRound(taskId: string, agents: Array<{ agent: string; step?: number }>, now?: number): DispatchRoundNode;
+	startRound(taskId: string, agents: DispatchAgentSeed[], now?: number): DispatchRoundNode;
 	/**
 	 * Append one running agent node to a round at the moment its slot is
 	 * picked up — the lazy publication pattern for dispatch paths that
 	 * open a round with an empty roster (startRound(taskId, [])), so
 	 * each node's startedAt is its own agent's start and never-picked-up
-	 * slots leave no nodes. The slot must equal the round's current node
-	 * count: pickups append in slot order, which keeps the
-	 * slot-indexed lookup in updateAgent valid. Throws on an unknown
-	 * task id or round (same rule as startRound: a silent no-op would
-	 * strand the dispatch untracked) and on an out-of-order slot.
+	 * slots leave no nodes. The seed's model and thinkingLevel record
+	 * onto the node at pickup, so the display surfaces carry the
+	 * spawn-time runtime before the first streamed update. The slot must
+	 * equal the round's current node count: pickups append in slot
+	 * order, which keeps the slot-indexed lookup in updateAgent valid.
+	 * Throws on an unknown task id or round (same rule as startRound: a
+	 * silent no-op would strand the dispatch untracked) and on an
+	 * out-of-order slot.
 	 */
-	startAgent(taskId: string, roundIndex: number, slot: number, input: { agent: string; step?: number }, now?: number): DispatchAgentNode;
+	startAgent(taskId: string, roundIndex: number, slot: number, input: DispatchAgentSeed, now?: number): DispatchAgentNode;
 	/** Merge the defined fields of the update into the targeted agent node; unknown ids are ignored. */
 	updateAgent(taskId: string, roundIndex: number, slot: number, update: DispatchAgentUpdate): void;
 	/** Mark every still-running agent of the task failed (abort/dispatch-error cleanup). */
@@ -199,6 +227,8 @@ export function createDispatchRegistry(): DispatchRegistry {
 				agents: agents.map((slot) => ({
 					agent: slot.agent,
 					step: slot.step,
+					model: slot.model,
+					thinkingLevel: slot.thinkingLevel,
 					status: "running",
 					startedAt: now ?? Date.now(),
 				})),
@@ -218,6 +248,8 @@ export function createDispatchRegistry(): DispatchRegistry {
 			const node: DispatchAgentNode = {
 				agent: input.agent,
 				step: input.step,
+				model: input.model,
+				thinkingLevel: input.thinkingLevel,
 				status: "running",
 				startedAt: now ?? Date.now(),
 			};
@@ -271,6 +303,7 @@ export function mergeAgentUpdate(node: DispatchAgentNode, update: DispatchAgentU
 	if (update.activity !== undefined) node.activity = update.activity;
 	if (update.thinkingLog !== undefined) node.thinkingLog = update.thinkingLog;
 	if (update.model !== undefined) node.model = update.model;
+	if (update.thinkingLevel !== undefined) node.thinkingLevel = update.thinkingLevel;
 	if (update.cwd !== undefined) node.cwd = update.cwd;
 	if (update.usage !== undefined) node.usage = update.usage;
 	if (update.result !== undefined) node.result = update.result;
@@ -426,6 +459,31 @@ const TASK_PREVIEW_MAX_CHARS = 80;
  */
 export function formatTaskPreview(task: string): string {
 	return task.replace(/\s+/g, " ").slice(0, TASK_PREVIEW_MAX_CHARS);
+}
+
+/**
+ * Compact display token for a pi ThinkingLevel value on the dense
+ * surfaces (the strip's agent chip, the navigator's agent rows):
+ * minimal and medium abbreviate to min and med, the rest of the
+ * vocabulary already renders short and passes through unchanged, and
+ * an unknown value also passes through (display honesty over silent
+ * dropping). Absent or empty renders empty so the dense surfaces
+ * append nothing, which is what records predating the level wiring
+ * carry.
+ */
+const THINKING_LEVEL_SHORT_FORMS: Record<string, string> = {
+	off: "off",
+	minimal: "min",
+	low: "low",
+	medium: "med",
+	high: "high",
+	xhigh: "xhigh",
+	max: "max",
+};
+
+export function formatThinkingLevel(level: string | undefined): string {
+	if (!level) return "";
+	return THINKING_LEVEL_SHORT_FORMS[level] ?? level;
 }
 
 /** Structural subset of a streamed message, so pi message types satisfy it without an import. */

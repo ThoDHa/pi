@@ -199,6 +199,7 @@ interface SingleResult {
 	stderr: string;
 	usage: UsageStats;
 	model?: string;
+	thinkingLevel?: ThinkingLevel;
 	stopReason?: string;
 	errorMessage?: string;
 	step?: number;
@@ -259,6 +260,7 @@ function agentUpdateFromResult(result: SingleResult, cwd: string | undefined, no
 		activity: extractActivityLog(result.messages),
 		thinkingLog: extractThinkingLog(result.messages),
 		model: result.model,
+		thinkingLevel: result.thinkingLevel,
 		cwd,
 		usage: { ...result.usage },
 		result: { exitCode: result.exitCode, stopReason: result.stopReason, errorMessage: result.errorMessage },
@@ -420,6 +422,29 @@ export function resolveDispatchThinkingLevel(
 	return agent.model ? undefined : dispatchDefaults.thinkingLevel;
 }
 
+/**
+ * Resolve the `--model` / `--thinking` pair a dispatch runs one agent
+ * with: the model falls back to the session default when the agent
+ * frontmatter pins none, and the thinking level routes through
+ * resolveDispatchThinkingLevel's precedence. The registry pickup
+ * sites (the single/chain round rosters, the lazy parallel startAgent,
+ * the detached startSlot) call this alongside runSingleAgent so a
+ * registry node carries its runtime identity from the moment it
+ * exists. An unknown agent claims nothing (the empty pair): the
+ * dispatch of a name discovery never produced fails before spawning,
+ * and a node must not carry a runtime it never ran.
+ */
+export function resolveDispatchRuntime(
+	agent: AgentConfig | undefined,
+	dispatchDefaults: DispatchDefaults,
+): { model?: string; thinkingLevel?: ThinkingLevel } {
+	if (!agent) return {};
+	return {
+		model: agent.model ?? dispatchDefaults.model,
+		thinkingLevel: resolveDispatchThinkingLevel(agent, dispatchDefaults),
+	};
+}
+
 async function runSingleAgent(
 	defaultCwd: string,
 	dispatchDefaults: DispatchDefaults,
@@ -450,9 +475,8 @@ async function runSingleAgent(
 	}
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-	const model = agent.model ?? dispatchDefaults.model;
+	const { model, thinkingLevel } = resolveDispatchRuntime(agent, dispatchDefaults);
 	if (model) args.push("--model", model);
-	const thinkingLevel = resolveDispatchThinkingLevel(agent, dispatchDefaults);
 	if (thinkingLevel) args.push("--thinking", thinkingLevel);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
@@ -468,6 +492,7 @@ async function runSingleAgent(
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 		model,
+		thinkingLevel,
 		step,
 	};
 
@@ -789,6 +814,8 @@ async function runDetachedJob(
 	// steps never enter a snapshot; a node's startedAt is its own
 	// step's start, matching the blocking rounds' timing.
 	const slotNodes = new Map<number, DispatchAgentNode>();
+	const resolveSlotRuntime = (slot: number) =>
+		resolveDispatchRuntime(agents.find((candidate) => candidate.name === steps[slot].agent), dispatchDefaults);
 	const startSlot = (slot: number): DispatchAgentNode => {
 		const existing = slotNodes.get(slot);
 		if (existing) return existing;
@@ -798,6 +825,7 @@ async function runDetachedJob(
 			status: "running",
 			startedAt: Date.now(),
 			cwd: steps[slot].cwd ?? defaultCwd,
+			...resolveSlotRuntime(slot),
 		};
 		slotNodes.set(slot, node);
 		publishDetachedJobSnapshot(job, slotNodes);
@@ -1202,6 +1230,11 @@ export default function (pi: ExtensionAPI) {
 			const parentSessionId = ctx.sessionManager?.getSessionId();
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
+			// The registry pickup sites record the spawn-time runtime (model
+			// and thinking level) on their nodes through the same resolution
+			// runSingleAgent spawns with.
+			const resolveAgentRuntime = (agentName: string) =>
+				resolveDispatchRuntime(agents.find((candidate) => candidate.name === agentName), dispatchDefaults);
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
 
 			const hasChain = (params.chain?.length ?? 0) > 0;
@@ -1339,7 +1372,9 @@ export default function (pi: ExtensionAPI) {
 					for (let i = 0; i < params.chain.length; i++) {
 						const step = params.chain[i];
 						const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
-						const round = dispatchRegistry.startRound(taskNode.id, [{ agent: step.agent, step: i + 1 }]);
+						const round = dispatchRegistry.startRound(taskNode.id, [
+							{ agent: step.agent, step: i + 1, ...resolveAgentRuntime(step.agent) },
+						]);
 
 						// Create update callback that includes all previous results
 						const chainUpdate: OnUpdateCallback = (partial) => {
@@ -1444,7 +1479,10 @@ export default function (pi: ExtensionAPI) {
 					};
 
 					const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
-						dispatchRegistry.startAgent(taskNode.id, dispatchRound.index, index, { agent: t.agent });
+						dispatchRegistry.startAgent(taskNode.id, dispatchRound.index, index, {
+							agent: t.agent,
+							...resolveAgentRuntime(t.agent),
+						});
 						const result = await runSingleAgent(
 							ctx.cwd,
 							dispatchDefaults,
@@ -1501,7 +1539,7 @@ export default function (pi: ExtensionAPI) {
 					mode: "single",
 					prompt: params.task,
 				});
-				const dispatchRound = dispatchRegistry.startRound(taskNode.id, [{ agent: params.agent }]);
+				const dispatchRound = dispatchRegistry.startRound(taskNode.id, [{ agent: params.agent, ...resolveAgentRuntime(params.agent) }]);
 				try {
 					const streamingUpdate: OnUpdateCallback = (partial) => {
 						syncRegistryAgent(dispatchRegistry, taskNode.id, dispatchRound.index, 0, partial.details?.results[0], params.cwd ?? ctx.cwd);

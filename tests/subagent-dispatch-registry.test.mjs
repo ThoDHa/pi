@@ -39,6 +39,7 @@ import {
 	extractThinkingEntries,
 	extractThinkingLog,
 	formatTaskPreview,
+	formatThinkingLevel,
 	formatUsageSummary,
 	getSharedDispatchState,
 	mergeAgentUpdate,
@@ -172,6 +173,45 @@ assert.equal(lazyNodes.length, 2, "the abort cleanup creates no nodes for never-
 assert.equal(lazyNodes[0]?.status, "failed");
 assert.equal(lazyNodes[0]?.finishedAt, NOW + 4_000);
 assert.equal(lazyNodes[1]?.status, "done", "already-settled lazy nodes keep their status");
+
+// --- startAgent / startRound: spawn-time model and thinking level on the node ---
+
+const runtime = createDispatchRegistry();
+const runtimeTask = runtime.startTask({ mode: "parallel", prompt: "runtime identity", now: NOW });
+runtime.startRound(runtimeTask.id, [], NOW);
+const runtimePicked = runtime.startAgent(
+	runtimeTask.id,
+	1,
+	0,
+	{ agent: "planner", model: "glm-5.3", thinkingLevel: "high" },
+	NOW + 1_000,
+);
+assert.equal(runtimePicked.model, "glm-5.3", "startAgent records the spawn-time resolved model on the node");
+assert.equal(runtimePicked.thinkingLevel, "high", "startAgent records the spawn-time resolved thinking level on the node");
+assert.equal(
+	runtime.getTask(runtimeTask.id)?.rounds[0]?.agents[0]?.thinkingLevel,
+	"high",
+	"the stored node carries the level so the strip renders it before the first streamed update",
+);
+
+// A roster-published round (single/chain) records the same fields at
+// round start, the node-creation point those paths use.
+const rosterRegistry = createDispatchRegistry();
+const rosterTask = rosterRegistry.startTask({ mode: "single", prompt: "roster runtime", now: NOW });
+rosterRegistry.startRound(
+	rosterTask.id,
+	[{ agent: "reviewer", step: 1, model: "openai/gpt-5", thinkingLevel: "max" }],
+	NOW,
+);
+const rosterNode = rosterRegistry.getTask(rosterTask.id)?.rounds[0]?.agents[0];
+assert.equal(rosterNode?.model, "openai/gpt-5");
+assert.equal(rosterNode?.thinkingLevel, "max");
+
+// A pickup without the fields (the shape predating the wiring) leaves
+// both undefined: renderers treat absent as nothing.
+const barePicked = runtime.startAgent(runtimeTask.id, 1, 1, { agent: "scout" }, NOW + 2_000);
+assert.equal(barePicked.model, undefined);
+assert.equal(barePicked.thinkingLevel, undefined);
 
 // --- reset clears everything (session replacement) ---
 
@@ -473,6 +513,11 @@ assert.equal(mergedNode.status, "done");
 assert.equal(mergedNode.finishedAt, NOW + 5_000);
 assert.equal(mergedNode.lastActivity, "$ rg pattern", "undefined update fields never clobber node fields");
 
+mergeAgentUpdate(mergedNode, { thinkingLevel: "xhigh" });
+assert.equal(mergedNode.thinkingLevel, "xhigh", "the thinking level merges like every other defined field");
+mergeAgentUpdate(mergedNode, { thinkingLevel: undefined });
+assert.equal(mergedNode.thinkingLevel, "xhigh", "an absent thinking level never clobbers the node's recorded one");
+
 mergeAgentUpdate(mergedNode, { thinkingLog: [{ at: NOW, text: "weighed the options" }] });
 assert.deepEqual(mergedNode.thinkingLog, [{ at: NOW, text: "weighed the options" }], "the thinking log merges like every other defined field");
 mergeAgentUpdate(mergedNode, { thinkingLog: [{ at: NOW + 1, text: "revised thought" }] });
@@ -543,6 +588,19 @@ for (const boundaryLength of [79, 80, 81]) {
 		`a ${boundaryLength}-character task renders ${expected.length} characters (79/80 unchanged, 81 sliced)`,
 	);
 }
+
+// --- formatThinkingLevel: the compact display token shared by the dense surfaces ---
+
+assert.equal(formatThinkingLevel("high"), "high");
+assert.equal(formatThinkingLevel("low"), "low");
+assert.equal(formatThinkingLevel("max"), "max");
+assert.equal(formatThinkingLevel("off"), "off");
+assert.equal(formatThinkingLevel("xhigh"), "xhigh");
+assert.equal(formatThinkingLevel("minimal"), "min", "the two long words abbreviate; the rest of the vocabulary is already short");
+assert.equal(formatThinkingLevel("medium"), "med");
+assert.equal(formatThinkingLevel(undefined), "", "an absent level renders empty so dense surfaces append nothing (pre-wiring records)");
+assert.equal(formatThinkingLevel(""), "");
+assert.equal(formatThinkingLevel("unexpected"), "unexpected", "an unknown value passes through honestly instead of being dropped");
 
 // --- getSharedDispatchState: one globalThis-converged state ---
 
