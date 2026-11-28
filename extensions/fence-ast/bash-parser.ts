@@ -25,8 +25,11 @@
  *   degrades to a rejection (and then to ask verdicts) instead of
  *   holding every gated bash call for the process lifetime (review
  *   finding DC-1). The budget rejects; it does not cancel the
- *   underlying load, so a slow-but-alive init can still complete and
- *   the reject-and-retry memoization picks it up on the next call.
+ *   underlying load. The orphaned init is adopted by no one: a retry
+ *   re-runs initialization from scratch, and the orphan's eventual
+ *   wasm allocation is never released - one bounded leak per
+ *   budget-expiry cycle, the deliberate tradeoff for never holding a
+ *   gated call hostage to a wedged load.
  * - Failures are rejections, never synchronous throws: the factory is
  *   async and `loadBashParser()` always returns a promise. A rejected
  *   or budget-expired initialization does not poison the memo; the
@@ -54,7 +57,11 @@
  *   suite pins that walk). The deployed agent root sits above this
  *   repository and is untracked by design; unit PISCOPE-2-3's landing
  *   evidence re-runs the live parse probe from that directory to
- *   discharge the deployed walk, which this repo cannot see.
+ *   discharge the deployed walk, which this repo cannot see. The
+ *   vendored node-types.json rides beside the executable artifacts as
+ *   the grammar's declared vocabulary surface: inert data the
+ *   vocabulary check and the re-pin gate read, digest-pinned and
+ *   verified with the rest before any vendored byte loads.
  *
  * The parser never throws at load time from the fence's perspective:
  * the bash pass's detection layer awaits this promise inside its own
@@ -210,11 +217,12 @@ export function verifyGrammarArtifacts(
 /**
  * Race one initialization step-set against the bounded budget (review
  * finding DC-1). The budget rejects with a descriptive error; it does
- * not cancel the raced promise, so a slow-but-alive init completes in
- * the background and the reject-and-retry memoization adopts it on the
- * next call. `budgetMs` is injectable so the suite can pin the hung
- * init behavior against a small budget instead of waiting out the real
- * constant.
+ * not cancel the raced promise, and the retry re-runs initialization
+ * from scratch - the orphaned load is adopted by no one and its wasm
+ * allocation is never released (one bounded leak per budget-expiry
+ * cycle, the deliberate tradeoff). `budgetMs` is injectable so the
+ * suite can pin the hung init behavior against a small budget instead
+ * of waiting out the real constant.
  */
 export function withInitBudget<T>(init: Promise<T>, budgetMs: number = BASH_PARSER_INIT_TIMEOUT_MS): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;

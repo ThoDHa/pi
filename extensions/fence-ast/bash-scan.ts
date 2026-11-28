@@ -29,12 +29,22 @@
  * - A heredoc body is prose bash never parses as commands, but an
  *   interpolating body still runs its expansions; the walk scans
  *   bodies for expansion nodes (which ask). When the statement's
- *   head consumer reads stdin as a script (a shell, su, ssh, eval,
- *   or bare-redirect exec identity, wrappers and their arguments
- *   stripped), the body is that script's text, so its words
- *   extract and gate exactly as executor payload words do; a
- *   non-shell consumer's heredoc stays data, and a here-string
- *   value under such a head rides the same rule.
+ *   command stream feeds a script consumer (any stdin-script identity
+ *   among the stream's tokens: a shell, su, ssh, eval, an interpreter,
+ *   or a bare-redirect exec; wrappers and their arguments looked
+ *   through; the statement pipeline's last stage owning the
+ *   statement's stdin, and every stage of a post-heredoc continuation
+ *   pipeline consulted because each receives body-derived bytes), the
+ *   body is that script's text, so its words extract and gate exactly
+ *   as executor payload words do; a data consumer's heredoc stays
+ *   data, and a here-string value under an active seam rides the same
+ *   rule - including a pipeline-wide seam, because a here-string on
+ *   any pipeline stage puts value-derived bytes on every later
+ *   stage's stdin and a script consumer anywhere in the pipeline
+ *   executes them (cat forwards its stdin; the posture reads
+ *   presence, so an upstream stage that ignores stdin over-asks).
+ *   The posture is position-independent, so a statement that merely
+ *   mentions a shell word over-asks, the disclosed tradeoff.
  * - The grammar splits a mid-word backslash-newline continuation into
  *   two word nodes where bash glues them into one; bash removes the
  *   pair and splits the rest on whitespace, so the walk re-joins the
@@ -72,13 +82,13 @@ import { withBashParse, type BashSyntaxNode } from "./bash-parser.ts";
 export interface BashScanResult {
 	/** The walk met an expansion node (any form bash would expand: $, ${}, $(), $(( )), backticks, process substitution, ANSI-C quoting) anywhere in the parsed tree: one position-blind traversal flags every expansion node the grammar produces (escapes honored by the grammar; single-quoted text exempt except under executor shapes and seam-active heredoc or here-string text carrying a raw $ or backtick). */
 	substitution: boolean;
-	/** An executor invocation (a shell/su/ssh token under lexical path-stripped identity with a -c-carrying flag, glued forms included, or eval) anywhere in one command node's token stream, name or arguments: detection is position-independent over the stream, so a prefixed payload (sudo bash -c, watch bash -c) re-splits exactly as a bare one does. */
+	/** An executor invocation anywhere in one command node's token stream: a shell/su token with a -c or su long --command flag, ssh, eval, or a payload-carrying interpreter (python, node, perl, ruby, php, Rscript, osascript, lua) with its payload flag. Detection is position-independent over the stream, so a prefixed payload (sudo bash -c, watch bash -c, env python3 -c) re-splits exactly as a bare one does. */
 	executor: boolean;
 	/** The wrapper spelling when an executor shape rides behind command/env/nohup/nice/timeout/exec in one command node: the walk cannot see through it, so the call floors to ask. */
 	interposed: string | null;
 	/** The parse carries an ERROR or missing token (broken quoting, malformed syntax): the bail class is parse health, not a syntax vocabulary. */
 	bail: boolean;
-	/** The assigned variable name when the walk met an assignment in any posture (lone, command prefix, declaration, append, subscript) or an env spelling carrying a hijackable execution vector (PROMPT_COMMAND, BASH_ENV, ZDOTDIR, ENV, LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH, PS4, PATH): the shell or its loader consumes the value for deferred or indirect execution regardless of its shape, so the assignment itself floors the call to ask. */
+	/** The assigned variable name when the walk met an assignment in any posture (lone, command prefix, declaration, append, subscript) or an env spelling carrying a hijackable execution vector: the pinned floor (PROMPT_COMMAND, BASH_ENV, ZDOTDIR, ENV, LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH, PS4, PATH, CDPATH, FPATH, HISTFILE) plus every LD_ loader-family name outside the inert allowlist. The shell or its loader consumes the value for deferred or indirect execution regardless of its shape, so the assignment itself floors the call to ask. */
 	envVector: string | null;
 	/** Set when a cd/pushd names no lexically resolvable target (bare cd, -, option-only). */
 	cdAsk: string | null;
@@ -133,8 +143,8 @@ const EXECUTOR_PAYLOAD_DOLLAR_KIND =
 const STDIN_SCRIPT_DOLLAR_KIND =
 	"a raw $ or backtick in a stdin-script body (the consumer shell re-evaluates it)";
 
-/** Node types whose presence is substitution: any form bash would expand. */
-const EXPANSION_NODE_TYPES: ReadonlySet<string> = new Set([
+/** Node types whose presence is substitution: any form bash would expand. Exported for the grammar-vocabulary completeness check (extensions/fence-ast/grammar-vocabulary.ts) and the re-pin gate. */
+export const EXPANSION_NODE_TYPES: ReadonlySet<string> = new Set([
 	"simple_expansion",
 	"expansion",
 	"command_substitution",
@@ -143,11 +153,11 @@ const EXPANSION_NODE_TYPES: ReadonlySet<string> = new Set([
 	"ansi_c_string",
 ]);
 
-/** Argument-shape node types whose resolved text feeds extraction. */
-const ARG_NODE_TYPES: ReadonlySet<string> = new Set(["word", "string", "raw_string", "concatenation"]);
+/** Argument-shape node types whose resolved text feeds extraction. A translated string ($"...") resolves exactly as its plain double-quoted twin when no translation is installed, so its text strips the marker and reads as string content. Exported for the grammar-vocabulary completeness check. */
+export const ARG_NODE_TYPES: ReadonlySet<string> = new Set(["word", "string", "raw_string", "concatenation", "translated_string"]);
 
-/** Subtrees the extraction walk reads nothing from: comments are inert to bash, heredoc tags and bodies are not operands, and a command_name is identity, not an operand. Expansion PRESENCE is independent of this list - the generic traversal reads the full tree - so no skip here can hide an expansion. */
-const SKIP_SUBTREE_TYPES: ReadonlySet<string> = new Set([
+/** Subtrees the extraction walk reads nothing from: comments are inert to bash, heredoc tags and bodies are not operands, and a command_name is identity, not an operand. Expansion PRESENCE is independent of this list - the generic traversal reads the full tree - so no skip here can hide an expansion. Exported for the grammar-vocabulary completeness check. */
+export const SKIP_SUBTREE_TYPES: ReadonlySet<string> = new Set([
 	"comment",
 	"heredoc_start",
 	"heredoc_end",
@@ -162,9 +172,16 @@ const BASH_EXECUTOR_SHELLS: ReadonlySet<string> = new Set(["bash", "zsh", "sh", 
  * Redirect operator tokens: anonymous grammar tokens whose node type
  * is the operator text itself. file_redirect children iterate in
  * source order as optional fd, operator, destination, so the operator
- * must not read as an unmodeled destination shape.
+ * must not read as an unmodeled destination shape. The set is
+ * deliberately not staleness-checked against the grammar's declared
+ * surface (grammar-vocabulary.ts): these are anonymous defensive
+ * spellings, operator drift degrades to the unmodeled-shape
+ * substitution bias (fail-safe), and one spelling here (`<>`) is not
+ * declared by the grammar at all - every real `<>` shape carries an
+ * ERROR node and bails to ask before this set is ever consulted.
+ * Exported for the grammar-vocabulary completeness check.
  */
-const REDIRECT_OPERATOR_TYPES: ReadonlySet<string> = new Set([
+export const REDIRECT_OPERATOR_TYPES: ReadonlySet<string> = new Set([
 	">",
 	">>",
 	">&",
@@ -194,20 +211,25 @@ const BASH_INTERPOSER_WORDS: ReadonlySet<string> = new Set(["command", "env", "n
 
 /**
  * Variables the shell or its loader consumes for deferred or indirect
- * execution rather than as data, the full hijackable family (advisor
- * confirmation memos 19 and 23, review 22): PROMPT_COMMAND runs at
- * every interactive prompt, BASH_ENV is sourced by every
- * non-interactive shell, ZDOTDIR and ENV point the shell family at
- * startup files, LD_PRELOAD loads into the next exec of any
- * dynamically linked binary, LD_AUDIT is dlopened by the same loader
- * on the next exec and its constructor runs, LD_LIBRARY_PATH
- * redirects the loader's library search on the next exec (a planted
- * matching-soname library executes), PS4 executes its expansion at
- * the first xtrace line, and PATH redirects executable lookup on
- * every subsequent command. A value's shape proves nothing about what
- * will run, so an assignment in any posture or an env spelling
- * carrying one of these names floors the call to ask regardless of
- * the value.
+ * execution rather than as data, the pinned floor of the hijackable
+ * family (advisor confirmation memos 19 and 23, review 22, unit 2-3's
+ * routed siblings): PROMPT_COMMAND runs at every interactive prompt,
+ * BASH_ENV is sourced by every non-interactive shell, ZDOTDIR and ENV
+ * point the shell family at startup files, LD_PRELOAD loads into the
+ * next exec of any dynamically linked binary, LD_AUDIT is dlopened by
+ * the same loader on the next exec and its constructor runs,
+ * LD_LIBRARY_PATH redirects the loader's library search on the next
+ * exec (a planted matching-soname library executes), PS4 executes its
+ * expansion at the first xtrace line, PATH redirects executable
+ * lookup on every subsequent command, CDPATH redirects cd's directory
+ * lookup the same way (a pre-planted out-of-scope directory receives
+ * the cd), FPATH redirects zsh's function autoload lookup (a planted
+ * function file executes on the next call), and HISTFILE receives the
+ * shell's recorded command lines on exit (an out-of-scope file write
+ * whose content re-executes through history expansion). A value's
+ * shape proves nothing about what will run, so an assignment in any
+ * posture or an env spelling carrying one of these names floors the
+ * call to ask regardless of the value.
  */
 const BASH_DEFERRED_EXECUTION_VARS: ReadonlySet<string> = new Set([
 	"PROMPT_COMMAND",
@@ -219,7 +241,26 @@ const BASH_DEFERRED_EXECUTION_VARS: ReadonlySet<string> = new Set([
 	"LD_LIBRARY_PATH",
 	"PS4",
 	"PATH",
+	"CDPATH",
+	"FPATH",
+	"HISTFILE",
 ]);
+
+/** The loader-family prefix rule (review 25 DC-2): every LD_ name joins the floor automatically, so the next loader-consumed name needs no pin cycle. The inert allowlist carries the names that only toggle loader diagnostics or binding mode and execute no code. */
+const LD_LOADER_NAME_PREFIX = "LD_";
+const LD_INERT_LOADER_NAMES: ReadonlySet<string> = new Set(["LD_DEBUG", "LD_BIND_NOW", "LD_TRACE_LOADED_OBJECTS", "LD_SHOW_AUXV"]);
+
+/**
+ * The deferred-execution vector test: the pinned name floor plus the
+ * loader-family prefix rule. The enumerated set stays the pinned
+ * surface every posture pin names; the prefix rule admits the loader
+ * family's unnamed siblings without ending the floor's precision.
+ */
+function isDeferredExecutionVectorName(name: string): boolean {
+	if (BASH_DEFERRED_EXECUTION_VARS.has(name)) return true;
+	if (!name.startsWith(LD_LOADER_NAME_PREFIX)) return false;
+	return !LD_INERT_LOADER_NAMES.has(name);
+}
 
 /**
  * A combined-flag token carrying -c, glued-value forms included:
@@ -230,7 +271,43 @@ const BASH_DEFERRED_EXECUTION_VARS: ReadonlySet<string> = new Set([
  */
 const bashExecutorFlag = /^-[a-zA-Z]*c/;
 
-/** Raw-text carriers of expansion the executor shapes re-evaluate: $ forms and backticks anywhere in the raw command. */
+/** su's long-form command flag spellings: --command VALUE and --command=VALUE carry the payload exactly as the short -c does. */
+const bashSuLongCommandFlag = /^(--command|--command=.+)$/;
+
+/** Short-cluster payload-flag test for one interpreter identity's flag characters: the cluster form -xflag matches glued spellings (-c'code') exactly as bashExecutorFlag does for the shells. */
+function interpreterPayloadFlagTests(chars: string, longForms: RegExp[] = []): readonly RegExp[] {
+	return [new RegExp(`^-[a-zA-Z]*[${chars}]`), ...longForms];
+}
+
+/**
+ * The payload-carrying interpreters (unit PISCOPE-2-3's routed
+ * closure): each carries executable strings through a flag whose
+ * argument the interpreter evaluates in its own language, so the
+ * payload gates through the same executor machinery as the shells.
+ * python -c, node -e/-p and --eval, perl -e, ruby -e, php -r,
+ * Rscript -e, osascript -e, lua -e.
+ */
+const INTERPRETER_PAYLOAD_FLAG_TESTS: Readonly<Record<string, readonly RegExp[]>> = Object.freeze({
+	python: interpreterPayloadFlagTests("c"),
+	python2: interpreterPayloadFlagTests("c"),
+	python3: interpreterPayloadFlagTests("c"),
+	node: interpreterPayloadFlagTests("ep", [/^(--eval|--eval=.+)$/]),
+	nodejs: interpreterPayloadFlagTests("ep", [/^(--eval|--eval=.+)$/]),
+	perl: interpreterPayloadFlagTests("e"),
+	ruby: interpreterPayloadFlagTests("e"),
+	php: interpreterPayloadFlagTests("r"),
+	Rscript: interpreterPayloadFlagTests("e"),
+	osascript: interpreterPayloadFlagTests("e"),
+	lua: interpreterPayloadFlagTests("e"),
+});
+
+/**
+ * Raw-text carriers of expansion the SHELL-flavored executor shapes
+ * re-evaluate: $ forms and backticks anywhere in the raw command. An
+ * interpreter payload is code in the interpreter's language, not
+ * shell text, so its dollars and backticks re-evaluate as code, not
+ * as shell expansion; the bias stays keyed to the shell flavor.
+ */
 const bashSubstitutionChars = /[$`]/;
 
 /** sed's script-carrying flags: their value is the edit script, an argument bash never opens. */
@@ -285,6 +362,8 @@ const SED_SCRIPT_FILE_POSITION = "a sed script-file flag value";
 interface ScanAccumulator {
 	substitution: boolean;
 	executor: boolean;
+	/** True when an executor shape of the SHELL flavor fired: its payload is shell text and joins the raw-dollar bias. Interpreter-flavored payloads are code, not shell text. */
+	executorShellText: boolean;
 	interposed: string | null;
 	bail: boolean;
 	envVector: string | null;
@@ -329,8 +408,11 @@ function unescapeBashText(text: string): string {
  * The quote-stripped, escape-processed text of one argument-shape
  * node: a word unescapes as bash does, a raw_string strips its single
  * quotes and keeps backslashes literally (bash cannot process escapes
- * there), a string strips its double quotes, and a concatenation
- * joins its parts. This text drives identity, flag, and cd matching.
+ * there), a string strips its double quotes, a translated string
+ * strips its $" marker and reads as its plain double-quoted twin (no
+ * translation installed means the text passes through unchanged),
+ * and a concatenation joins its parts. This text drives identity,
+ * flag, and cd matching.
  */
 function processedTextOf(node: BashSyntaxNode): string {
 	switch (node.type) {
@@ -340,6 +422,8 @@ function processedTextOf(node: BashSyntaxNode): string {
 			return node.text.slice(1, -1);
 		case "string":
 			return node.text.slice(1, -1);
+		case "translated_string":
+			return node.text.slice(2, -1);
 		case "concatenation": {
 			let joined = "";
 			for (let i = 0; i < node.childCount; i++) {
@@ -369,6 +453,13 @@ function piecesOfNode(node: BashSyntaxNode): string[] {
 		case "raw_string": {
 			const inner = node.text.slice(1, -1);
 			return inner.split(bashWhitespaceSplit).filter((piece) => piece.length > 0);
+		}
+		case "translated_string": {
+			const inner = node.text.slice(2, -1);
+			return inner
+				.split(bashWhitespaceSplit)
+				.filter((piece) => piece.length > 0)
+				.map(unescapeBashText);
 		}
 		case "string": {
 			const inner = node.text.slice(1, -1);
@@ -428,8 +519,11 @@ function interpreterScriptFlag(identity: string, text: string): { spelling: stri
  * next token when separated), and that argument's pieces label as the
  * interpreter payload. Position-independent over the stream, the same
  * posture executor detection uses, so a prefixed spelling labels exactly
- * as the bare one does. Only consulted outside the executor posture,
- * which relabels the whole command's arguments as its own payload.
+ * as the bare one does. Interpreter labels take precedence over the
+ * executor phrase: the interpreter posture relabels its payload
+ * argument more precisely than the executor floor's generic phrase,
+ * which covers the command's remaining arguments only when no
+ * interpreter label exists.
  */
 function interpreterPayloadLabels(tokenTexts: string[]): Map<number, string> {
 	const labels = new Map<number, string>();
@@ -458,7 +552,8 @@ function interpreterPayloadLabels(tokenTexts: string[]): Map<number, string> {
  * the token stream, spelled as the invocation it is (a shell or su with
  * its -c flag, bare ssh, or eval), mirroring
  * tokensCarryExecutorShape's scan order. The trailing fallback is
- * unreachable at a true executor posture; it keeps the phrase total.
+ * reachable for executor postures the named shapes do not spell (a
+ * su --command payload); it keeps the phrase total there.
  */
 function executorPayloadLabel(tokenTexts: string[]): string {
 	for (let index = 0; index < tokenTexts.length; index++) {
@@ -516,17 +611,18 @@ function executorPayloadPieces(text: string): string[] {
  * Whether an identity consumes stdin as a script: the shell family
  * reads its script from stdin when run without arguments, su spawns a
  * shell, ssh runs the remote shell on stdin, eval executes the
- * command line its arguments join with stdin inherited by whatever
- * runs, and a bare exec (redirect-only, no argument) applies its
- * redirections to the current shell so a later command reads the
- * attached text as stdin. Executor detection uses the same identity
- * family.
+ * command line its arguments join, and the interpreters read stdin as
+ * their script when given no script argument. exec is not carried
+ * here: its membership is argument-sensitive and lives in
+ * commandCarriesStdinScriptIdentity.
  */
-function isStdinScriptIdentity(identity: string): boolean {
-	return (
-		BASH_EXECUTOR_SHELLS.has(identity) || identity === "su" || identity === "ssh" || identity === "eval" || identity === "exec"
-	);
-}
+const STDIN_SCRIPT_IDENTITIES: ReadonlySet<string> = new Set([
+	...BASH_EXECUTOR_SHELLS,
+	"su",
+	"ssh",
+	"eval",
+	...Object.keys(INTERPRETER_PAYLOAD_FLAG_TESTS),
+]);
 
 /**
  * The default provenance phrase: an operand whose extraction position no
@@ -538,12 +634,32 @@ const ARGUMENT_POSITION = "a command argument";
 /**
  * Push the path-like words of one stdin-script text (a heredoc body
  * or a here-string value handed to such a consumer) as operands,
- * deduped in walk order, naming the statement head that reads them
- * (EXT-37: the seam source is the trigger provenance).
+ * deduped in walk order, naming the seam's activating consumer (the
+ * position-independent seam's first stdin-script identity, head or
+ * not; EXT-37: the seam source is the trigger provenance).
  */
 function pushStdinScriptPieces(text: string, acc: ScanAccumulator, position: string): void {
 	for (const piece of executorPayloadPieces(text)) {
 		if (isPathLikeBashWord(piece)) pushOperand(acc, piece, position);
+	}
+}
+
+/**
+ * Consume one seam-active stdin-script text (a heredoc body or a
+ * here-string value): raw dollars or backticks bias to substitution
+ * (the executor corner's backstop, the kind named for the ask's
+ * expansion kinds), otherwise the path-like words extract as operands
+ * named by the position string (EXT-37: the seam source is the
+ * trigger provenance). Already-flagged substitution short-circuits so
+ * extraction never runs behind an ask the walk has already raised.
+ */
+function consumeStdinScriptText(text: string, acc: ScanAccumulator, position: string): void {
+	if (acc.substitution) return;
+	if (bashSubstitutionChars.test(text)) {
+		acc.substitution = true;
+		recordSubstitutionKind(acc, STDIN_SCRIPT_DOLLAR_KIND);
+	} else {
+		pushStdinScriptPieces(text, acc, position);
 	}
 }
 
@@ -625,7 +741,7 @@ function assignmentName(node: BashSyntaxNode): string | null {
 function flagDeferredExecutionVector(node: BashSyntaxNode, acc: ScanAccumulator): void {
 	if (acc.envVector !== null) return;
 	const name = assignmentName(node);
-	if (name !== null && BASH_DEFERRED_EXECUTION_VARS.has(name)) {
+	if (name !== null && isDeferredExecutionVectorName(name)) {
 		acc.envVector = name;
 		acc.envVectorPosture = "assignment";
 	}
@@ -664,21 +780,44 @@ function scanAssignment(node: BashSyntaxNode, acc: ScanAccumulator, extractOpera
 /**
  * Whether a token text carries an executor shape, mirroring the
  * lexical scanner's segment rule over one command node's tokens: an
- * eval or ssh identity anywhere, or a shell/su identity followed
- * anywhere later by a -c-carrying flag.
+ * eval or ssh identity anywhere, a shell/su identity followed
+ * anywhere later by a -c-carrying flag (su's long --command forms
+ * included), or an interpreter identity followed anywhere later by
+ * its payload flag. The shell boolean distinguishes the flavors: a
+ * shell-flavored payload is shell text whose raw dollars and
+ * backticks re-evaluate, while an interpreter payload is code in the
+ * interpreter's language and does not join the raw-text bias.
  */
-function tokensCarryExecutorShape(tokens: string[]): boolean {
+function executorShapeInTokens(tokens: string[]): { any: boolean; shell: boolean } {
+	let any = false;
+	let shell = false;
 	for (let index = 0; index < tokens.length; index++) {
 		const identity = bashExecutorTokenIdentity(tokens[index]);
-		if (identity === "eval") return true;
-		if (identity === "ssh") return true;
-		if (BASH_EXECUTOR_SHELLS.has(identity) || identity === "su") {
-			for (let next = index + 1; next < tokens.length; next++) {
-				if (bashExecutorFlag.test(tokens[next])) return true;
+		if (identity === "eval" || identity === "ssh") {
+			any = true;
+			shell = true;
+			continue;
+		}
+		const shellLike = BASH_EXECUTOR_SHELLS.has(identity) || identity === "su";
+		const interpreterFlags = INTERPRETER_PAYLOAD_FLAG_TESTS[identity];
+		if (!shellLike && !interpreterFlags) continue;
+		let flagged = false;
+		for (let next = index + 1; next < tokens.length; next++) {
+			if (shellLike && (bashExecutorFlag.test(tokens[next]) || (identity === "su" && bashSuLongCommandFlag.test(tokens[next])))) {
+				flagged = true;
+				break;
+			}
+			if (interpreterFlags && interpreterFlags.some((test) => test.test(tokens[next]))) {
+				flagged = true;
+				break;
 			}
 		}
+		if (flagged) {
+			any = true;
+			if (shellLike) shell = true;
+		}
 	}
-	return false;
+	return { any, shell };
 }
 
 /**
@@ -807,15 +946,20 @@ function detectCdTarget(pieces: string[], acc: ScanAccumulator): void {
  * return: expansion results are invisible to the walk, so extracted
  * operands would be guesses. The vector flag runs before that gate in
  * every posture (assignment name, env spelling), because the ask
- * condition is the name, not the value.
+ * condition is the name, not the value. The stdin-script seam state
+ * joins the command's own identity with the pipeline-level seam the
+ * walk passes in (seamFeeds): a here-string attached to this command
+ * feeds a script consumer elsewhere in the pipeline, so its value is
+ * script text wherever it actually lands, and extracts with the
+ * raw-dollar backstop exactly as an own-identity value does.
  */
-function handleCommand(node: BashSyntaxNode, acc: ScanAccumulator, source: string): void {
+function handleCommand(node: BashSyntaxNode, acc: ScanAccumulator, source: string, seamFeeds: string | null = null): void {
 	const nameText = commandNameText(node);
 	const identity = bashExecutorTokenIdentity(nameText);
 	const argTokens: ArgumentToken[] = [];
 	const assignments: BashSyntaxNode[] = [];
 	const herestrings: BashSyntaxNode[] = [];
-	const seamIdentity = headIdentityThroughWrappers(node);
+	const seamIdentity = seamFeeds ?? commandCarriesStdinScriptIdentity(node);
 	for (let i = 0; i < node.childCount; i++) {
 		const child = node.child(i);
 		if (!child) continue;
@@ -832,7 +976,7 @@ function handleCommand(node: BashSyntaxNode, acc: ScanAccumulator, source: strin
 		} else if (child.type === "file_redirect") {
 			handleFileRedirect(child, acc);
 		} else if (child.type === "herestring_redirect") {
-			if (isStdinScriptIdentity(seamIdentity)) herestrings.push(child);
+			if (seamIdentity !== null) herestrings.push(child);
 			else walkNode(child, acc, source);
 		} else {
 			walkNode(child, acc, source);
@@ -846,7 +990,7 @@ function handleCommand(node: BashSyntaxNode, acc: ScanAccumulator, source: strin
 		for (const token of argTokens) {
 			const eq = token.text.indexOf("=");
 			const name = eq > 0 ? token.text.slice(0, eq) : null;
-			if (name !== null && BASH_DEFERRED_EXECUTION_VARS.has(name)) {
+			if (name !== null && isDeferredExecutionVectorName(name)) {
 				if (acc.envVector === null) {
 					acc.envVector = name;
 					acc.envVectorPosture = "env spelling";
@@ -858,15 +1002,21 @@ function handleCommand(node: BashSyntaxNode, acc: ScanAccumulator, source: strin
 
 	// Executor detection is position-independent over the command's
 	// full token stream, the same look the interposed check uses: an
-	// eval/ssh identity or a shell/su identity followed by a -c flag
-	// anywhere in the stream sets the executor flag, so a payload under
-	// a non-vocabulary prefix (sudo bash -c, watch bash -c, exec sh -c)
-	// re-splits and gates exactly as the bare spelling does.
-	if (tokensCarryExecutorShape(tokenTexts)) acc.executor = true;
+	// eval/ssh identity, a shell/su identity followed by a -c or su
+	// long --command flag, or an interpreter identity followed by its
+	// payload flag anywhere in the stream sets the executor flag, so a
+	// payload under a non-vocabulary prefix (sudo bash -c, watch bash
+	// -c, exec sh -c, env python3 -c) re-splits and gates exactly as
+	// the bare spelling does. The shell flavor rides separately: only
+	// a shell-flavored payload is shell text whose raw dollars join
+	// the substitution bias.
+	const executorShape = executorShapeInTokens(tokenTexts);
+	if (executorShape.any) acc.executor = true;
+	if (executorShape.shell) acc.executorShellText = true;
 
 	for (let index = 0; index < tokenTexts.length; index++) {
 		if (!BASH_INTERPOSER_WORDS.has(bashExecutorTokenIdentity(tokenTexts[index]))) continue;
-		if (tokensCarryExecutorShape(tokenTexts.slice(index + 1))) {
+		if (executorShapeInTokens(tokenTexts.slice(index + 1)).any) {
 			if (acc.interposed === null) acc.interposed = tokenTexts[index];
 			break;
 		}
@@ -877,18 +1027,13 @@ function handleCommand(node: BashSyntaxNode, acc: ScanAccumulator, source: strin
 	if (acc.executor) {
 		for (const token of argTokens) token.pieces = executorPayloadPieces(token.node.text);
 	}
-	const executorLabel = acc.executor ? executorPayloadLabel(tokenTexts) : null;
-	const interpreterLabels = executorLabel === null ? interpreterPayloadLabels(tokenTexts) : null;
+	const interpreterLabels = interpreterPayloadLabels(tokenTexts);
+	const executorLabel = acc.executor && interpreterLabels.size === 0 ? executorPayloadLabel(tokenTexts) : null;
 	for (const herestring of herestrings) {
 		for (let i = 0; i < herestring.childCount; i++) {
 			const value = herestring.child(i);
 			if (value && ARG_NODE_TYPES.has(value.type)) {
-				if (bashSubstitutionChars.test(value.text)) {
-					acc.substitution = true;
-					recordSubstitutionKind(acc, STDIN_SCRIPT_DOLLAR_KIND);
-				} else {
-					pushStdinScriptPieces(value.text, acc, `a here-string fed to ${seamIdentity} as its stdin script`);
-				}
+				consumeStdinScriptText(value.text, acc, `a here-string fed to ${seamIdentity} as its stdin script`);
 			}
 		}
 	}
@@ -904,8 +1049,8 @@ function handleCommand(node: BashSyntaxNode, acc: ScanAccumulator, source: strin
 		}
 		const position =
 			(roles !== null && roles[i].position !== null ? roles[i].position : null)
+			?? (interpreterLabels.has(i) ? interpreterLabels.get(i) : null)
 			?? executorLabel
-			?? (interpreterLabels !== null && interpreterLabels.has(i) ? interpreterLabels.get(i) : null)
 			?? ARGUMENT_POSITION;
 		for (const piece of argTokens[i].pieces) {
 			if (isPathLikeBashWord(piece)) pushOperand(acc, piece, position);
@@ -951,85 +1096,242 @@ function handleFileRedirect(node: BashSyntaxNode, acc: ScanAccumulator): void {
 }
 
 /**
- * The head consumer's identity of one statement child: the first
- * command node in document order (compound and grouped heads
- * included, so `{ bash; }` reads bash), except a pipeline child reads
- * its LAST stage because a statement's stdin feeds the pipeline's end
- * (`cat x | bash << EOF` runs bash on the body, `bash | cat << EOF`
- * feeds the body to cat as data); or null when the child carries no
- * command. A wrapper identity strips through the interposer words AND
- * their arguments (flags, assignments, durations) so `command bash <<
- * EOF` and `env -i bash << EOF` read bash, the same full-stream
- * look-past posture executor detection uses.
+ * The structured walk of one pipeline node: stages feed each other in
+ * order, so a here-string attached to any stage puts value-derived
+ * bytes on every later stage's stdin, and a script consumer anywhere
+ * in the pipeline executes those bytes as its stdin script (review
+ * 29: `cat <<< 'open("/etc/passwd")' | python3` passed while the
+ * per-command seam check saw only cat's data posture). The pipeline
+ * pre-scans its stages with the position-independent stream looks
+ * (streamFindCarrier over commandCarriesHerestring and
+ * commandCarriesStdinScriptIdentityGuarded, the identity look reading
+ * the consumer's name off the found command): a
+ * here-string on any stage plus a script identity on any stage
+ * makes every here-string under the pipeline ride the seam, so the
+ * value extracts as script pieces with the raw-dollar backstop
+ * wherever it actually lands, and the ask reasons name the pipeline's
+ * script consumer. A pipeline carrying no here-string
+ * walks exactly as the generic descent did, and a heredoc never
+ * appears inside a pipeline stage (the grammar hangs heredocs under
+ * redirected_statement), so heredoc postures are unaffected here.
  */
-function statementHeadIdentity(node: BashSyntaxNode): string | null {
+function handlePipeline(node: BashSyntaxNode, acc: ScanAccumulator, source: string, seamFeeds: string | null): void {
+	let herestringSeen = false;
+	let consumerIdentity: string | null = null;
+	for (let i = 0; i < node.childCount; i++) {
+		const stage = node.child(i);
+		if (!stage) continue;
+		if (streamFindCarrier(stage, commandCarriesHerestring) !== null) herestringSeen = true;
+		if (consumerIdentity === null) {
+			const bearer = streamFindCarrier(stage, commandCarriesStdinScriptIdentityGuarded);
+			if (bearer !== null) consumerIdentity = commandCarriesStdinScriptIdentity(bearer);
+		}
+	}
+	const pipelineSeam = seamFeeds ?? (herestringSeen && consumerIdentity !== null ? consumerIdentity : null);
+	for (let i = 0; i < node.childCount; i++) {
+		const stage = node.child(i);
+		if (!stage) continue;
+		if (stage.type === "command") handleCommand(stage, acc, source, pipelineSeam);
+		else walkNode(stage, acc, source, pipelineSeam);
+	}
+}
+
+/**
+ * The stdin-script identity one command node's token stream carries,
+ * or null when none: the shell family, su, ssh, eval, or an
+ * interpreter identity anywhere among the name and argument tokens (a
+ * quoted or path-qualified spelling strips to its identity first),
+ * the same position-independent posture executor detection uses. The
+ * first identity found is the seam's activating consumer, the name the
+ * ask reasons carry. exec is argument-sensitive: it counts only when
+ * no argument names a program (every non-flag, non-interposer argument
+ * would be the program exec replaces the process with), so `exec <<
+ * EOF` with a trailing shell activates the seam while `exec ls << EOF`
+ * keeps the heredoc as data. A statement that merely mentions a shell
+ * word among its arguments therefore over-asks (fail-safe), the
+ * disclosed tradeoff of the position-independent posture.
+ */
+function commandCarriesStdinScriptIdentity(command: BashSyntaxNode): string | null {
+	const tokens = [commandNameText(command)];
+	for (let i = 0; i < command.childCount; i++) {
+		const child = command.child(i);
+		if (child && ARG_NODE_TYPES.has(child.type)) tokens.push(processedTextOf(child));
+	}
+	let execSeen = false;
+	for (const token of tokens) {
+		const identity = bashExecutorTokenIdentity(token);
+		if (STDIN_SCRIPT_IDENTITIES.has(identity)) return identity;
+		if (identity === "exec") execSeen = true;
+		if (BASH_INTERPOSER_WORDS.has(identity) || token.startsWith("-")) continue;
+		if (execSeen) return null;
+	}
+	return execSeen ? "exec" : null;
+}
+
+/**
+ * Whether one stream node attaches a here-string redirect. The
+ * child-type loop stays total over node types on purpose: command
+ * attachment is the only spelling the vendored grammar emits today (a
+ * here-string beside a compound parses as ERROR plus a file_redirect,
+ * live-confirmed), a redirected_statement-level attachment is declared
+ * in node-types but not emitted, and the predicate must still see the
+ * declared shape the day a grammar upgrade starts producing it so the
+ * pipeline seam arms for the redirected_statement branch that consumes
+ * it; guarding the loop to commands would silence that detection.
+ */
+function commandCarriesHerestring(node: BashSyntaxNode): boolean {
+	for (let i = 0; i < node.childCount; i++) {
+		const child = node.child(i);
+		if (child && child.type === "herestring_redirect") return true;
+	}
+	return false;
+}
+
+function commandCarriesStdinScriptIdentityGuarded(node: BashSyntaxNode): boolean {
+	return node.type === "command" && commandCarriesStdinScriptIdentity(node) !== null;
+}
+
+/**
+ * The first stream node (a pipeline stage, compound heads included)
+ * whose subtree carries the predicate, or null when none: the shared
+ * descent behind the pipeline seam's two position-independent looks, a
+ * here-string attachment and a stdin-script identity. The identity
+ * look reads the consumer's name off the found command node.
+ */
+function streamFindCarrier(node: BashSyntaxNode, carries: (node: BashSyntaxNode) => boolean): BashSyntaxNode | null {
+	if (carries(node)) return node;
+	for (let i = 0; i < node.childCount; i++) {
+		const child = node.child(i);
+		if (child) {
+			const found = streamFindCarrier(child, carries);
+			if (found !== null) return found;
+		}
+	}
+	return null;
+}
+
+/**
+ * The compound statement containers a redirected statement's body can
+ * spell: descending into one from the direct consultation flips the
+ * visit to every-statement-head mode, because the compound's stdin is
+ * the statement's redirect input and its inner stream delivers that
+ * input from its head.
+ */
+const COMPOUND_BEARER_TYPES: ReadonlySet<string> = new Set([
+	"subshell",
+	"compound_statement",
+	"list",
+]);
+
+/**
+ * The stdin-script identity a redirected statement's stdin feeds, or
+ * null when none: any command in the statement (compound and grouped
+ * heads included, wrappers and their arguments looked through)
+ * carrying a stdin-script identity, or the pipeline rule naming one.
+ * The direct pipeline rule reads a pipeline child's LAST stage because
+ * a statement's stdin feeds the redirect-bearing stage (`cat x | bash
+ * << EOF` runs bash on the body, `bash | cat << EOF` feeds the body
+ * to cat as data). A compound bearer inverts that rule: the grammar
+ * hangs the redirect beside a subshell or brace group
+ * (redirected_statement with a compound body), the compound's stdin
+ * is the body, and its inner
+ * pipeline delivers the body to its FIRST stage, whose output feeds
+ * the later stages. Descending into a compound bearer therefore
+ * flips the consultation to every statement-head inside it,
+ * recursively through nesting and through AND-lists, and to every
+ * stage of any pipeline inside (`(python3 | cat) << 'EOF'` executes
+ * the body in python3, the review 32 finding; the direct read alone
+ * consulted only cat). Sequential statements after the body's first
+ * consumer over-ask under the flip (they never see the body), the
+ * same disclosed tradeoff as the mention over-ask. A pipeline hanging
+ * INSIDE a heredoc_redirect is the opposite posture: every stage
+ * after the heredoc-bearing one receives bytes derived from the body
+ * (the bearing stage forwards or transforms it), so the embedded walk
+ * consults EVERY stage of the hung pipeline, and any script-consumer
+ * stage means the body executes there (`cat << EOF | python3 | cat`
+ * runs the body in python3, the review 29 finding). The grammar
+ * nests the hung continuation as a pipeline inside a pipeline, and
+ * the walk descends both levels stage by stage. Activation is the
+ * position-independent posture (review 25 DC-1, advisor memo 27
+ * condition 1): the seam no longer depends on which command name the
+ * statement head names, so sudo, doas, and every other non-vocabulary
+ * prefix before a shell gates the body.
+ */
+function statementActivatesStdinScriptSeam(node: BashSyntaxNode, heredocRedirects: BashSyntaxNode[]): string | null {
 	let found: string | null = null;
-	const visit = (current: BashSyntaxNode): void => {
+	const visit = (current: BashSyntaxNode, embedded: boolean): void => {
 		if (found !== null) return;
 		if (current.type === "command") {
-			found = headIdentityThroughWrappers(current);
+			const identity = commandCarriesStdinScriptIdentity(current);
+			if (identity !== null) found = identity;
 			return;
 		}
 		if (current.type === "pipeline") {
-			for (let i = current.childCount - 1; i >= 0; i--) {
-				const child = current.child(i);
-				if (child) visit(child);
+			if (embedded) {
+				for (let i = 0; i < current.childCount; i++) {
+					const stage = current.child(i);
+					if (stage) visit(stage, true);
+				}
+			} else {
+				const last = current.child(current.childCount - 1);
+				if (last) visit(last, COMPOUND_BEARER_TYPES.has(last.type));
 			}
 			return;
 		}
 		for (let i = 0; i < current.childCount; i++) {
 			const child = current.child(i);
-			if (child) visit(child);
+			if (child && child.type !== "heredoc_redirect") {
+				visit(child, embedded || COMPOUND_BEARER_TYPES.has(child.type));
+			}
 		}
 	};
-	visit(node);
+	visit(node, false);
+	if (found !== null) return found;
+	for (const redirect of heredocRedirects) {
+		for (let i = 0; i < redirect.childCount && found === null; i++) {
+			const child = redirect.child(i);
+			if (child) visit(child, true);
+		}
+	}
 	return found;
 }
 
 /**
- * One command node's stdin-script identity with wrapper identities
- * and wrapper ARGUMENTS stripped: the command name if it already
- * consumes stdin as a script, otherwise every argument token scanned
- * for the first stdin-script identity (the program the wrapper will
- * run after its flags, assignments, and durations), so `command
- * bash`, `env zsh`, `nohup nice -n 5 sh`, and `env -i bash` all read
- * the shell they will run; with no stdin-script identity among the
- * arguments the first non-interposer token is the wrapper's actual
- * program and the seam stays inactive for it.
+ * One redirected_statement: the grammar hangs the command (or the
+ * compound bearer), the attached redirect operators, and the heredoc
+ * under this wrapper, so this handler walks every child in grammar
+ * order (the file_redirect targets still extract per the GPS quirk
+ * correction) and adds the stdin-script seam: when the statement's
+ * command stream feeds a script consumer (statementActivatesStdinScriptSeam:
+ * any stdin-script identity in the stream, the statement pipeline's
+ * last stage owning the statement's stdin, every statement-head
+ * inside a compound bearer because the compound's stdin is the body,
+ * every stage of a heredoc-embedded continuation pipeline consulted
+ * because each receives body-derived bytes), every heredoc body under
+ * the statement is that consumer's script text and its path-like
+ * words extract as operands, exactly as executor payload words do,
+ * and a body whose raw text carries a $ or backtick biases to
+ * substitution (the executor corner's backstop: a quoted delimiter
+ * makes the body literal to the grammar while the child shell still
+ * expands it). Heredoc bodies gate on the statement's own seam only:
+ * the heredoc replaces the statement's stdin, so pipeline-fed bytes
+ * never reach it and an upstream seam never makes one script text.
+ * A here-string attached at the redirected-statement level joins the
+ * same vocabulary under the statement seam OR the pipeline seam the
+ * walk passes in (seamFeeds): the value is script text wherever a
+ * consumer executes it, and the compound-wrapped spellings that
+ * forward it downstream are exactly the pipeline-seam case. The
+ * vendored grammar currently errors on every compound-attached
+ * here-string spelling (ERROR plus a file_redirect over the value,
+ * which bails fail-safe), so the branch is drift defense for the
+ * attachment the node-types declare; a data consumer's redirect
+ * payloads contribute nothing (they are data), and an interpolating
+ * payload under substitution stays behind the substitution ask with
+ * operands empty.
  */
-function headIdentityThroughWrappers(command: BashSyntaxNode): string {
-	let identity = bashExecutorTokenIdentity(commandNameText(command));
-	if (!BASH_INTERPOSER_WORDS.has(identity)) return identity;
-	let stripped: string | null = null;
-	for (let i = 0; i < command.childCount; i++) {
-		const child = command.child(i);
-		if (!child || !ARG_NODE_TYPES.has(child.type)) continue;
-		identity = bashExecutorTokenIdentity(processedTextOf(child));
-		if (isStdinScriptIdentity(identity)) return identity;
-		if (stripped === null && !BASH_INTERPOSER_WORDS.has(identity)) stripped = identity;
-	}
-	return stripped ?? identity;
-}
-
-/**
- * One redirected_statement: the grammar hangs the command, the
- * attached redirect operators, and the heredoc under this wrapper, so
- * this handler walks every child in grammar order (the file_redirect
- * targets still extract per the GPS quirk correction) and adds the
- * stdin-script seam: when the head consumer is a shell, su, ssh,
- * eval, or a bare-redirect exec (no argument), every heredoc body
- * under the statement is that consumer's
- * script text and its path-like words extract as operands, exactly as
- * executor payload words do, and a body whose raw text carries a $
- * or backtick biases to substitution (the executor corner's backstop:
- * a quoted delimiter makes the body literal to the grammar while the
- * child shell still expands it); a non-shell consumer's body
- * contributes nothing (it is data), and an interpolating body under
- * substitution stays behind the substitution ask with operands empty.
- */
-function handleRedirectedStatement(node: BashSyntaxNode, acc: ScanAccumulator, source: string): void {
+function handleRedirectedStatement(node: BashSyntaxNode, acc: ScanAccumulator, source: string, seamFeeds: string | null = null): void {
 	const heredocRedirects: BashSyntaxNode[] = [];
-	let headIdentity: string | null = null;
+	const herestringRedirects: BashSyntaxNode[] = [];
 	for (let i = 0; i < node.childCount; i++) {
 		const child = node.child(i);
 		if (!child) continue;
@@ -1037,38 +1339,48 @@ function handleRedirectedStatement(node: BashSyntaxNode, acc: ScanAccumulator, s
 			heredocRedirects.push(child);
 			continue;
 		}
-		if (headIdentity === null) headIdentity = statementHeadIdentity(child);
-		walkNode(child, acc, source);
+		if (child.type === "herestring_redirect") {
+			herestringRedirects.push(child);
+			continue;
+		}
+		walkNode(child, acc, source, seamFeeds);
 	}
-	if (headIdentity === null || !isStdinScriptIdentity(headIdentity)) {
-		for (const redirect of heredocRedirects) walkNode(redirect, acc, source);
-		return;
-	}
-	for (const redirect of heredocRedirects) {
-		for (let i = 0; i < redirect.childCount; i++) {
-			const child = redirect.child(i);
-			if (!child) continue;
-			if (child.type === "heredoc_body") {
-				if (!acc.substitution) {
-					if (bashSubstitutionChars.test(child.text)) {
-						acc.substitution = true;
-						recordSubstitutionKind(acc, STDIN_SCRIPT_DOLLAR_KIND);
-					} else {
-						pushStdinScriptPieces(child.text, acc, `a heredoc body fed to ${headIdentity} as its stdin script`);
-					}
+	const statementSeam = statementActivatesStdinScriptSeam(node, heredocRedirects);
+	if (statementSeam !== null) {
+		for (const redirect of heredocRedirects) {
+			for (let i = 0; i < redirect.childCount; i++) {
+				const child = redirect.child(i);
+				if (!child) continue;
+				if (child.type === "heredoc_body") {
+					consumeStdinScriptText(child.text, acc, `a heredoc body fed to ${statementSeam} as its stdin script`);
+				} else {
+					walkNode(child, acc, source);
 				}
-			} else {
-				walkNode(child, acc, source);
 			}
 		}
+	} else {
+		for (const redirect of heredocRedirects) walkNode(redirect, acc, source);
+	}
+	if (statementSeam !== null || seamFeeds !== null) {
+		const origin = statementSeam ?? seamFeeds;
+		for (const redirect of herestringRedirects) {
+			for (let i = 0; i < redirect.childCount; i++) {
+				const value = redirect.child(i);
+				if (value && ARG_NODE_TYPES.has(value.type)) {
+					consumeStdinScriptText(value.text, acc, `a here-string fed to ${origin} as its stdin script`);
+				}
+			}
+		}
+	} else {
+		for (const redirect of herestringRedirects) walkNode(redirect, acc, source);
 	}
 }
 
-function walkNode(node: BashSyntaxNode, acc: ScanAccumulator, source: string): void {
+function walkNode(node: BashSyntaxNode, acc: ScanAccumulator, source: string, seamFeeds: string | null = null): void {
 	if (SKIP_SUBTREE_TYPES.has(node.type)) return;
 	if (node.type === "heredoc_body") return;
 	if (node.type === "redirected_statement") {
-		handleRedirectedStatement(node, acc, source);
+		handleRedirectedStatement(node, acc, source, seamFeeds);
 		return;
 	}
 	if (node.type === "file_redirect") {
@@ -1076,7 +1388,11 @@ function walkNode(node: BashSyntaxNode, acc: ScanAccumulator, source: string): v
 		return;
 	}
 	if (node.type === "command") {
-		handleCommand(node, acc, source);
+		handleCommand(node, acc, source, seamFeeds);
+		return;
+	}
+	if (node.type === "pipeline") {
+		handlePipeline(node, acc, source, seamFeeds);
 		return;
 	}
 	if (node.type === "variable_assignment") {
@@ -1101,7 +1417,7 @@ function walkNode(node: BashSyntaxNode, acc: ScanAccumulator, source: string): v
 	}
 	for (let i = 0; i < node.childCount; i++) {
 		const child = node.child(i);
-		if (child) walkNode(child, acc, source);
+		if (child) walkNode(child, acc, source, seamFeeds);
 	}
 }
 
@@ -1141,7 +1457,9 @@ function joinWordsAcrossContinuation(
  * substitution's inner command ran); then the executor raw-text
  * dollar test for the node-invisible payload dollars a quoted string
  * carries (the raw text is not an expansion node, but a child shell
- * re-evaluates its payload), with the seam's own backstop already
+ * re-evaluates its payload - the test is shell-flavored: an
+ * interpreter payload is code, not shell text, and does not bias),
+ * with the seam's own backstop already
  * folded into the walk: a seam-active heredoc body or here-string
  * value whose raw text carries a $ or backtick flags substitution
  * where the grammar cannot see it; then the deferred-execution vector floor.
@@ -1153,6 +1471,7 @@ export async function runBashScan(command: string): Promise<BashScanResult> {
 		const acc: ScanAccumulator = {
 			substitution: false,
 			executor: false,
+			executorShellText: false,
 			interposed: null,
 			bail: rootNode.hasError,
 			envVector: null,
@@ -1171,7 +1490,7 @@ export async function runBashScan(command: string): Promise<BashScanResult> {
 		if (acc.substitution) {
 			return withProvenance(acc, { substitution: true, executor: false, bail: true, envVector: acc.envVector, envVectorPosture: acc.envVectorPosture, cdAsk: null, operands: [], interposed: null });
 		}
-		if (acc.executor && bashSubstitutionChars.test(command)) {
+		if (acc.executor && acc.executorShellText && bashSubstitutionChars.test(command)) {
 			recordSubstitutionKind(acc, EXECUTOR_PAYLOAD_DOLLAR_KIND);
 			return withProvenance(acc, { substitution: true, executor: false, bail: true, envVector: acc.envVector, envVectorPosture: acc.envVectorPosture, cdAsk: null, operands: [], interposed: null });
 		}

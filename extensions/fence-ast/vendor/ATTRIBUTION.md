@@ -14,6 +14,7 @@ never an untracked runtime tree.
 | `web-tree-sitter.wasm` | web-tree-sitter@0.26.9 | 200297 | `1ed02fe75a60642bea084670e33267795aab26c19012805b9fb513ab458680ee` |
 | `web-tree-sitter.js` | web-tree-sitter@0.26.9 | 153666 | `0c868236a47296b4ff3c1570f20e0899e4a784ff6e5cd7bfc9c3a55225463e4a` |
 | `tree-sitter-bash.wasm` | tree-sitter-bash@0.25.1 | 1358224 | `8292919c88a0f7d3fb31d0cd0253ca5a9531bc1ede82b0537f2c63dd8abe6a7a` |
+| `node-types.json` | tree-sitter-bash@0.25.1 (`src/node-types.json`) | 51167 | `b644629f7f9460cb0af080cb88f3bef898e6c47b6f8a76ed512b67ae16ef5ac5` |
 
 The engine entry is executable code, not inert data: `web-tree-sitter.js`
 runs at import time, and the wasm load path can evaluate embedded JS
@@ -26,9 +27,18 @@ loads nothing).
 Both packages are published under the MIT license; the two `.LICENSE` files in
 this directory are the verbatim license texts shipped inside those packages.
 The pins above are mirrored in `../grammar-pins.ts` as `GRAMMAR_DIGEST_PINS`,
-the surface the grammar seal folds into `SealState` (unit PISCOPE-2-3), where
+the surface the grammar seal's bash decision evaluates (unit PISCOPE-2-3):
 a mismatch or an unreadable artifact degrades every bash verdict to ask-mode
-instead of trusting drifted bytes.
+instead of trusting drifted bytes, while path verdicts stay governed by the
+release pins.
+
+`node-types.json` is inert JSON vocabulary data, never imported or executed:
+it is the grammar's declared node-type surface, extracted from the same pack
+as the wasm, and it is the authority the grammar-vocabulary completeness
+check (`../grammar-vocabulary.ts`) and the re-pin gate (`../re-pin.ts`) read.
+A grammar upgrade that renames or adds a node type without extending the
+walk's vocabulary refuses to re-pin, closing the fail-open drift direction
+the byte pins alone cannot see (advisor memo 15 F2/DC-2).
 
 ## Provenance and reproducibility
 
@@ -78,7 +88,10 @@ verify the fresh tarball's integrity equals the registry's dist.integrity for
 the named version (npm pack checks the signed packument; record the verified
 value with the change), byte-compare every artifact against this directory,
 copy only after reviewing the delta, recompute and re-pin
-`GRAMMAR_DIGEST_PINS`, record the new version's registry anchors in the
+`GRAMMAR_DIGEST_PINS` (one command: the re-pin helper at `../re-pin.ts`
+recomputes the release and grammar pin sets, gates on the walk-vocabulary
+assertion, and refuses to bless bytes whose node-type surface the walk does
+not cover), record the new version's registry anchors in the
 table above, and land the change through the grammar-seal review. A mutated,
 truncated, or re-spelled artifact without a matching re-pin fails the suite's
 digest pins immediately, and from the PISCOPE-2-2 landing onward the loader

@@ -73,11 +73,13 @@
  * /dev/zero, /dev/stdin, /dev/stdout, /dev/stderr, /dev/fd/N) stay
  * exempt from bash operand verdicts only, never from the path tools,
  * and /dev/tty stays gated because it reads user input. Executor
- * shapes are command_name identity (a bash/zsh/sh/dash/ksh, su, or
- * ssh token whose directory prefix strips away lexically; no
- * filesystem resolution, so a missing path still gates) followed by
- * a -c-carrying flag, glued forms included, or the exact token eval;
- * a command/env/nohup/nice/timeout/exec wrapper preceding an executor
+ * shapes are position-independent over one command's token stream:
+ * an eval or ssh identity anywhere, a shell/su identity followed
+ * anywhere later by a -c-carrying or su long --command flag (glued
+ * forms included), or a payload-carrying interpreter followed by its
+ * payload flag; every identity strips its directory prefix lexically,
+ * no filesystem resolution, so a missing path still gates. A
+ * command/env/nohup/nice/timeout/exec wrapper preceding an executor
  * shape in one command floors the call to ask, because the wrapper
  * re-executes its arguments. A quoted prose mention of bash -c is
  * argument data, not the shell token, so it neither triggers nor
@@ -122,29 +124,89 @@
  *
  * The bash pass parses with tree-sitter-bash since PISCOPE-2-2, and
  * its residual is stated here because it is the extension's only
- * shell-facing layer: the walk visits the positions where bash
+ * shell-facing layer (trued to parser-era truth at PISCOPE-2-3, the
+ * landing unit): the walk visits the positions where bash
  * materializes paths (argument tokens, assignment and declaration
  * values including array elements, redirect destinations, cd and
  * pushd targets) and extracts operands from the path-like text those
  * positions carry, while substitution reads as the presence of an
  * expansion node anywhere in the parsed tree - one position-blind
  * traversal with no skip list - so every position bash expands in
- * (command names included) asks. Expansion results, runtime-assembled paths, and output feeding a
- * later command stay invisible, and their presence asks; alias-,
- * function-, and PATH-resolution outcomes are equally invisible (an
- * alias hiding an invocation spelling is shell state the parse cannot
- * see). Spellings the extraction does not treat as operands stay
- * ungated where bash treats them as data, and the pattern-first skip
- * covers sed only: slash-carrying grep/rg/awk pattern arguments still
- * surface as operands and ask (over-ask direction) until their own
- * rows join the skip table. Executor and wrapper recognition remains a
- * modeled-shape list, not a proof:
+ * (command names included) asks. Expansion results, runtime-assembled
+ * paths, and output feeding a later command stay invisible, and their
+ * presence asks; alias-, function-, and PATH-resolution outcomes are
+ * equally invisible (an alias hiding an invocation spelling is shell
+ * state the parse cannot see).
+ *
+ * Executor recognition is position-independent over one command's
+ * token stream (a shell/su token with a -c or su long --command flag,
+ * ssh, eval, or a payload-carrying interpreter - python, node, perl,
+ * ruby, php, Rscript, osascript, lua - with its payload flag), so a
+ * payload under any prefix gates exactly as the bare spelling does;
+ * the payload pieces extract through the child's own quote-dropping
+ * word split. An interpreter payload is code in the interpreter's
+ * language, not shell text, so its dollars and backticks do not bias
+ * substitution (a shell-flavored payload still biases); a code payload
+ * naming an out-of-scope path asks through its pieces. The
+ * stdin-script seam reads the statement's command stream the same
+ * position-independent way: when any token carries a script identity
+ * (the shells, su, ssh, eval, the interpreters, or a redirect-only
+ * exec; wrappers and their arguments looked through; the statement
+ * pipeline's last stage owning the statement's stdin; every
+ * stage of a post-heredoc continuation pipeline consulted because
+ * each receives body-derived bytes; a compound bearer consulting
+ * every statement-head inside it, recursively through nesting,
+ * because the compound's stdin is the body and its inner stream
+ * delivers it; a here-string on any pipeline stage plus a script
+ * consumer anywhere in that pipeline activating the seam for the
+ * value, at a command or at the redirected statement itself), heredoc
+ * bodies and here-string values extract as operands with the
+ * raw-dollar backstop; a statement that
+ * merely mentions a shell word therefore over-asks (fail-safe), and
+ * a data consumer's heredoc stays inert. Deferred-execution vectors floor to ask by
+ * name in every assignment posture and env spelling: the pinned
+ * twelve-name family (PROMPT_COMMAND, BASH_ENV, ZDOTDIR, ENV,
+ * LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH, PS4, PATH, CDPATH, FPATH,
+ * HISTFILE) plus every LD_ loader name outside the inert allowlist
+ * (LD_DEBUG, LD_BIND_NOW, LD_TRACE_LOADED_OBJECTS, LD_SHOW_AUXV).
+ * The parked lexical-era residuals are dispositioned: env -S is
+ * closed (the env wrapper floors any executor behind it to ask), and
+ * su's long --command form is gated (it joins the payload-flag
+ * detection).
+ *
+ * Residuals stated, not claimed away. Shell state the parse cannot
+ * see stays open in the over-ask-safe direction: trap and alias
+ * bodies and quoted-literal stdin scripts carrying dollar indirection
+ * are string data bash evaluates later (a seam-active body's raw
+ * dollar backstops it; trap and alias bodies remain ungated until
+ * their own rows join). The environment-consumed-by-programs family
+ * (SHELL, PYTHONSTARTUP, GIT_EDITOR and siblings) stays inert as a
+ * lone assignment, while prefix spellings gate on the extracted
+ * value. Mechanism gaps that need cross-call state: a bare export,
+ * declare, or typeset of a vector name without a value, read NAME,
+ * and a nested command-env wrapper. The pattern-first skip covers
+ * sed only (the EXT-34 closure): the wider family of data-bearing
+ * operands whose text looks like a path - grep/rg/awk pattern
+ * positionals, cut and tr delimiters - surfaces as operands and asks
+ * (over-ask direction) until their own role machines join. Executor
+ * and wrapper recognition remains a modeled-shape list, not a proof:
  * invocation spellings outside the pinned classes may pass, the
  * pinned classes are the contract, and no closure beyond them is
  * claimed. The command's own executable (the leading word, absolute
  * or PATH-resolved) is not treated as a file operand: binary lookup is
  * outside the model, as it already is for every ungated bare command
  * name.
+ *
+ * The grammar's bytes are pinned and sealed: the vendored parser
+ * artifacts hash-verify before any vendored byte loads
+ * (verify-before-import), the same digests fold into a grammar leg of
+ * the seal whose degradation asks every bash verdict while path
+ * verdicts stay governed by the release pins, and the suite plus the
+ * re-pin helper (extensions/fence-ast/re-pin.ts) hold the walk's
+ * node-type vocabularies against the grammar's declared surface
+ * (vendor/node-types.json), so a sanctioned grammar upgrade that
+ * outpaces the walk refuses to re-pin instead of shipping a green
+ * seal over a stale walk.
  *
  * Resolution generalizes the task-storage guard's hardened machinery
  * (lexical, kernel-style symlink-plus-dotdot, realpath, write-ahead
@@ -263,6 +325,7 @@ import type { AskCandidateForm } from "./fence-ask/ask-wire.ts";
 import { appliedSelfGrants, applyGrantToSelf, recordParentGrant } from "./fence-ask/grant-ledger.ts";
 import { runBashScan } from "./fence-ast/bash-scan.ts";
 import type { BashScanResult } from "./fence-ast/bash-scan.ts";
+import { GRAMMAR_ARTIFACT_FILES, GRAMMAR_DIGEST_PINS } from "./fence-ast/grammar-pins.ts";
 import { childProvisioningFromEnv, forwardOutOfScopeAsk } from "./fence-ask/ask-channel.ts";
 
 /**
@@ -816,6 +879,61 @@ export function resetSessionSeal(): void {
 	cachedSessionSeal = undefined;
 }
 
+/** The vendored parser artifact directory the grammar seal hashes, resolved beside this module. */
+const fenceAstVendorDirectory = fileURLToPath(new URL("./fence-ast/vendor/", import.meta.url));
+
+/**
+ * The seal's grammar leg: digest every vendored parser artifact
+ * (executable wasm and engine entry plus the node-types vocabulary
+ * authority) against GRAMMAR_DIGEST_PINS and report degraded on
+ * drift, an unreadable artifact, or a missing pin. The walk's
+ * verdicts parse commands with these bytes, so a mismatch means the
+ * walk's own trust base is unproven: bash verdicts degrade to ask
+ * (the same availability posture the release seal's drift carries,
+ * the user-accepted tradeoff), while path verdicts stay governed by
+ * the release leg alone - the grammar artifacts play no role in path
+ * resolution. The loader's verify-before-import ordering is
+ * unaffected: this evaluation is a read-only re-check beside it, and
+ * neither leg ever imports a vendored byte. Read-only, never throws,
+ * never exits.
+ */
+export function evaluateGrammarSealState(
+	pins: Record<string, string> = GRAMMAR_DIGEST_PINS,
+	vendorDirectory: string = fenceAstVendorDirectory,
+): SealState {
+	const reasons: string[] = [];
+	for (const fileName of GRAMMAR_ARTIFACT_FILES) {
+		const pinned = pins[fileName];
+		if (typeof pinned !== "string" || pinned.length === 0) {
+			reasons.push(`${fileName} has no pinned grammar digest`);
+			continue;
+		}
+		const actual = computeFileDigest(path.join(vendorDirectory, fileName));
+		if (actual === null) {
+			reasons.push(`${fileName} is unreadable in the vendored parser`);
+		} else if (actual !== pinned) {
+			reasons.push(`${fileName} changed since its grammar digest was pinned (drift or upgrade)`);
+		}
+	}
+	return reasons.length === 0 ? { degraded: false, reasons: [] } : { degraded: true, reasons };
+}
+
+/**
+ * Memoized real grammar seal behind decideBashToolCall's omitted
+ * grammarSeal argument: evaluated once per process beside the release
+ * seal, reset by resetGrammarSeal for suites and changed conditions.
+ */
+let cachedGrammarSeal: SealState | undefined;
+
+export function sessionGrammarSealState(): SealState {
+	if (cachedGrammarSeal === undefined) cachedGrammarSeal = evaluateGrammarSealState();
+	return cachedGrammarSeal;
+}
+
+export function resetGrammarSeal(): void {
+	cachedGrammarSeal = undefined;
+}
+
 /**
  * The per-source breakdown of every extra-root source behind the
  * factory's allowed-root build: the tracked config and the optional
@@ -1216,9 +1334,12 @@ export type { BashScanResult };
  * argument pieces, executor payload words (the child shell's own word
  * split of a quoted payload at an executor shape), whole
  * file_redirect destinations, assignment and declaration values,
- * stdin-script heredoc body and here-string words under a
- * shell/su/ssh/eval head, and cd/pushd targets, executor detection reads
- * command_name identity plus the -c flag shape, interposition reads
+ * stdin-script heredoc body and here-string words under any
+ * script-consumer statement (the seam reads the command stream
+ * position-independently), and cd/pushd targets; executor detection
+ * reads the token stream (shells/su with a -c or long --command flag,
+ * ssh, eval, the payload-carrying interpreters with their payload
+ * flags), interposition reads
  * wrapper identities, envVector names an env-var-carried execution
  * vector assigned in any posture or carried by an env spelling, and
  * the bail flag is the parse's own health (ERROR trees). EXT-37 adds
@@ -1330,6 +1451,8 @@ export interface BashGateCall {
 	approved?: boolean;
 	/** Suite injection; omitted consumes the memoized real session seal. */
 	seal?: SealState;
+	/** Suite injection of the grammar seal leg; omitted consumes the memoized real grammar seal. A degraded grammar leg asks every bash call; path verdicts never consult it. */
+	grammarSeal?: SealState;
 	/** Tilde-expansion home; defaults to the real home. */
 	home?: string;
 	/** Suite injection of the AST scan; omitted runs the real scanBashCommand. The rejection path is the parser-unavailable fail-safe ask. */
@@ -1338,9 +1461,11 @@ export interface BashGateCall {
 
 /**
  * The whole tool_call decision for one bash call, as data, sharing the
- * path gate's ask/block machinery: a degraded seal asks every bash call
- * (a shell command is a potential path bearer and the resolution parity
- * its operands rely on is unproven); a non-string command or session
+ * path gate's ask/block machinery: a degraded seal leg asks every bash
+ * call (the release leg because a shell command is a potential path
+ * bearer and the resolution parity its operands rely on is unproven;
+ * the grammar leg because the parsing walk's own vendored trust base
+ * is unproven); a non-string command or session
  * cwd asks fail-closed; an AST walk whose tree carries substitution
  * asks (the walk cannot see expansion results); an ERROR-bearing parse
  * asks (the bail class is parse health); parser unavailability (a
@@ -1348,29 +1473,41 @@ export interface BashGateCall {
  * through the boundary below, never a silent allow; a cd/pushd naming
  * no lexically resolvable target asks (home, OLDPWD, and the directory
  * stack are shell state); an assignment or env spelling carrying a
- * hijackable execution vector (PROMPT_COMMAND, BASH_ENV, ZDOTDIR,
- * ENV, LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH, PS4, PATH) asks
- * regardless of the value's shape (the shell or its loader runs them
- * on a schedule the scanner cannot evaluate); an executor shape
- * riding behind a command/env/nohup/nice/timeout/exec wrapper asks
- * without scanning through (the wrapper re-executes its arguments);
- * otherwise every extracted operand resolves through the verdict core
- * carrying its extraction-position provenance and the first ask wins,
- * so the reason names the trigger class (EXT-37): the operand's
- * extraction position, the substitution ask's expansion kinds, and
- * the vector floor's posture all join the detail the prompt, the
- * refusal, and the forwarded ask evidence render. A command with no
- * asking operand passes untouched.
+ * hijackable execution vector (the pinned floor: PROMPT_COMMAND,
+ * BASH_ENV, ZDOTDIR, ENV, LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH, PS4,
+ * PATH, CDPATH, FPATH, HISTFILE, plus every LD_ name outside the inert
+ * allowlist) asks regardless of the value's shape (the shell or its
+ * loader runs them on a schedule the scanner cannot evaluate); an
+ * executor shape riding behind a command/env/nohup/nice/timeout/exec
+ * wrapper asks without scanning through (the wrapper re-executes its
+ * arguments); otherwise every extracted operand resolves through the
+ * verdict core carrying its extraction-position provenance and the
+ * first ask wins, so the reason names the trigger class (EXT-37): the
+ * operand's extraction position, the substitution ask's expansion
+ * kinds, and the vector floor's posture all join the detail the
+ * prompt, the refusal, and the forwarded ask evidence render. A
+ * command with no asking operand passes untouched.
  */
 export async function decideBashToolCall(call: BashGateCall): Promise<PathGateDecision> {
 	if (!GATED_BASH_TOOLS.has(call.toolName)) return { action: "pass" };
 	const effectiveSeal = call.seal ?? sessionSealState();
+	const effectiveGrammarSeal = call.grammarSeal ?? sessionGrammarSealState();
 	const home = call.home ?? os.homedir();
 	const commandText = typeof call.input.command === "string" ? call.input.command : String(call.input.command);
 	const askBash = (detail: string): PathGateDecision =>
 		assembleGateDecision(call.toolName, { path: commandText, scope: "ask", detail }, call.hasUI, call.approved);
+	const sealReasons: string[] = [];
+	let sealLabel = "";
 	if (effectiveSeal.degraded) {
-		return askBash(`release seal degraded: ${effectiveSeal.reasons.join("; ")}; every path needs explicit approval until the gate is re-pinned to the running release`);
+		sealLabel = "release seal degraded";
+		sealReasons.push(...effectiveSeal.reasons);
+	}
+	if (effectiveGrammarSeal.degraded) {
+		sealLabel = sealLabel === "" ? "grammar seal degraded" : "release and grammar seals degraded";
+		sealReasons.push(...effectiveGrammarSeal.reasons.map((reason) => `grammar seal: ${reason}`));
+	}
+	if (sealReasons.length > 0) {
+		return askBash(`${sealLabel}: ${sealReasons.join("; ")}; every path needs explicit approval until the gate is re-pinned`);
 	}
 	if (typeof call.sessionCwd !== "string" || call.sessionCwd.length === 0) {
 		return askBash("session cwd is not a usable string; refusing to guess");

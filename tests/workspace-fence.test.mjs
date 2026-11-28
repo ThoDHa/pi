@@ -69,8 +69,8 @@
  * presence of expansion nodes with the single-quote narrowing and
  * escape-literal semantics; operands extract from word/string pieces,
  * redirect targets, and assignment RHS; quoted prose splits into
- * pieces; executor shapes are command_name identity plus the -c flag
- * shape; interposition floors on wrapper identities; ERROR-bearing
+ * pieces; executor shapes are position-independent token-stream
+ * detection; interposition floors on wrapper identities; ERROR-bearing
  * parses bail; heredocs, comments, grouping, and braces parse to
  * verdicts), decideBashToolCall pins its verdict classes
  * (in-scope pass, out-of-scope ask, substitution bias, ERROR-tree
@@ -78,7 +78,14 @@
  * overrides, device exemption, degraded-seal ask, headless block),
  * the sed pattern-first skip pins the EXT-34 incident closure, and
  * the factory handler maps bash events onto the shared ask/block
- * machinery through the async decision seam.
+ * machinery through the async decision seam. PISCOPE-2-3 adds the
+ * routed closures (the seam-vocabulary class, the interpreter payload
+ * floor, su's long --command form, the CDPATH/FPATH/HISTFILE and LD_
+ * loader-family floor), the grammar seal leg (a drifted vendored
+ * artifact asks every bash verdict while path verdicts stay governed
+ * by the release pins), the grammar-vocabulary completeness gate
+ * over the vendored node-types.json, and the re-pin helper's
+ * clean-evaluation and refusal pins.
  *
  * The unit 1-2 parent-own grant recorder is pinned at three depths:
  * recordParentOwnGrant's classification classes against real fixture
@@ -130,6 +137,7 @@ import cwdScopeGate, {
 	decideBashToolCall,
 	decidePathToolCall,
 	expandTilde,
+	evaluateGrammarSealState,
 	evaluateSealState,
 	fenceExtraRoots,
 	fenceExtraRootSources,
@@ -141,6 +149,7 @@ import cwdScopeGate, {
 	parseExtraRoots,
 	parseFenceConfig,
 	resetFenceExtraRoots,
+	resetGrammarSeal,
 	resetSessionSeal,
 	resolveRunningRelease,
 	childScopedAllowedRoots,
@@ -148,6 +157,7 @@ import cwdScopeGate, {
 	resolveScopeTarget,
 	recordParentOwnGrant,
 	scanBashCommand,
+	sessionGrammarSealState,
 	sessionSealState,
 } from "../extensions/workspace-fence.ts";
 import { appliedSelfGrants, inheritedExtraRootsEnvValue, parentGrantedDirectories, registerLiveChild, resetFenceAskState } from "../extensions/fence-ask/grant-ledger.ts";
@@ -162,6 +172,8 @@ import {
 	withInitBudget,
 } from "../extensions/fence-ast/bash-parser.ts";
 import { GRAMMAR_ARTIFACT_FILES, GRAMMAR_DIGEST_PINS } from "../extensions/fence-ast/grammar-pins.ts";
+import { extractGrammarVocabulary, vocabularyIsClean, walkVocabularyGaps } from "../extensions/fence-ast/grammar-vocabulary.ts";
+import { computeGrammarPins, computeReleasePins, verifyRepinVocabulary } from "../extensions/fence-ast/re-pin.ts";
 
 // Hermeticity over ambient ask-channel provisioning: the factory handler
 // reads PISCOPE_ASK_FORWARDING_ROOT / PISCOPE_ASK_CHILD_TOKEN from the live
@@ -3694,6 +3706,547 @@ try {
 		false,
 	);
 
+	// --- PISCOPE-2-3: the routed closures (advisor memo 27 conditions) ---
+	// The 2-2 clearance is conditional on this unit carrying the routed
+	// families. One: the seam-vocabulary class closes
+	// position-independently (advisor memo 27 condition 1, review 25
+	// DC-1): the seam activates when a stdin-script identity appears
+	// anywhere in the statement's command stream, the pipeline's last
+	// stage keeps ownership of the statement's stdin, and the routed
+	// heads (sudo and its wrapper siblings, the interpreters) gate
+	// their heredoc and here-string payloads. The disclosed tradeoff
+	// pins too: a statement that merely mentions a shell word over-asks
+	// (fail-safe), and the data postures stay inert. Two: the
+	// payload-carrying interpreters join the executor floor, so their
+	// code payloads gate through the same quote-dropping piece split as
+	// shell payloads; the raw-dollar bias stays shell-flavored (an
+	// interpreter payload is code, not shell text). Three: su's long
+	// --command form joins the payload-flag detection. Four: the
+	// deferred-execution floor admits the routed name siblings (CDPATH,
+	// FPATH, HISTFILE) plus the LD_ loader-family prefix rule with the
+	// inert allowlist. env -S and the simple su --command shape are the
+	// dispositions that already gate (controls, not flips).
+
+	// The seam-vocabulary class: non-interposer prefixes before a
+	// stdin-script consumer left the heredoc body invisible.
+	check(
+		"a sudo-prefixed shell heredoc with a read-and-write body asks",
+		(await bashGate({ input: { command: `sudo bash << EOF\ncat \"/etc/shadow\" > \"/home/khave/stolen\"\nEOF` } })).action,
+		"ask",
+	);
+	check(
+		"a doas-prefixed shell heredoc with an out-of-scope body asks",
+		(await bashGate({ input: { command: "doas bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a stdbuf-wrapped shell heredoc with an out-of-scope body asks",
+		(await bashGate({ input: { command: "stdbuf -o0 bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a watch-wrapped shell heredoc with an out-of-scope body asks",
+		(await bashGate({ input: { command: "watch bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a setsid-wrapped shell heredoc with an out-of-scope body asks",
+		(await bashGate({ input: { command: "setsid bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"an ionice-wrapped shell heredoc with an out-of-scope body asks",
+		(await bashGate({ input: { command: "ionice -c2 bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a strace-wrapped shell heredoc with an out-of-scope body asks",
+		(await bashGate({ input: { command: "strace bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"an xargs-wrapped shell heredoc with an out-of-scope body asks",
+		(await bashGate({ input: { command: "xargs bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a chroot-wrapped shell heredoc with an out-of-scope body asks",
+		(await bashGate({ input: { command: "chroot /tmp bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a sudo shell heredoc with flag-and-subcommand spellings asks",
+		(await bashGate({ input: { command: "sudo -u root bash -s << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a sudo-wrapped env shell heredoc asks (the positional asymmetry)",
+		(await bashGate({ input: { command: "sudo env -i bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a sudo-wrapped timeout shell heredoc asks (the positional asymmetry)",
+		(await bashGate({ input: { command: "sudo timeout 5 bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a sudo shell heredoc body carrying dollar indirection asks",
+		(await bashGate({ input: { command: "f=/etc/passwd; sudo bash <<'EOF'\ncat $f\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a sudo shell here-string with an inner-quoted payload asks",
+		(await bashGate({ input: { command: `sudo bash <<< 'cat \"/etc/passwd\"'` } })).action,
+		"ask",
+	);
+	check(
+		"a pipeline whose last stage is an interpreter gates the heredoc body",
+		(await bashGate({ input: { command: "cat << EOF | python3\nopen('/etc/passwd')\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a pipeline whose last stage is a prefixed shell gates the heredoc body",
+		(await bashGate({ input: { command: "cat x | sudo bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+
+	// The disclosed tradeoff: the stream scan over-asks when a
+	// non-consumer command merely mentions a script identity.
+	check(
+		"a heredoc statement that merely mentions a shell word asks (the disclosed over-ask)",
+		(await bashGate({ input: { command: "grep bash << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+
+	// The payload-carrying interpreters join the executor floor.
+	check(
+		"a python payload with an out-of-scope path asks",
+		(await bashGate({ input: { command: `python3 -c 'open(\"/etc/passwd\")'` } })).action,
+		"ask",
+	);
+	check(
+		"a bare python payload with an out-of-scope path asks",
+		(await bashGate({ input: { command: `python -c 'open(\"/etc/passwd\")'` } })).action,
+		"ask",
+	);
+	check(
+		"a python2 payload with an out-of-scope path asks",
+		(await bashGate({ input: { command: `python2 -c 'open(\"/etc/passwd\")'` } })).action,
+		"ask",
+	);
+	check(
+		"a glued python payload with an inner-quoted path asks",
+		(await bashGate({ input: { command: `python3 -c'open(\"/etc/passwd\")'` } })).action,
+		"ask",
+	);
+	check(
+		"a path-qualified python payload with an out-of-scope path asks",
+		(await bashGate({ input: { command: `/usr/bin/python3 -c 'open(\"/etc/passwd\")'` } })).action,
+		"ask",
+	);
+	check(
+		"a node payload with an out-of-scope read asks",
+		(await bashGate({ input: { command: `node -e 'require(\"fs\").readFileSync(\"/etc/passwd\")'` } })).action,
+		"ask",
+	);
+	check(
+		"a node long-form eval payload with an out-of-scope read asks",
+		(await bashGate({ input: { command: `node --eval 'require(\"fs\").readFileSync(\"/etc/passwd\")'` } })).action,
+		"ask",
+	);
+	check(
+		"a perl payload with an out-of-scope open asks",
+		(await bashGate({ input: { command: `perl -e 'open(F, \"/etc/passwd\")'` } })).action,
+		"ask",
+	);
+	check(
+		"a ruby payload with an out-of-scope read asks",
+		(await bashGate({ input: { command: `ruby -e 'File.read(\"/etc/passwd\")'` } })).action,
+		"ask",
+	);
+	check(
+		"a php payload with an out-of-scope read asks",
+		(await bashGate({ input: { command: `php -r 'echo file_get_contents(\"/etc/passwd\");'` } })).action,
+		"ask",
+	);
+	check(
+		"an Rscript payload with an out-of-scope read asks",
+		(await bashGate({ input: { command: `Rscript -e 'readLines(\"/etc/passwd\")'` } })).action,
+		"ask",
+	);
+	check(
+		"a lua payload with an out-of-scope open asks",
+		(await bashGate({ input: { command: `lua -e 'io.open(\"/etc/passwd\")'` } })).action,
+		"ask",
+	);
+	check(
+		"an interpreter-headed heredoc body with an out-of-scope path asks",
+		(await bashGate({ input: { command: `python3 << EOF\nopen(\"/etc/passwd\")\nEOF` } })).action,
+		"ask",
+	);
+	check("an interpreter payload sets the executor flag", (await scan(`python3 -c 'open(\"/etc/passwd\")'`)).executor, true);
+	check(
+		"an interpreter behind a wrapper floors to the interposed ask",
+		(await bashGate({ input: { command: `env python3 -c 'open(\"/etc/passwd\")'` } })).action,
+		"ask",
+	);
+
+	// su's long --command form joins the payload-flag detection.
+	check(
+		"a su long-form command payload with an inner-quoted read-and-write asks",
+		(await bashGate({ input: { command: `su --command 'cat \"/etc/shadow\" > \"/home/khave/stolen\"' root` } })).action,
+		"ask",
+	);
+	check(
+		"a su long-form glued command payload with an inner-quoted read-and-write asks",
+		(await bashGate({ input: { command: `su --command='cat \"/etc/shadow\" > \"/home/khave/stolen\"' root` } })).action,
+		"ask",
+	);
+	check("a su long-form command payload sets the executor flag", (await scan(`su --command 'cat \"/etc/passwd\"' root`)).executor, true);
+
+	// The routed name siblings and the loader-family prefix rule join
+	// the deferred-execution floor.
+	check("a lone CDPATH assignment asks", (await bashGate({ input: { command: "CDPATH=/etc" } })).action, "ask");
+	check(
+		"a CDPATH assignment chain hijacking cd asks",
+		(await bashGate({ input: { command: "CDPATH=/etc; cd evil; touch secret" } })).action,
+		"ask",
+	);
+	check("a lone FPATH assignment asks", (await bashGate({ input: { command: "FPATH=/etc/evil" } })).action, "ask");
+	check("a lone HISTFILE assignment asks", (await bashGate({ input: { command: "HISTFILE=/etc/passwd" } })).action, "ask");
+	check(
+		"an unknown LD_ loader-family prefix assignment asks regardless of its value",
+		(await bashGate({ input: { command: "LD_XX=1 ls" } })).action,
+		"ask",
+	);
+	check(
+		"an unknown LD_ loader-family export chain asks",
+		(await bashGate({ input: { command: "LD_XX=/tmp/evil.so; export LD_XX; ls" } })).action,
+		"ask",
+	);
+	check("a lone CDPATH assignment names the vector", (await scan("CDPATH=/etc")).envVector, "CDPATH");
+	check("an unknown LD_ assignment names the vector", (await scan("LD_XX=/tmp/evil.so ls")).envVector, "LD_XX");
+
+	// Dispositions and postures that already gate or pass at base
+	// (green-among-red controls; a flip here is a regression).
+	check(
+		"the env -S split-string wrapper floors an executor payload to ask",
+		(await bashGate({ input: { command: "env -S FOO=1 bash -c 'cat /etc/shadow'" } })).action,
+		"ask",
+	);
+	check(
+		"a su long-form command payload with a single-level path still asks",
+		(await bashGate({ input: { command: `su --command='cat /etc/passwd' root` } })).action,
+		"ask",
+	);
+	check(
+		"an osascript payload with an out-of-scope path still asks through extraction",
+		(await bashGate({ input: { command: `osascript -e 'do shell script \"cat /etc/passwd\"'` } })).action,
+		"ask",
+	);
+	check("an interposer-prefixed shell heredoc still asks", (await bashGate({ input: { command: "command sudo bash << EOF\ncat /etc/passwd\nEOF" } })).action, "ask");
+	check("an env-prefixed sudo shell heredoc still asks", (await bashGate({ input: { command: "env -i sudo bash << EOF\ncat /etc/passwd\nEOF" } })).action, "ask");
+	check("a timeout-prefixed sudo shell heredoc still asks", (await bashGate({ input: { command: "timeout 5 sudo bash << EOF\ncat /etc/passwd\nEOF" } })).action, "ask");
+	check("a timeout-prefixed shell heredoc still asks", (await bashGate({ input: { command: "timeout 5 bash << EOF\ncat /etc/passwd\nEOF" } })).action, "ask");
+	check("a pipeline-end shell heredoc still asks", (await bashGate({ input: { command: "cat notes.txt | bash << EOF\ncat /etc/passwd\nEOF" } })).action, "ask");
+	check("a shell-headed pipeline keeps the heredoc as data", (await bashGate({ input: { command: "bash | cat << EOF\ncat /etc/passwd\nEOF" } })).action, "pass");
+	check("a data-headed heredoc stays inert", (await bashGate({ input: { command: "cat << EOF\nsome text\nEOF" } })).action, "pass");
+	check("an exec-headed non-shell command keeps the heredoc as data", (await bashGate({ input: { command: "exec ls << EOF\ncat /etc/passwd\nEOF" } })).action, "pass");
+	check(
+		"a CDPATH prefix spelling still asks through the value operand",
+		(await bashGate({ input: { command: "CDPATH=/etc cd evil" } })).action,
+		"ask",
+	);
+	check(
+		"a declared HISTFILE assignment still asks through the declaration value",
+		(await bashGate({ input: { command: "declare HISTFILE=/etc/passwd" } })).action,
+		"ask",
+	);
+	check("the LD_DEBUG inert name stays exempt regardless of its value", (await bashGate({ input: { command: "LD_DEBUG=all ls" } })).action, "pass");
+	check("the LD_BIND_NOW inert name stays exempt", (await bashGate({ input: { command: "LD_BIND_NOW=1 ls" } })).action, "pass");
+	check("the LD_TRACE_LOADED_OBJECTS inert name stays exempt", (await bashGate({ input: { command: "LD_TRACE_LOADED_OBJECTS=1 ls" } })).action, "pass");
+	check(
+		"an interpreter payload with an in-scope path passes",
+		(await bashGate({ input: { command: `python3 -c 'print(1)'` } })).action,
+		"pass",
+	);
+	check(
+		"an interpreter script argument in scope passes",
+		(await bashGate({ input: { command: "python3 notes.txt" } })).action,
+		"pass",
+	);
+	check(
+		"a sudo shell heredoc with an in-scope body passes through extraction",
+		(await bashGate({ input: { command: "sudo bash << EOF\ncat notes.txt\nEOF" } })).action,
+		"pass",
+	);
+	check(
+		"a plain argument mentioning a shell word keeps the no-heredoc posture",
+		(await bashGate({ input: { command: "grep bash notes.txt" } })).action,
+		"pass",
+	);
+	check(
+		"an interpreter-headed shell heredoc still asks",
+		(await bashGate({ input: { command: "zsh << EOF\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+
+	// --- PISCOPE-2-3 fix round (review 29): mid-pipeline seam consultation ---
+	// The seam's pipeline consultation was last-stage-only: the direct
+	// rule consults the statement pipeline's last stage (correct there:
+	// the statement's stdin feeds the redirect-bearing stage), and the
+	// heredoc-embedded rule consulted only the hung continuation
+	// pipeline's last stage. But every stage after the heredoc-bearing
+	// one receives bytes derived from the body (the bearing stage
+	// forwards or transforms it), so a script consumer at ANY
+	// non-final stage executes the body while only the trailing stage
+	// was consulted: `cat << 'EOF' | python3 | cat` ran the body in
+	// python3 ungated. The here-string flavor missed even the
+	// two-member shape because the seam check is per-command: `cat <<<
+	// 'open("/etc/passwd")' | python3` passed with the value resolving
+	// in-scope as one data piece while python3 executed it, and the
+	// forwarded flavor `bash | cat <<< ...` reached bash's stdin the
+	// same way. The fix: the embedded consultation walks every stage of
+	// the hung pipeline, and a pipeline carrying a here-string and a
+	// script-consumer stage anywhere activates the seam for the value.
+	// The direct rule stays last-stage-only so the pinned data
+	// postures (`bash | cat << EOF`, `exec ls << EOF`) survive.
+	check(
+		"a mid-pipeline interpreter stage gates the heredoc body",
+		(await bashGate({ input: { command: "cat << 'EOF' | python3 | cat\nopen(\"/etc/passwd\")\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a mid-pipeline shell stage gates the heredoc body",
+		(await bashGate({ input: { command: "cat << 'EOF' | bash | wc -l\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a mid-pipeline ssh stage gates the heredoc body",
+		(await bashGate({ input: { command: "cat << 'EOF' | ssh host | wc -l\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a mid-pipeline su stage gates the heredoc body",
+		(await bashGate({ input: { command: "cat << 'EOF' | su root | wc -l\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a mid-pipeline eval stage gates the heredoc body",
+		(await bashGate({ input: { command: "cat << 'EOF' | eval | wc -l\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a mixed chain of mid-pipeline consumers gates the heredoc body",
+		(await bashGate({ input: { command: "cat << 'EOF' | python3 | bash | cat\nopen(\"/etc/passwd\")\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"an unquoted three-member heredoc pipeline gates at the mid stage",
+		(await bashGate({ input: { command: "cat << EOF | python3 | cat\nopen('/etc/passwd')\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a mid-pipeline interpreter stage gates the here-string value",
+		(await bashGate({ input: { command: `cat <<< 'open("/etc/passwd")' | python3` } })).action,
+		"ask",
+	);
+	check(
+		"a three-member here-string chain with a mid-pipeline interpreter asks",
+		(await bashGate({ input: { command: `cat <<< 'open("/etc/passwd")' | python3 | cat` } })).action,
+		"ask",
+	);
+	check(
+		"a forwarded here-string reaching an upstream shell stage asks",
+		(await bashGate({ input: { command: `bash | cat <<< 'open("/etc/passwd")'` } })).action,
+		"ask",
+	);
+	check(
+		"scan extracts the mid-pipeline consumer's body words",
+		JSON.stringify((await scan("cat << 'EOF' | python3 | cat\nopen(\"/etc/passwd\")\nEOF")).operands),
+		JSON.stringify(["/etc/passwd"]),
+	);
+	check(
+		"scan splits the mid-pipeline here-string value into script pieces",
+		JSON.stringify((await scan(`cat <<< 'open("/etc/passwd")' | python3`)).operands),
+		JSON.stringify(["/etc/passwd"]),
+	);
+	// The disclosed mention over-ask extends to the mid-pipeline
+	// consultation: a non-consumer mid stage naming a script identity
+	// activates the seam for the upstream body (fail-safe posture).
+	check(
+		"a mid-pipeline shell mention over-asks (the disclosed posture)",
+		(await bashGate({ input: { command: "cat << 'EOF' | grep bash | wc -l\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	// Green-among-red controls: a flip here is a regression. The
+	// first-stage consumer gates at the carrier; a consumer-free chain
+	// keeps the body as data; a here-string with no consumer stage in
+	// the pipeline stays data.
+	check(
+		"a first-stage consumer heredoc still gates at the carrier",
+		(await bashGate({ input: { command: "bash << 'EOF' | cat\ncat /etc/passwd\nEOF" } })).action,
+		"ask",
+	);
+	check(
+		"a consumer-free mid-pipeline chain keeps the heredoc body as data",
+		(await bashGate({ input: { command: "cat << 'EOF' | grep x | wc -l\ncat /etc/passwd\nEOF" } })).action,
+		"pass",
+	);
+	check(
+		"a here-string data posture without a consumer stage stays data",
+		(await bashGate({ input: { command: `echo hi <<< 'some text' | wc -l` } })).action,
+		"pass",
+	);
+
+	// --- PISCOPE-2-3 fix round 2 (review 32): compound-bearing seam stages ---
+	// Finding 1: a heredoc attached to a COMPOUND stage (a subshell or
+	// brace group; the grammar hangs the redirect beside the compound as
+	// redirected_statement(body: compound, redirect)) makes the compound's
+	// stdin the heredoc body, and the compound's INNER pipeline delivers
+	// that body to its FIRST stage, whose output feeds the later stages.
+	// The direct consultation read only the inner pipeline's LAST stage,
+	// so `(python3 | cat) << 'EOF'` executed the body in python3 while
+	// only the trailing cat was consulted. The fix flips the consultation
+	// to every statement-head inside a compound bearer, recursively
+	// through nesting (spaced subshell-in-subshell, brace-in-brace,
+	// AND-lists) and every stage of any pipeline inside; sequential
+	// statements after the body's first consumer over-ask (they never see
+	// the body), the same disclosed tradeoff as the mention over-ask.
+	// Finding 2 named compound-attached here-strings as silent allows, but
+	// the live parse refutes the premise: the vendored grammar cannot hang
+	// a herestring_redirect beside a compound at all (it emits ERROR plus
+	// a file_redirect over the value), so every named shape bails to ask
+	// today; those shapes pin green as the fail-safe record, with the
+	// structure pin locking the ERROR posture at the re-pin boundary. The
+	// redirected_statement-level here-string vocabulary still joins the
+	// seam (drift defense for the shape the node-types declare), and the
+	// compound-wrapped control proves the command-attached forward path
+	// that already gates.
+	check(
+		"a compound-bearing heredoc stage gates its body through the inner pipeline",
+		(await bashGate({ input: { command: `(python3 | cat) << 'EOF'\nopen("/etc/passwd")\nEOF` } })).action,
+		"ask",
+	);
+	check(
+		"a brace-bearing heredoc stage gates its body through the inner pipeline",
+		(await bashGate({ input: { command: `{ python3 | cat; } << 'EOF'\nopen("/etc/passwd")\nEOF` } })).action,
+		"ask",
+	);
+	check(
+		"a compound-bearing heredoc stage behind a statement-pipeline prefix gates its body",
+		(await bashGate({ input: { command: `echo seed | (python3 | cat) << 'EOF'\nopen("/etc/passwd")\nEOF` } })).action,
+		"ask",
+	);
+	check(
+		"a compound-bearing heredoc stage with a shell at the inner first stage gates",
+		(await bashGate({ input: { command: `(bash | cat) << 'EOF'\ncat /etc/passwd\nEOF` } })).action,
+		"ask",
+	);
+	check(
+		"a nested-subshell heredoc bearer gates through the innermost pipeline",
+		(await bashGate({ input: { command: `( (python3 | cat) ) << 'EOF'\nopen("/etc/passwd")\nEOF` } })).action,
+		"ask",
+	);
+	check(
+		"a brace-bearing heredoc stage behind a statement-pipeline prefix gates its body",
+		(await bashGate({ input: { command: `echo seed | { python3 | cat; } << 'EOF'\nopen("/etc/passwd")\nEOF` } })).action,
+		"ask",
+	);
+	check(
+		"nested brace groups gate through the innermost pipeline",
+		(await bashGate({ input: { command: `{ { python3 | cat; }; } << 'EOF'\nopen("/etc/passwd")\nEOF` } })).action,
+		"ask",
+	);
+	check(
+		"an AND-list pipeline inside a compound heredoc bearer gates its body",
+		(await bashGate({ input: { command: `(cat && python3 | cat) << 'EOF'\nopen("/etc/passwd")\nEOF` } })).action,
+		"ask",
+	);
+	check(
+		"scan extracts the compound bearer's body words for the inner pipeline consumer",
+		JSON.stringify((await scan(`(python3 | cat) << 'EOF'\nopen("/etc/passwd")\nEOF`)).operands),
+		JSON.stringify(["/etc/passwd"]),
+	);
+	// The consolidation member: a sequential statement pipeline after the
+	// body's first consumer never sees the body, but the every-head
+	// consultation asks anyway (the disclosed posture, previously a pass).
+	check(
+		"a sequential statement pipeline inside a compound bearer asks (the disclosed consolidation)",
+		(await bashGate({ input: { command: `(cat; python3 | cat) << 'EOF'\nopen("/etc/passwd")\nEOF` } })).action,
+		"ask",
+	);
+	check(
+		"an unquoted-delimiter compound bearer gates through the inner pipeline",
+		(await bashGate({ input: { command: `(python3 | cat) << EOF\nopen('/etc/passwd')\nEOF` } })).action,
+		"ask",
+	);
+	// Green-among-red controls: a flip here is a regression. Compound
+	// bearers without a script identity keep the body as data, the
+	// sequential identity posture keeps asking, the compound-attached
+	// here-string spellings keep their parse-bail asks, and the
+	// compound-wrapped forward path keeps gating.
+	check(
+		"a compound heredoc bearer without a script identity keeps the body as data",
+		(await bashGate({ input: { command: `(cat) << 'EOF'\nsome text\nEOF` } })).action,
+		"pass",
+	);
+	check(
+		"a brace heredoc bearer without a script identity keeps the body as data",
+		(await bashGate({ input: { command: `{ cat; } << 'EOF'\nsome text\nEOF` } })).action,
+		"pass",
+	);
+	check(
+		"a pipeline-end compound data bearer keeps the body as data",
+		(await bashGate({ input: { command: `cat x | (cat) << 'EOF'\nsome text\nEOF` } })).action,
+		"pass",
+	);
+	check(
+		"a compound bearer whose pipeline carries no identity keeps the body as data",
+		(await bashGate({ input: { command: `(cat | { cat; }) << 'EOF'\nsome text\nEOF` } })).action,
+		"pass",
+	);
+	check(
+		"a compound bearer with a sequential script identity keeps asking (the existing posture)",
+		(await bashGate({ input: { command: `(cat; bash) << 'EOF'\nopen("/etc/passwd")\nEOF` } })).action,
+		"ask",
+	);
+	check(
+		"a compound-attached here-string fails safe on the parse bail",
+		(await bashGate({ input: { command: `(bash) <<< 'open("/etc/passwd")'` } })).action,
+		"ask",
+	);
+	check(
+		"a compound-attached here-string in a pipeline fails safe on the parse bail",
+		(await bashGate({ input: { command: `(cat) <<< 'open("/etc/passwd")' | python3` } })).action,
+		"ask",
+	);
+	check(
+		"a brace-attached here-string in a pipeline fails safe on the parse bail",
+		(await bashGate({ input: { command: `{ cat; } <<< 'open("/etc/passwd")' | python3` } })).action,
+		"ask",
+	);
+	check(
+		"a consumer-inside-brace here-string spelling fails safe on the parse bail",
+		(await bashGate({ input: { command: `echo x | { python3; } <<< 'open("/etc/passwd")'` } })).action,
+		"ask",
+	);
+	check(
+		"the grammar errors on a compound-attached here-string",
+		await withBashParse("(cat) <<< x", (root) => root.hasError),
+		true,
+	);
+	check(
+		"the grammar attaches a command here-string without error",
+		await withBashParse("cat <<< x", (root) => root.hasError),
+		false,
+	);
+	check(
+		"a compound-wrapped here-string forwarded to a pipeline consumer gates",
+		(await bashGate({ input: { command: `(cat <<< 'open("/etc/passwd")') | python3` } })).action,
+		"ask",
+	);
+
 	// --- parent-own grant recorder: unit 1-2 wiring ----------------------
 	// The interactive Yes on the parent's own ask path is property 1's
 	// producer: the approved ask's escaping candidate is classified
@@ -4488,6 +5041,234 @@ check(
 check("the suite leaves the ask-root env at its start state", process.env[CHILD_ASK_ROOT_ENV], handlerSavedAskRoot);
 check("the suite leaves the ask-token env at its start state", process.env[CHILD_ASK_TOKEN_ENV], handlerSavedAskToken);
 
+// --- PISCOPE-2-3: the grammar seal, the vocabulary gate, the re-pin helper
+// The landing unit folds GRAMMAR_DIGEST_PINS into the bash decision as
+// the seal's grammar leg: a drifted or unreadable vendored artifact
+// degrades every bash verdict to ask (the same availability posture
+// the user accepted for the release seal) while path verdicts stay
+// governed by the release pins alone. The vocabulary gate closes the
+// fail-open drift direction the byte pins cannot see: the walk's
+// node-type sets must cover the grammar's declared surface (vendored
+// node-types.json) in both directions, and the re-pin helper refuses
+// to bless bytes whose vocabulary is unverifiable or gapped.
+
+resetGrammarSeal();
+check("the real grammar seal evaluates clean on the shipped vendor", sessionGrammarSealState().degraded, false);
+check("the grammar seal memoizes to a single evaluation", sessionGrammarSealState() === sessionGrammarSealState(), true);
+{
+	const first = sessionGrammarSealState();
+	resetGrammarSeal();
+	check("resetGrammarSeal forces a fresh evaluation object", sessionGrammarSealState() !== first, true);
+	check("the fresh evaluation stays clean under the shipped vendor", sessionGrammarSealState().degraded, false);
+}
+{
+	const grammarFixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "fence-grammar-seal-"));
+	try {
+		for (const artifact of GRAMMAR_ARTIFACT_FILES) {
+			fs.copyFileSync(path.join(fenceAstVendorDir, artifact), path.join(grammarFixtureDir, artifact));
+		}
+		check(
+			"the grammar seal evaluates clean against a faithful fixture copy",
+			evaluateGrammarSealState(GRAMMAR_DIGEST_PINS, grammarFixtureDir).degraded,
+			false,
+		);
+		const mutatedName = "tree-sitter-bash.wasm";
+		const mutatedPath = path.join(grammarFixtureDir, mutatedName);
+		const bytes = fs.readFileSync(mutatedPath);
+		bytes[Math.floor(bytes.length / 2)] ^= 0xff;
+		fs.writeFileSync(mutatedPath, bytes);
+		const drifted = evaluateGrammarSealState(GRAMMAR_DIGEST_PINS, grammarFixtureDir);
+		check("a drifted vendored artifact degrades the grammar seal", drifted.degraded, true);
+		checkContains("the drift reason names the artifact", drifted.reasons.join("; "), mutatedName);
+		checkContains("the drift reason names the grammar digest", drifted.reasons.join("; "), "grammar digest");
+		fs.rmSync(mutatedPath, { force: true });
+		const missing = evaluateGrammarSealState(GRAMMAR_DIGEST_PINS, grammarFixtureDir);
+		check("a missing vendored artifact degrades the grammar seal", missing.degraded, true);
+		checkContains("the missing reason names the artifact unreadable", missing.reasons.join("; "), "unreadable");
+		const unpinned = evaluateGrammarSealState({}, grammarFixtureDir);
+		check("an artifact without a pin degrades the grammar seal", unpinned.degraded, true);
+	} finally {
+		fs.rmSync(grammarFixtureDir, { recursive: true, force: true });
+	}
+}
+{
+	const p23Gate = (overrides = {}) =>
+		decideBashToolCall({
+			toolName: "bash",
+			input: { command: "echo hello" },
+			sessionCwd: cwdDir,
+			allowedRoots: customRoots,
+			hasUI: true,
+			seal: { degraded: false, reasons: [] },
+			...overrides,
+		});
+	const cleanSeal = { degraded: false, reasons: [] };
+	const degradedGrammar = { degraded: true, reasons: ["tree-sitter-bash.wasm changed since its grammar digest was pinned (drift or upgrade)"] };
+	const grammarAsk = await p23Gate({ grammarSeal: degradedGrammar, input: { command: "echo hello" } });
+	check("a degraded grammar seal asks every bash call", grammarAsk.action, "ask");
+	checkContains("the grammar ask names the grammar seal", String(grammarAsk.title ?? ""), "grammar seal degraded");
+	checkContains("the grammar ask names the drifted artifact", String(grammarAsk.title ?? ""), "tree-sitter-bash.wasm");
+	check(
+		"a degraded grammar seal blocks headless",
+		(await p23Gate({ grammarSeal: degradedGrammar, input: { command: "echo hello" }, hasUI: false })).action,
+		"block",
+	);
+	const bothLegs = await p23Gate({
+		seal: { degraded: true, reasons: ["utils/paths.js changed since its digest was pinned (drift or upgrade)"] },
+		grammarSeal: degradedGrammar,
+		input: { command: "echo hello" },
+	});
+	checkContains("both degraded legs compose into one ask", String(bothLegs.title ?? ""), "release and grammar seals degraded");
+	check(
+		"the grammar leg keeps the bash blast radius: an in-scope path tool passes while bash asks",
+		decidePathToolCall({
+			toolName: "read",
+			input: { path: inFile },
+			sessionCwd: cwdDir,
+			allowedRoots: customRoots,
+			hasUI: true,
+			seal: cleanSeal,
+		}).action,
+		"pass",
+	);
+	check("the same session's bash call asks under the degraded grammar leg", (await p23Gate({ grammarSeal: degradedGrammar })).action, "ask");
+	check(
+		"an in-scope bash command still passes under a clean grammar leg",
+		(await p23Gate({ grammarSeal: cleanSeal, input: { command: `cat "${inFile}"` } })).action,
+		"pass",
+	);
+}
+{
+	const nodeTypesRaw = fs.readFileSync(path.join(fenceAstVendorDir, "node-types.json"), "utf8");
+	const vocabulary = extractGrammarVocabulary(JSON.parse(nodeTypesRaw));
+	const gaps = walkVocabularyGaps(vocabulary);
+	check("the shipped grammar's vocabulary covers the walk's expansion set", vocabularyIsClean(gaps), true);
+	check(
+		"the grammar's expansion surface is exactly the walk's six forms",
+		JSON.stringify(vocabulary.expansionForms),
+		JSON.stringify(["ansi_c_string", "arithmetic_expansion", "command_substitution", "expansion", "process_substitution", "simple_expansion"]),
+	);
+	check(
+		"the grammar's argument surface is the walk's five word-like shapes",
+		JSON.stringify(vocabulary.argumentShapes),
+		JSON.stringify(["concatenation", "raw_string", "string", "translated_string", "word"]),
+	);
+	const renamedFixture = JSON.parse(nodeTypesRaw);
+	for (const entry of renamedFixture) {
+		if (entry.type === "word") entry.type = "wordx";
+	}
+	const renamedVocabulary = extractGrammarVocabulary(renamedFixture);
+	const renamedGaps = walkVocabularyGaps(renamedVocabulary);
+	check("a renamed argument shape reports stale", renamedGaps.staleArgument.includes("word"), true);
+	check("a renamed argument shape leaves the vocabulary gapped", vocabularyIsClean(renamedGaps), false);
+	const newShapeFixture = JSON.parse(nodeTypesRaw);
+	for (const entry of newShapeFixture) {
+		if (entry.type === "command" && entry.fields && entry.fields.argument) {
+			entry.fields.argument.types.push({ type: "literal", named: true });
+		}
+	}
+	const newShapeVocabulary = extractGrammarVocabulary(newShapeFixture);
+	check("a grammar-added argument shape reports argumentMissing", walkVocabularyGaps(newShapeVocabulary).argumentMissing.includes("literal"), true);
+	let extracted = "threw";
+	try {
+		extractGrammarVocabulary({ not: "an array" });
+		extracted = "returned";
+	} catch {
+		extracted = "threw";
+	}
+	check("a non-array vocabulary source refuses", extracted, "threw");
+	let noCommand = "threw";
+	try {
+		extractGrammarVocabulary([{ type: "word", named: true }]);
+		noCommand = "returned";
+	} catch (error) {
+		noCommand = String(error && error.message).includes("command argument field") ? "threw-naming" : "threw";
+	}
+	check("a vocabulary source without a command argument field refuses naming it", noCommand, "threw-naming");
+}
+{
+	check(
+		"the re-pin helper's grammar computation evaluates clean against the committed pins",
+		JSON.stringify(computeGrammarPins(fenceAstVendorDir)),
+		JSON.stringify(GRAMMAR_DIGEST_PINS),
+	);
+	const releaseDist = resolveRunningRelease();
+	check("the landing tree resolves the running release for the release-pin computation", typeof releaseDist, "string");
+	if (typeof releaseDist === "string") {
+		check(
+			"the re-pin helper's release computation evaluates clean against the committed pins",
+			JSON.stringify(computeReleasePins(releaseDist)),
+			JSON.stringify(RELEASE_DIGEST_PINS),
+		);
+	}
+	let shipped = "threw";
+	try {
+		verifyRepinVocabulary(fenceAstVendorDir);
+		shipped = "passed";
+	} catch (error) {
+		shipped = `threw: ${String(error && error.message).slice(0, 60)}`;
+	}
+	check("the re-pin vocabulary gate passes on the shipped grammar", shipped, "passed");
+	const refusedFixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "fence-repin-gate-"));
+	try {
+		let refusedMissing = "";
+		try {
+			verifyRepinVocabulary(refusedFixtureDir);
+			refusedMissing = "passed";
+		} catch (error) {
+			refusedMissing = String(error && error.message).includes("unverifiable") ? "refused-naming" : String(error && error.message).slice(0, 60);
+		}
+		check("the gate refuses a vendor directory with no vocabulary source", refusedMissing, "refused-naming");
+		const driftedNodeTypes = JSON.parse(fs.readFileSync(path.join(fenceAstVendorDir, "node-types.json"), "utf8"));
+		for (const entry of driftedNodeTypes) {
+			if (entry.type === "word") entry.type = "wordx";
+		}
+		fs.writeFileSync(path.join(refusedFixtureDir, "node-types.json"), JSON.stringify(driftedNodeTypes));
+		let refusedDrift = "";
+		try {
+			verifyRepinVocabulary(refusedFixtureDir);
+			refusedDrift = "passed";
+		} catch (error) {
+			refusedDrift = String(error && error.message).includes("finish the walk before re-pinning") ? "refused-naming" : String(error && error.message).slice(0, 60);
+		}
+		check("the gate refuses a grammar the walk's vocabulary does not cover", refusedDrift, "refused-naming");
+	} finally {
+		fs.rmSync(refusedFixtureDir, { recursive: true, force: true });
+	}
+}
+{
+	const translatedGate = (command) =>
+		decideBashToolCall({
+			toolName: "bash",
+			input: { command },
+			sessionCwd: cwdDir,
+			allowedRoots: customRoots,
+			hasUI: true,
+			seal: { degraded: false, reasons: [] },
+		});
+	check(
+		"a translated-string literal carrying an out-of-scope path asks",
+		(await translatedGate(`cat $\"/etc/passwd\"`)).action,
+		"ask",
+	);
+	check(
+		"a translated-string literal carrying an in-scope path passes",
+		(await translatedGate(`cat $\"notes.txt\"`)).action,
+		"pass",
+	);
+	check(
+		"a translated-string prose mention stays inert",
+		(await translatedGate(`echo $\"hello world\"`)).action,
+		"pass",
+	);
+	check(
+		"a translated-string operand extracts through the argument shape",
+		JSON.stringify((await scanBashCommand(`cat $\"/etc/passwd\"`)).operands),
+		JSON.stringify(["/etc/passwd"]),
+	);
+}
+
 const passed = total - failed;
 console.log(`\n${passed}/${total} passed, ${failed} failed`);
+
 if (failed > 0) process.exitCode = 1;
